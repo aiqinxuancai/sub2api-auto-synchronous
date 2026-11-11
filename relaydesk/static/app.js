@@ -2,6 +2,14 @@
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+// crypto.randomUUID 仅在安全上下文（HTTPS / localhost）可用，HTTP 访问时需回退
+const requestKey = () => {
+  if (window.crypto?.randomUUID) return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (window.crypto?.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+};
 const state = { csrf: '', setup: false, ready: false, page: 'overview', overview: null,
   groups: [], users: [], jobs: [], logs: [], quota: null, receipts: [], selected: new Set(),
   groupFilter: 'all', groupPage: 0, userPage: 0, settingsDirty: false, quotaDirty: false,
@@ -537,7 +545,7 @@ $('#reset-now').onclick = () => {
   const users = state.users.filter(user => (rule.scope === 'all' || rule.user_ids.includes(user.id)) && (rule.include_admins || user.role !== 'admin'));
   if (!users.length) { toast('请先刷新成员，并选择需要重置的账号。', true); return; }
   state.resetRule = rule;
-  state.resetRequestKey = crypto.randomUUID();
+  state.resetRequestKey = requestKey();
   const root = $('#reset-review'); root.replaceChildren(el('p', 'muted small', `将${rule.scope === 'all' ? '所有' : '已选择的'} ${users.length} 位成员的余额设为`),
     el('div', 'reset-amount', '$ ' + number(rule.amount, 6)), el('p', 'notice', '本次操作直接覆盖当前余额。确认后立即执行，每月自动重置规则另行保存。'));
   for (const user of users.slice(0, 8)) root.append(el('p', 'reset-person', user.email + (user.role === 'admin' ? ' · 管理员' : '')));
@@ -604,7 +612,7 @@ $('#open-batch').onclick = () => {
       option.value = stable.local_group_id; groups.prepend(option);
     }
   }
-  state.batchKey = crypto.randomUUID(); $('#batch-dialog').showModal();
+  state.batchKey = requestKey(); $('#batch-dialog').showModal();
 };
 $('#batch-modes').onclick = event => {
   const button = event.target.closest('[data-mode]'); if (!button) return;
@@ -614,7 +622,7 @@ $('#batch-modes').onclick = event => {
   $('#batch-error').textContent = ''; $('#batch-preview-rows').replaceChildren(el('p', 'empty-inline', '填写信息后，点击更新预览。'));
 };
 $('#batch-preview').onclick = previewBatch;
-$('#batch-form').oninput = () => { state.batchKey = crypto.randomUUID(); };
+$('#batch-form').oninput = () => { state.batchKey = requestKey(); };
 $('#batch-form').addEventListener('submit', event => {
   event.preventDefault(); const users = previewBatch(); if (!users) return;
   action(async () => {
