@@ -403,6 +403,45 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/overview").json()["low_cost_weight_defaults"], DEFAULT_WEIGHTS)
         self.assertEqual(self.client.post("/api/jobs/low-cost", json={"mode": "rate"}, headers=self.headers).status_code, 400)
 
+    def test_best_source_settings_validation(self):
+        config = self.client.get("/api/config").json()
+        self.assertEqual((config["best_source_enabled"], config["best_source_name"], config["best_source_check_minutes"],
+                          config["best_source_keep_top"], config["best_source_retry_minutes"]), (False, "最优源站 OpenAI", 10, 10, 1))
+        for value in ({"best_source_check_minutes": 0}, {"best_source_check_minutes": 1441}, {"best_source_keep_top": 0},
+                      {"best_source_keep_top": 101}, {"best_source_retry_minutes": 0}, {"best_source_enabled": "yes"},
+                      {"best_source_name": " "}, {"best_source_name": "最低价 OpenAI"}):
+            self.assertEqual(self.client.put("/api/config", json=value, headers=self.headers).status_code, 400, value)
+        response = self.client.put("/api/config", json={"best_source_name": " 源站优选 ", "best_source_keep_top": 5},
+                                   headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["best_source_name"], "源站优选")
+
+    def test_best_source_job_schedule_and_overview(self):
+        self.service.save_config({"best_source_enabled": True, "best_source_check_minutes": 7})
+        job = self.job("/jobs/best-source")
+        self.assertEqual(job["status"], "success", job)
+        self.assertEqual((job["result"]["upstream_id"], job["result"]["provider_rank"]), (7, 1))
+        overview = self.client.get("/api/overview").json()
+        self.assertEqual(overview["best_source"]["status"], "active")
+        self.assertAlmostEqual(overview["best_source_schedule"]["next_rank"] - time.time(), 7 * 60, delta=5)
+        self.assertEqual(overview["stats"]["active"], 1)
+        when = datetime.now(timezone.utc)
+        self.service.store.put("best_source_schedule", {"next_rank": 0})
+        self.service.store.put("low_cost_schedule", {"next_rank": when.timestamp() + 3600, "next_health": when.timestamp() + 3600})
+        with patch.object(self.service, "submit", return_value="mock-job") as submit:
+            self.service.tick(when)
+            submit.assert_called_once_with("best_source", {"mode": "ranking"})
+        self.assertEqual(self.service.store.get("best_source_schedule")["next_rank"], when.timestamp() + 60)
+
+    def test_best_source_disabled_after_openai_is_deselected(self):
+        self.service.save_config({"best_source_enabled": True})
+        self.job("/jobs/best-source")
+        self.service.save_config({"sync_platforms": ["gemini"]})
+        self.assertLessEqual(self.service.store.get("best_source_schedule")["next_rank"], time.time())
+        with patch.object(self.service, "submit", return_value="mock-job") as submit:
+            self.service.tick(datetime.now(timezone.utc))
+            submit.assert_any_call("best_source", {"mode": "ranking"})
+
     def test_obsolete_low_cost_settings_are_removed_on_startup(self):
         config = self.service.store.get("config")
         config.update(low_cost_rank_hours=3, low_cost_rate_check_enabled=True, low_cost_rate_rise_percent=20)

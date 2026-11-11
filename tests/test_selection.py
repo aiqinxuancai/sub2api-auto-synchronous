@@ -7,7 +7,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from provider_ranking import default_score, detector_passed, ranked_items
-from relaydesk.low_cost import LowCostSelector
+from relaydesk.low_cost import BestSourceSelector, LowCostSelector
 from relaydesk.scoring import DEFAULT_WEIGHTS, score_candidates
 from relaydesk.service import SELECTION_DEFAULTS
 from sync_sub2api import State, SyncError, Synchronizer, select_usable
@@ -393,6 +393,57 @@ class LowCostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BestSourceTests(unittest.TestCase):
+    setUp = test_sync.SyncIntegrationTests.setUp
+    tearDown = test_sync.SyncIntegrationTests.tearDown
+
+    def check(self, selector=BestSourceSelector, **settings):
+        engine = Synchronizer(self.config, State(self.config))
+        self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
+        options = {**SELECTION_DEFAULTS, "best_source_enabled": True, "low_cost_enabled": True, **settings}
+        return selector(engine, options).reconcile(engine.load_snapshot(), mode="ranking")
+
+    def test_selects_default_first_and_keeps_it_inside_top_k(self):
+        first = self.check()
+        self.assertEqual((first["upstream_id"], first["provider_rank"], first["decision"]), (7, 1, "selected"))
+        self.assertIn("[sub2api-bestsource:", self.fake.local_groups[-1]["description"])
+        self.fake.provider_overrides[9] = {"success_rates": {"1h": 1}}  # 9 overtakes 7 in the default order
+        kept = self.check(best_source_keep_top=10)
+        self.assertEqual((kept["upstream_id"], kept["decision"], kept["current_provider_rank"]), (7, "retained", 2))
+        moved = self.check(best_source_keep_top=1)
+        self.assertEqual((moved["upstream_id"], moved["switch_reason"]), (9, "outside_top_ten"))
+        self.assertEqual(moved["local_group_id"], first["local_group_id"])
+        self.assertEqual(len(self.fake.accounts), 1)
+
+    def test_switches_immediately_when_current_is_unavailable(self):
+        self.assertEqual(self.check()["upstream_id"], 7)
+        self.healthy = {8, 9}
+        moved = self.check()
+        self.assertEqual((moved["upstream_id"], moved["switch_reason"]), (8, "source_unavailable"))
+        self.healthy = set()
+        off = self.check()
+        self.assertEqual((off["status"], off["reason"]), ("inactive", "no_healthy_candidates"))
+        self.assertFalse(any(method == "DELETE" for method, _, _ in self.fake.requests))
+
+    def test_skips_unavailable_first_place_when_selecting(self):
+        self.healthy = {8, 9}
+        self.assertEqual(self.check()["upstream_id"], 8)
+
+    def test_coexists_with_low_cost_group_and_shares_upstream_key(self):
+        best = self.check()
+        cheap = self.check(LowCostSelector)
+        self.assertEqual(best["upstream_id"], cheap["upstream_id"])
+        self.assertNotEqual(best["local_group_id"], cheap["local_group_id"])
+        self.assertEqual(len(self.fake.accounts), 2)
+        self.assertEqual(len(self.fake.keys), 1)
+
+    def test_disabled_selector_stops_routing(self):
+        self.check()
+        off = self.check(best_source_enabled=False)
+        self.assertEqual((off["status"], off["reason"]), ("inactive", "selector_disabled"))
+        self.assertFalse(self.fake.accounts[0]["schedulable"])
 
 
 class ScoringTests(unittest.TestCase):

@@ -135,6 +135,20 @@
           <details class="candidate-details"><summary><span id="low-cost-candidates-label">查看候选渠道</span><svg class="icon"><use href="#i-chevron"/></svg></summary><div id="low-cost-candidates"></div></details>
         </div>
 
+        <div class="panel low-cost-panel best-source-panel">
+          <div class="panel-heading">
+            <div><h2><svg class="icon accent"><use href="#i-shield"/></svg><span id="best-title">最优源站 OpenAI</span><span id="best-status"></span></h2><p id="best-note">跟随 providers 默认排序第 1 名，不跌出前 N 名就保持。</p></div>
+            <button class="button" id="check-best-source" type="button"><svg class="icon"><use href="#i-refresh"/></svg>立即检测</button>
+          </div>
+          <div class="low-cost-summary">
+            <div><span class="small-label">当前上游渠道</span><strong id="best-source">等待首次检测</strong><small id="best-local">providers 默认排序</small></div>
+            <div><span class="small-label">默认排序</span><strong id="best-rank">—</strong><small id="best-keep"></small></div>
+            <div><span class="small-label">适用倍率 · 上游 → 本地</span><strong id="best-rate">—</strong></div>
+            <div><span class="small-label">下一次检测</span><small id="best-next">尚未启用</small></div>
+          </div>
+          <details class="candidate-details"><summary><span id="best-candidates-label">查看候选渠道</span><svg class="icon"><use href="#i-chevron"/></svg></summary><div id="best-candidates"></div></details>
+        </div>
+
         <div class="overview-body">
           <div class="panel groups-panel">
             <div class="panel-heading">
@@ -164,11 +178,13 @@
           <div><h1>连接配置</h1><p class="muted">连接你的站点，设定同步节奏。修改后点击底部的「保存配置」生效。</p></div>
         </header>
 
+        <p id="settings-version-notice" class="notice error" hidden>页面版本比正在运行的服务新，部分设置无法读取。请重启工作台服务（如 <code>.\manage_web.ps1 -Action Stop</code> 后再 <code>-Action Start</code>）并刷新页面，在此之前不要保存配置。</p>
         <form id="settings-form" class="settings-form">
           <nav class="settings-nav" aria-label="配置分区">
             <a href="#settings-connections" data-section>站点连接</a>
             <a href="#settings-rules" data-section>同步规则</a>
             <a href="#settings-lowcost" data-section>最低价分组</a>
+            <a href="#settings-bestsource" data-section>最优源站</a>
           </nav>
 
           <div class="settings-grid" id="settings-connections">
@@ -291,6 +307,22 @@
               </div>
 
               <p class="hint"><svg class="icon"><use href="#i-info"/></svg>评分检测时，当前渠道仍在前「1 + 允许下降」名内就保留，避免频繁切换；可用性检测只看渠道是否可用。分组 ID 固定，切换后无需重新绑定员工 Key。需同时选择 OpenAI 并开启「同步转发账号」。</p>
+            </div>
+          </div>
+
+          <div class="panel automation-panel" id="settings-bestsource">
+            <div class="panel-heading">
+              <div><h2>最优源站 OpenAI</h2><p>跟随 providers 默认排序的第 1 名，只要不跌出前 N 名就保持不换。</p></div>
+              <label class="switch-label"><span>启用分组</span><input name="best_source_enabled" type="checkbox" role="switch"><span class="switch-track"></span></label>
+            </div>
+            <div class="panel-body">
+              <div class="form-grid four">
+                <label class="field">本地分组名称<input name="best_source_name" maxlength="100" required><small>需与最低价分组名称不同</small></label>
+                <label class="field">检测间隔<span class="input-with-unit"><input name="best_source_check_minutes" type="number" min="1" max="1440" required><span>分钟</span></span><small>每次检测同时检查排名与可用性</small></label>
+                <label class="field">保持范围<span class="input-with-unit"><span class="unit-prefix">前</span><input name="best_source_keep_top" type="number" min="1" max="100" required><span>名</span></span><small>当前渠道跌出前 N 名才更换，1–100</small></label>
+                <label class="field">失败重试间隔<span class="input-with-unit"><input name="best_source_retry_minutes" type="number" min="1" max="1440" required><span>分钟</span></span><small>连接失败或等待上游 Key 时重试</small></label>
+              </div>
+              <p class="hint"><svg class="icon"><use href="#i-info"/></svg>首次启用或需要更换时，选用默认排序中第一个可用的渠道；当前渠道关闭、无法访问或不健康时立即更换。分组 ID 固定，切换后无需重新绑定员工 Key。需同时选择 OpenAI 并开启「同步转发账号」。</p>
             </div>
           </div>
 

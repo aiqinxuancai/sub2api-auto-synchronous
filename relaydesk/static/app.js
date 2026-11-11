@@ -9,7 +9,7 @@ const state = { csrf: '', setup: false, ready: false, page: 'overview', overview
   currentJob: null, batchKey: null, resetRule: null, polling: false, offline: false };
 const pages = { overview: '同步概览', settings: '连接配置', members: '成员与额度', logs: '运行日志' };
 const kinds = { sync: '同步可用分组', preview: '同步预览', connect: '连接测试', refresh_users: '刷新成员',
-  batch_users: '批量创建成员', quota_reset: '余额重置', low_cost: '最低价渠道检测' };
+  batch_users: '批量创建成员', quota_reset: '余额重置', low_cost: '最低价渠道检测', best_source: '最优源站检测' };
 const statuses = { active: '运行中', inactive: '已停用', pending: '待同步', excluded: '已排除',
   success: '已完成', failed: '失败', partial: '部分完成', running: '执行中', queued: '排队中',
   interrupted: '已中断', uncertain: '待核对' };
@@ -168,7 +168,7 @@ function renderOverview() {
   if (report.warnings?.length) messages.push(...report.warnings.filter(warning => !report.pending || !String(warning?.warning || warning).includes('API_KEY_CREATE_RATE_LIMITED')).map(warningText));
   $('#sync-notice').hidden = messages.length === 0;
   $('#sync-notice').textContent = [...new Set(messages)].join(' ');
-  renderLowCost(); renderRunning(); renderActivity(); renderCountdown();
+  renderLowCost(); renderBestSource(); renderRunning(); renderActivity(); renderCountdown();
 }
 const scoreMetrics = { price: '价格', rating: '评分', popularity: '人气', cache: '缓存', latency: '延迟', success: '成功率' };
 function lowCostDecision(data) {
@@ -234,6 +234,32 @@ function renderLowCost() {
     root.append(row);
   }
   if (!root.childNodes.length) root.append(el('p', 'field-help', '完成检测后显示候选渠道与综合评分。'));
+}
+function renderBestSource() {
+  const { config, best_source: data = {}, best_source_schedule: schedule = {} } = state.overview;
+  const enabled = config.best_source_enabled && config.sync_platforms.includes('openai') && config.sync_accounts;
+  const keepTop = config.best_source_keep_top, active = data.status === 'active';
+  $('#best-title').textContent = config.best_source_name;
+  $('#best-status').replaceChildren(badge(enabled ? (data.status || 'pending') : 'inactive'));
+  $('#best-source').textContent = data.source_name || '等待首次检测';
+  $('#best-local').textContent = data.local_group_id ? `本地 #${data.local_group_id} · ${data.models?.length || 0} 个模型` : 'providers 默认排序';
+  $('#best-rank').textContent = active && data.provider_rank ? `#${data.provider_rank}` : '—';
+  $('#best-keep').textContent = active ? `跌出前 ${keepTop} 名时更换` : '';
+  $('#best-rate').textContent = data.source_rate == null ? '—' : `${number(data.source_rate)} → ${number(data.local_rate)}`;
+  $('#best-next').textContent = enabled ? `检测 ${date(schedule.next_rank)} · 每 ${config.best_source_check_minutes} 分钟` : '在连接配置中开启，选择 OpenAI 并同步转发账号';
+  $('#best-note').textContent = reasons[data.reason] || (data.switch_reason && reasons[data.switch_reason] ? `${reasons[data.switch_reason]}，已更换为默认排序第一个可用渠道。`
+    : data.decision === 'retained' ? `当前渠道仍在默认排序前 ${keepTop} 名内，继续保留。` : `跟随 providers 默认排序第 1 名，不跌出前 ${keepTop} 名就保持。`);
+  $('#best-candidates-label').textContent = `查看默认排序前 ${keepTop} 名`;
+  $('#check-best-source').disabled = state.jobs.some(job => ['queued', 'running'].includes(job.status) && job.kind === 'best_source');
+  const root = $('#best-candidates'); root.replaceChildren();
+  for (const candidate of data.candidates || []) {
+    const row = el('div', 'candidate-row' + (candidate.eligible ? '' : ' ineligible'));
+    row.append(el('span', 'candidate-rank', `#${candidate.provider_rank}`), el('span', '', candidate.name || `分组 #${candidate.upstream_id}`),
+      el('strong', 'candidate-score', candidate.eligible ? `${number(candidate.source_rate)} 倍` : reasons[candidate.reason] || '不可用'));
+    if (candidate.upstream_id === data.upstream_id) row.classList.add('current');
+    root.append(row);
+  }
+  if (!root.childNodes.length) root.append(el('p', 'field-help', '完成检测后显示默认排序的候选渠道。'));
 }
 function renderCountdown() {
   if (!state.overview) return;
@@ -339,9 +365,13 @@ function renderModels() {
 $('#model-search').oninput = renderModels;
 
 const numericSettings = new Set(['interval_minutes', 'rate_factor', 'concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval', 'sync_top_n', 'low_cost_score_minutes', 'low_cost_health_minutes', 'low_cost_retry_minutes', 'low_cost_top_n', 'low_cost_rank_tolerance',
+  'best_source_check_minutes', 'best_source_keep_top', 'best_source_retry_minutes',
   ...Object.keys(scoreMetrics).map(key => 'low_cost_weight_' + key)]);
 function renderSettings() {
   const form = $('#settings-form'), config = state.overview.config;
+  // A page newer than the running backend shows blank fields; say so instead of letting a save fail later.
+  const missing = $$('[name]', form).filter(control => control.type !== 'password' && config[control.name] === undefined);
+  $('#settings-version-notice').hidden = !missing.length;
   for (const control of $$('[name]', form)) {
     if (control.name === 'sync_platforms') control.checked = config.sync_platforms.includes(control.value);
     else if (control.type === 'checkbox') control.checked = config[control.name];
@@ -427,6 +457,7 @@ async function runJob(path, body = {}, onDone) {
 $('#sync-now').onclick = () => action(() => runJob('/jobs/sync'));
 $('#preview-sync').onclick = () => action(() => runJob('/jobs/sync', { preview: true }, job => openJob(job)));
 $('#check-low-cost').onclick = () => action(() => runJob('/jobs/low-cost', { mode: 'ranking' }, job => openJob(job)));
+$('#check-best-source').onclick = () => action(() => runJob('/jobs/best-source', {}, job => openJob(job)));
 $('#refresh-users').onclick = () => action(() => runJob('/jobs/refresh-users'));
 
 function filteredUsers() {
@@ -566,10 +597,12 @@ $('#open-batch').onclick = () => {
   for (const group of state.groups.filter(group => group.status === 'active' && group.local_group_id)) {
     const option = el('option', '', `#${group.local_group_id} · ${group.name}`); option.value = group.local_group_id; groups.append(option);
   }
-  const lowCost = state.overview.low_cost;
-  if (lowCost?.status === 'active' && lowCost.local_group_id) {
-    const option = el('option', '', `#${lowCost.local_group_id} · ${lowCost.name}`);
-    option.value = lowCost.local_group_id; groups.prepend(option);
+  // Stable groups first: their IDs never change, so they suit long-lived employee access.
+  for (const stable of [state.overview.best_source, state.overview.low_cost]) {
+    if (stable?.status === 'active' && stable.local_group_id) {
+      const option = el('option', '', `#${stable.local_group_id} · ${stable.name}`);
+      option.value = stable.local_group_id; groups.prepend(option);
+    }
   }
   state.batchKey = crypto.randomUUID(); $('#batch-dialog').showModal();
 };
@@ -610,6 +643,7 @@ function summary(job) {
   const result = job.result;
   if (!result) return job.error || statuses[job.status] || job.status;
   if (job.kind === 'connect') return result.message;
+  if (job.kind === 'best_source') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · 默认排序 #${result.provider_rank} · ${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
   if (job.kind === 'low_cost') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · ${result.score != null ? `${number(result.score, 1)} 分 · ` : ''}${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : result.switch_reason === 'rank_dropped' ? '评分排名下降，已更换渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
   if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}`;
   if (job.kind === 'refresh_users') return `已读取 ${result.count} 位成员`;
@@ -641,8 +675,8 @@ function renderJobDetail(job) {
   if (job.error) detail.append(el('p', 'notice error', job.error));
   const result = job.result;
   if (result) {
-    if (job.kind === 'low_cost' && result.upstream_id) {
-      detail.append(el('p', '', `上游 #${result.upstream_id} → 本地 #${result.local_group_id || '待创建'} · 排名 #${result.provider_rank || '—'}`));
+    if (['low_cost', 'best_source'].includes(job.kind) && result.upstream_id) {
+      detail.append(el('p', '', `上游 #${result.upstream_id} → 本地 #${result.local_group_id || '待创建'} · 默认排序 #${result.provider_rank || '—'}`));
       detail.append(el('p', '', `前 ${result.top_n || 10} 名中 ${result.candidates?.filter(row => row.eligible).length || 0} 个候选通过检测 · ${result.retained_keys || 0} 个上游 Key 保留复用`));
       if (result.score != null) detail.append(el('p', '', `综合评分 ${number(result.score, 1)} 分 · 评分第 ${result.score_rank || '—'} 名 · 允许下降 ${result.rank_tolerance ?? '—'} 名`));
       if (result.switch_reason && reasons[result.switch_reason]) detail.append(el('p', 'notice', `更换原因：${reasons[result.switch_reason]}`));

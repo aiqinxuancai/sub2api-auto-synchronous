@@ -600,7 +600,8 @@ class Synchronizer:
             self.keys = self.upstream.list_all("/keys")
         name = f"sub2api-sync-{self.target_id}-g{group_id}"
         mapped_id = self.state.data["groups"].get(str(group_id), {}).get("upstream_key_id")
-        mapped_id = mapped_id or self.state.data.get("low_cost", {}).get("keys", {}).get(str(group_id))
+        for stable in ("low_cost", "best_source"):
+            mapped_id = mapped_id or self.state.data.get(stable, {}).get("keys", {}).get(str(group_id))
         candidates = [key for key in self.keys if (key.get("id") == mapped_id or key.get("name") == name)
                       and self._key_is_usable(key, group_id)]
         if candidates:

@@ -224,6 +224,11 @@ def create_app(directory=None, *, service=None, start_scheduler=True):
             raise SyncError("检测模式无效")
         return {"job_id": manager.submit("low_cost", {"mode": mode})}
 
+    @app.post("/api/jobs/best-source")
+    async def best_source(request: Request, manager=Depends(current)):
+        await payload(request)
+        return {"job_id": manager.submit("best_source", {"mode": "ranking"})}
+
     @app.post("/api/jobs/batch-users")
     async def batch_users(request: Request, manager=Depends(current)):
         body = await payload(request)
