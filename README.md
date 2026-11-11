@@ -35,31 +35,58 @@
 
 ## 🚀 快速开始
 
-### 方式一：使用 Release 镜像（推荐）
+### 方式一：使用 GHCR 镜像（推荐）
 
-1. 打开 [Releases](https://github.com/aiqinxuancai/sub2api-auto-synchronous/releases)，下载最新版本附带的 `docker-compose.yml`，放到一个空目录。
+镜像地址：`ghcr.io/aiqinxuancai/sub2api-auto-synchronous`（支持 linux/amd64、linux/arm64）
+
+1. 新建一个空目录，在其中创建 `docker-compose.yml`，内容如下：
+
+   ```yaml
+   name: sub2api-flow
+
+   services:
+     flow:
+       image: ghcr.io/aiqinxuancai/sub2api-auto-synchronous:latest
+       ports:
+         - "127.0.0.1:8787:8787"   # 局域网访问改为 "8787:8787"
+       volumes:
+         - ./data/web:/app/data     # 所有配置与数据，升级时请保留
+       restart: unless-stopped
+       init: true
+       stop_grace_period: 2m
+       logging:
+         driver: json-file
+         options:
+           max-size: "10m"
+           max-file: "3"
+   ```
+
 2. 在该目录执行：
 
    ```sh
-   docker compose -f docker-compose.yml up -d
+   docker compose up -d
    ```
 
 3. 浏览器打开 **http://127.0.0.1:8787**。
 
-无需下载源码。部署文件已固定多架构镜像摘要，完整说明见同一 Release 中的 `DEPLOY.md`。
+无需下载源码，也不需要 `.env`。如需固定版本，把 `latest` 换成具体版本号，例如 `0.4.0`。
 
 <details>
 <summary>常用运维命令</summary>
 
 ```sh
-docker compose -f docker-compose.yml ps        # 查看状态
-docker compose -f docker-compose.yml logs -f   # 查看日志
-docker compose -f docker-compose.yml down      # 停止
+docker compose ps                      # 查看状态
+docker compose logs -f                 # 查看日志
+docker compose pull && docker compose up -d   # 升级到最新镜像
+docker compose down                    # 停止
 ```
 
 如果 GHCR 包是私有的，请先执行 `docker login ghcr.io`。
 
 </details>
+
+> [!TIP]
+> 每个 [Release](https://github.com/aiqinxuancai/sub2api-auto-synchronous/releases) 也附带一份固定了镜像摘要的 `docker-compose.yml` 和 `DEPLOY.md`，适合需要严格锁定版本的环境。
 
 ### 方式二：从源码构建
 
@@ -110,7 +137,7 @@ python -m venv .venv
 4. **开启功能** —— 新安装默认**关闭**自动同步和最低价分组，测试通过后按需开启。
 
 > [!TIP]
-> Docker 默认只允许本机访问。需要局域网访问时，把 `compose.yaml` 中的 `127.0.0.1:8787:8787` 改为 `8787:8787`。端口和数据目录都直接在 yml 中修改。
+> Docker 默认只允许本机访问。需要局域网访问时，把 `docker-compose.yml`（源码构建为 `compose.yaml`）中的 `127.0.0.1:8787:8787` 改为 `8787:8787`。端口和数据目录都直接在 yml 中修改。
 
 ---
 
@@ -200,7 +227,7 @@ python -m venv .venv
 
 ### 升级
 
-- **Docker**：用新 Release 的 `docker-compose.yml` 替换旧文件后重新 `up -d`，保留 `data/web` 目录即可。
+- **Docker（GHCR 镜像）**：在部署目录执行 `docker compose pull && docker compose up -d`，保留 `data/web` 目录即可；固定版本的用户修改 `image` 中的版本号后再执行。
 - **从旧 Web 版升级**：自动迁移旧 SQLite 配置，保留原工作台密码、任务和 Key 映射；迁移完成后以配置文件为准，不再读取 `.env`。
 - **从旧 CLI 版升级**：请在 Web 中重新保存站点信息，并保留原数据备份。
 
