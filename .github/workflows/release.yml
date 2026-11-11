@@ -1,0 +1,135 @@
+name: Release and GHCR
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Check release version
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: python scripts/prepare_release.py --repository "$REPOSITORY" --tag "$TAG"
+      - name: Run tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+  publish:
+    name: Build images and publish release
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Resolve image and version
+        id: release
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: python scripts/prepare_release.py --repository "$REPOSITORY" --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Build a local image for runtime checks
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          load: true
+          tags: sub2api-flow:smoke
+          cache-from: type=gha
+      - name: Verify startup and persistence across a restart
+        run: |
+          mkdir -p .cache/container-data
+          docker run -d --name flow-smoke --user "$(id -u):$(id -g)" -p 127.0.0.1:8787:8787 -v "$PWD/.cache/container-data:/app/data" sub2api-flow:smoke
+          python scripts/container_smoke.py initialize --data-dir .cache/container-data
+          docker restart flow-smoke
+          python scripts/container_smoke.py verify --data-dir .cache/container-data
+      - name: Collect container logs and remove it
+        if: always()
+        run: |
+          docker logs flow-smoke || true
+          docker rm -f flow-smoke || true
+      - name: Login to GHCR
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: ${{ steps.release.outputs.image }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ steps.release.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.prerelease == 'false' }}
+          flavor: latest=false
+      - name: Publish multi-platform image
+        id: image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build Python packages and source archive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python -m pip install build
+          python -m build
+          git archive --format=zip --output="dist/sub2api-flow-$TAG-source.zip" HEAD
+      - name: Generate deployment assets and checksums
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: python scripts/prepare_release.py --repository "$REPOSITORY" --tag "$TAG" --digest "$DIGEST" --output dist
+      - name: Validate the generated deployment file
+        run: docker compose -f dist/docker-compose.yml config --quiet
+      - name: Publish GitHub Release and attach files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+        run: |
+          options=()
+          if [ "$PRERELEASE" = "true" ]; then options+=(--prerelease); fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "Flow $TAG" --notes-file dist/release-notes.md "${options[@]}"
+          fi
+          gh release upload "$TAG" dist/*.whl dist/*.tar.gz dist/*-source.zip dist/docker-compose.yml dist/DEPLOY.md dist/image.json dist/SHA256SUMS --clobber

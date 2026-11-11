@@ -1,0 +1,18 @@
+name: sub2api-flow
+
+services:
+  flow:
+    image: sub2api-flow:local
+    build: .
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./data/web:/app/data
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 2m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,314 @@
+"""Ranking, top-N policy and the stable lowest-price group's lifecycle."""
+
+import copy
+import unittest
+from datetime import datetime, timezone
+from decimal import Decimal
+from unittest.mock import patch
+
+from provider_ranking import default_score, detector_passed, ranked_items
+from relaydesk.low_cost import LowCostSelector
+from relaydesk.service import SELECTION_DEFAULTS
+from sync_sub2api import State, SyncError, Synchronizer, select_usable
+import test_sync
+from test_sync import iso_after
+
+
+class RankingTests(unittest.TestCase):
+    def test_default_score_normalizes_missing_measurements_and_image_tps(self):
+        now = datetime.now(timezone.utc)
+        item = {"rate_multiplier": .05, "success_rates": {"1h": 1}, "summary_tps": 40,
+                "runtime_trimmed_avg_ttft_ms": 2000, "runtime_trimmed_avg_has_data": True,
+                "runtime_trimmed_avg_sample_count": 1, "runtime_cache_1h": {"ready": True, "cache_hit_rate": .92},
+                "effective_input_price_per_million_1h": .05}
+        self.assertAlmostEqual(default_score(item, {}, now), 100)
+        self.assertAlmostEqual(default_score({"success_rates": {"1h": 1}}, {}, now), 4000 / 140)
+        item["hall_metrics"] = {"chart": {"image": True}}
+        self.assertAlmostEqual(default_score(item, {}, now), 10000 / 120)
+
+    def test_failover_then_health_then_score_then_id(self):
+        def item(group_id, health, success, failover=True):
+            return {"group_id": group_id, "platform": "openai", "visible_in_hall": True,
+                    "detections_enabled": True, "model_cards": [{"health": health, "probe_state": "enabled"}],
+                    "success_rates": {"1h": success}, "hall_metrics": {"automatic_failover_enabled": failover}}
+        items = [item(1, "healthy", 1, False), item(6, "healthy", .75), item(3, "failed", 1),
+                 item(5, "healthy", 1), item(4, "healthy", 1), item(2, "insufficient", 1)]
+        self.assertEqual([i["group_id"] for i in ranked_items({"items": items}, datetime.now(timezone.utc))],
+                         [4, 5, 6, 2, 3, 1])
+
+    def test_reputation_expiry_and_detector_bonus(self):
+        now = datetime.now(timezone.utc)
+        item = {"success_rates": {"1h": 1}, "reputation": {
+            "popularity_range": "1h", "popularity_share": 1, "stars": 5,
+            "popularity_expires_at": iso_after(), "review_expires_at": iso_after()},
+            "model_detection": {"applicable": True, "status": "passed",
+                "stage_enabled": {"detection": True, "text": False},
+                "stages": {"detection": {"state": "completed"}}}}
+        base = 4000 / 140
+        self.assertAlmostEqual(default_score(item, {}, now), base * 1.6)
+        item["reputation"]["review_expires_at"] = iso_after(-30)
+        self.assertAlmostEqual(default_score(item, {}, now), base * 1.4)
+        item["model_detection"]["stage_enabled"]["text"] = True
+        self.assertFalse(detector_passed(item))
+
+
+class SelectionIntegrationTests(unittest.TestCase):
+    setUp = test_sync.SyncIntegrationTests.setUp
+    tearDown = test_sync.SyncIntegrationTests.tearDown
+    cycle = test_sync.SyncIntegrationTests.cycle
+
+    def all_healthy(self):
+        self.fake.healthy_group_ids = {group["id"] for group in self.fake.groups}
+        self.fake.provider_overrides = {7: {"success_rates": {"1h": .7}},
+                                        8: {"success_rates": {"1h": 1}},
+                                        9: {"success_rates": {"1h": .8}}}
+
+    def test_ranked_key_creation_and_owned_local_sort_order(self):
+        self.all_healthy()
+        self.config.max_new_keys = 1
+        report = self.cycle()
+        self.assertEqual([row["upstream_id"] for row in report["groups"]], [8, 9, 7])
+        self.assertEqual(self.fake.keys[0]["group_id"], 8)
+        self.assertEqual(report["pending"], 2)
+        self.config.max_new_keys = 10
+        self.cycle()
+        self.assertEqual([row["group_id"] for row in self.fake.keys], [8, 9, 7])
+        state = State(self.config).data["groups"]
+        for rank, source_id in enumerate((8, 9, 7), 1):
+            row = next(row for row in self.fake.local_groups if row["id"] == state[str(source_id)]["local_group_id"])
+            self.assertEqual(row["sort_order"], rank)
+        self.assertNotIn("sort_order", self.fake.local_groups[0])
+
+    def test_top_n_shrink_expand_reuses_resources_and_keys(self):
+        self.all_healthy()
+        self.cycle()
+        previous = copy.deepcopy(State(self.config).data["groups"])
+        self.config.sync_top_n = 1
+        self.config.disable_unavailable = False
+        report = self.cycle()
+        self.assertEqual([row["upstream_id"] for row in report["groups"]], [8])
+        self.assertEqual(len(self.fake.keys), 3)
+        for source_id in (7, 9):
+            self.assertEqual(State(self.config).data["groups"][str(source_id)]["last_status"], "inactive")
+        self.config.sync_top_n = 0
+        self.cycle()
+        for source_id in (7, 8, 9):
+            mapping = State(self.config).data["groups"][str(source_id)]
+            self.assertEqual(mapping["last_status"], "active")
+            self.assertEqual(mapping["local_group_id"], previous[str(source_id)]["local_group_id"])
+        self.assertEqual(len(self.fake.keys), 3)
+
+    def test_default_openai_and_other_platform_policy(self):
+        self.all_healthy()
+        self.fake.groups[1]["platform"] = "gemini"
+        report = self.cycle()
+        self.assertEqual({row["platform"] for row in report["groups"]}, {"openai"})
+        self.config.sync_platforms = {"gemini"}
+        self.config.disable_unavailable = False
+        self.cycle()
+        self.assertEqual(State(self.config).data["groups"]["7"]["last_status"], "inactive")
+        self.assertEqual(State(self.config).data["groups"]["8"]["last_status"], "active")
+        self.config.sync_platforms = set()
+        self.cycle()
+        self.assertTrue(all(row.get("last_status") == "inactive" for row in State(self.config).data["groups"].values()))
+        self.assertEqual(len(self.fake.keys), 3)
+
+    def test_top_n_per_platform_vs_global(self):
+        self.all_healthy()
+        self.fake.groups[0]["platform"] = "gemini"
+        self.config.sync_platforms = {"openai", "gemini"}
+        self.config.sync_top_n = 1
+        report = self.cycle()
+        self.assertEqual({row["upstream_id"] for row in report["groups"]}, {7, 8})
+        self.config.sync_top_scope = "global"
+        report = self.cycle()
+        self.assertEqual([row["upstream_id"] for row in report["groups"]], [8])
+
+    def test_cap_before_access_and_expiry_checks_does_not_backfill(self):
+        self.all_healthy()
+        self.config.sync_top_n = 1
+        self.fake.provider_overrides[8]["probe_expires_at"] = iso_after(-30)
+        report = self.cycle()
+        self.assertEqual(report["usable_groups"], 0)
+        self.assertEqual(report["excluded_reasons"], {"outside_sync_top_n": 2, "probe_expired": 1})
+
+    def test_hidden_groups_are_excluded_even_with_healthy_models(self):
+        self.fake.provider_overrides[7] = {"visible_in_hall": False}
+        report = self.cycle()
+        self.assertEqual(report["usable_groups"], 0)
+        self.assertEqual(report["excluded"][0]["reason"], "not_visible_in_hall")
+
+    def test_fatal_error_pending_count_uses_rank_order(self):
+        self.all_healthy()
+        self.fake.deny_groups = True
+        report = self.cycle()
+        self.assertEqual(report["actions"][0]["upstream_id"], 8)
+        self.assertEqual(report["pending"], 3)
+
+
+class LowCostTests(unittest.TestCase):
+    setUp = test_sync.SyncIntegrationTests.setUp
+    tearDown = test_sync.SyncIntegrationTests.tearDown
+
+    def check(self, mode="ranking", **settings):
+        engine = Synchronizer(self.config, State(self.config))
+        self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
+        options = {**SELECTION_DEFAULTS, "low_cost_enabled": True, **settings}
+        return LowCostSelector(engine, options).reconcile(engine.load_snapshot(), mode=mode)
+
+    def test_lowest_applicable_rate_zero_override_and_stable_retention(self):
+        self.fake.rates = {"7": 0, "8": .01}
+        first = self.check()
+        self.assertEqual(first["upstream_id"], 7)
+        self.assertEqual(first["local_rate"], 0)
+        self.fake.rates = {"7": 2, "8": .001}
+        second = self.check()
+        self.assertEqual(second["decision"], "retained")
+        self.assertEqual(second["upstream_id"], 7)
+        self.assertEqual(second["source_rate"], 2)
+        self.assertEqual(first["local_group_id"], second["local_group_id"])
+        self.assertEqual(len(self.fake.keys), 1)
+
+    def test_health_failover_disable_recover_same_alias_and_reuse_renamed_key(self):
+        first = self.check()
+        self.assertEqual(first["upstream_id"], 7)
+        self.healthy = {8, 9}
+        second = self.check("health")
+        self.assertEqual(second["upstream_id"], 8)
+        self.assertEqual(second["local_group_id"], first["local_group_id"])
+        self.assertEqual(len(self.fake.accounts), 1)
+        self.healthy = set()
+        off = self.check("health")
+        self.assertEqual(off["status"], "inactive")
+        self.assertFalse(self.fake.accounts[0]["schedulable"])
+        self.fake.keys[0]["name"] = "renamed"
+        self.healthy = {7}
+        recovered = self.check("health")
+        self.assertEqual(recovered["upstream_id"], 7)
+        self.assertEqual(recovered["local_group_id"], first["local_group_id"])
+        self.assertTrue(self.fake.accounts[0]["schedulable"])
+        self.assertEqual(len(self.fake.keys), 2)
+        self.assertFalse(any(method == "DELETE" for method, _, _ in self.fake.requests))
+
+    def test_only_ranking_check_replaces_healthy_current_outside_top_ten(self):
+        first = self.check()
+        for group_id in range(20, 30):
+            self.fake.groups.append({"id": group_id, "name": f"Rank {group_id}", "platform": "openai",
+                                     "status": "active", "rate_multiplier": .1 + (group_id - 20) / 100})
+            self.fake.provider_overrides[group_id] = {"success_rates": {"1h": 1}}
+        self.healthy = {group["id"] for group in self.fake.groups}
+        retained = self.check("health")
+        self.assertEqual(retained["upstream_id"], 7)
+        self.assertGreater(retained["provider_rank"], 10)
+        replaced = self.check("ranking")
+        self.assertEqual(replaced["upstream_id"], 20)
+        self.assertEqual(replaced["local_group_id"], first["local_group_id"])
+
+    def test_outside_top_ten_is_disabled_while_replacement_waits_for_key(self):
+        self.check()
+        for group_id in range(20, 30):
+            self.fake.groups.append({"id": group_id, "name": f"Rank {group_id}", "platform": "openai",
+                                     "status": "active", "rate_multiplier": .1})
+            self.fake.provider_overrides[group_id] = {"success_rates": {"1h": 1}}
+        self.healthy = {group["id"] for group in self.fake.groups}
+        self.fake.hourly_key_limit = True
+        result = self.check("ranking")
+        self.assertEqual(result["status"], "inactive")
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(len(self.fake.keys), 1)
+
+    def test_detection_gate_and_regular_top_n_independence(self):
+        self.fake.provider_overrides[7] = {"model_detection": {"status": "suspected"}}
+        self.config.sync_top_n = 1
+        selected = self.check()
+        self.assertEqual(selected["upstream_id"], 8)
+        self.assertNotIn("7", State(self.config).data["groups"])
+        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], ["model-a"])
+
+    def test_stale_or_incomplete_snapshots_never_mutate(self):
+        self.check()
+        self.fake.requests.clear()
+        self.fake.stale = True
+        with self.assertRaises(SyncError):
+            self.check("health")
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_lowest_group_key_is_reused_by_normal_sync(self):
+        self.check()
+        Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(len(self.fake.keys), 3)
+        self.assertEqual(len(self.fake.accounts), 4)
+        self.assertEqual(self.fake.local_groups[0]["name"], "Manual")
+
+    def test_key_limit_disables_failed_source_and_recovers_later(self):
+        self.check()
+        self.healthy = {8}
+        self.fake.hourly_key_limit = True
+        result = self.check("health")
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["status"], "inactive")
+        self.assertEqual(len(self.fake.keys), 1)
+        self.fake.hourly_key_limit = False
+        result = self.check("health")
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["upstream_id"], 8)
+
+    def test_deselect_openai_disables_alias_without_touching_manual_groups(self):
+        self.check()
+        self.config.sync_platforms = {"gemini"}
+        result = self.check("health")
+        self.assertEqual(result["status"], "inactive")
+        self.assertEqual(self.fake.local_groups[0]["status"], "active")
+        self.assertEqual(len(self.fake.keys), 1)
+
+    def test_marker_tamper_stops_before_writes(self):
+        self.check()
+        self.fake.local_groups[-1]["description"] = "manual ownership"
+        self.fake.requests.clear()
+        with self.assertRaises(SyncError):
+            self.check()
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_repeat_without_changes_makes_no_mutations(self):
+        self.check()
+        self.fake.requests.clear()
+        self.check()
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_creation_limit_fails_over_using_another_retained_key(self):
+        self.healthy = {9}
+        self.check()
+        self.healthy = {8}
+        self.check("health")
+        self.healthy = {7, 9}
+        self.fake.hourly_key_limit = True
+        result = self.check("health")
+        self.assertEqual(result["upstream_id"], 9)
+        self.assertEqual(result["decision"], "fallback_existing_key")
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(len(self.fake.keys), 2)
+
+    def test_partial_update_stays_disabled_and_recovers_without_new_alias(self):
+        first = self.check()
+        self.fake.rates["7"] = .3
+        engine = Synchronizer(self.config, State(self.config))
+        original = engine.target.request
+
+        def reject_account_update(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/admin/accounts/"):
+                raise SyncError("Simulated rejected credentials update")
+            return original(method, path, *args, **kwargs)
+
+        with patch.object(engine.target, "request", side_effect=reject_account_update):
+            selector = LowCostSelector(engine, {**SELECTION_DEFAULTS, "low_cost_enabled": True})
+            with self.assertRaises(SyncError):
+                selector.reconcile(engine.load_snapshot(), mode="health")
+        self.assertEqual(self.fake.local_groups[-1]["status"], "inactive")
+        recovered = self.check("health")
+        self.assertEqual(recovered["status"], "active")
+        self.assertEqual(recovered["local_group_id"], first["local_group_id"])
+        self.assertEqual(len(self.fake.keys), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

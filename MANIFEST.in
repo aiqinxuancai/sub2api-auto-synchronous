@@ -1,0 +1,6 @@
+include README.md requirements.txt Dockerfile compose.yaml
+recursive-include scripts *.py
+recursive-include relaydesk/static *
+recursive-exclude data *
+recursive-exclude .cache *
+global-exclude .env .env.* *.pyc
