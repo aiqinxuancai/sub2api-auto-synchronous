@@ -271,8 +271,8 @@ python sync_sub2api.py --data-dir data/web --inspect-upstream   # 只读取上�
 <details>
 <summary><b>发布流程（GitHub Actions / GHCR）</b></summary>
 
-1. 将 `pyproject.toml` 中的版本号更新为目标版本并提交。
-2. 推送对应 tag：
+1. 提交并推送要发布的代码（包含最新工作流）。
+2. 创建并推送版本 tag，例如：
 
    ```sh
    git tag v0.4.0
@@ -281,12 +281,15 @@ python sync_sub2api.py --data-dir data/web --inspect-upstream   # 只读取上�
 
 `.github/workflows/release.yml` 会依次：
 
-- 在 Python 3.10 / 3.12 / 3.14 上运行测试并校验版本一致；
+- 从 tag 自动写入构建用的 Python 包版本和 Web 版本，无需手动修改 `pyproject.toml`；
+- 在 Python 3.10 / 3.12 / 3.14 上安装依赖并运行测试；
 - 构建容器，验证首次设置和重启后配置保留；
 - 推送 linux/amd64 + linux/arm64 镜像到 `ghcr.io/<owner>/<repository>`（自动转小写）；
 - 构建 Python 包和源码 ZIP，发布 GitHub Release，附带部署 yml、`DEPLOY.md`、镜像摘要和 `SHA256SUMS`。
 
-**镜像标签**：正式版发布 `v0.4.0`、`0.4.0`、`0.4` 和 `latest`；预发布版本（如 `v0.4.0-rc.1`，项目版本填 `0.4.0-rc.1`）不会更新 `latest`。同一 tag 可重新运行并覆盖附件。
+**镜像标签**：正式版发布 `v0.4.0`、`0.4.0`、`0.4` 和 `latest`；预发布版本（如 `v0.4.0-rc.1`）不会更新 `latest`。Python 包、Web 页脚和源码 ZIP 中的版本会与 tag 一致。同一 tag 可重新运行并覆盖附件。
+
+**修复失败发布**：已运行的 tag 固定在原提交上，仅点击 Re-run 不会使用之后提交的修复。将修复推送到仓库后，从新提交创建下一个版本 tag（例如已有 `v0.0.1`，则推送 `v0.0.2`）。
 
 工作流使用内置 `GITHUB_TOKEN`（已声明 `contents: write` 与 `packages: write`），无需额外 PAT，但仓库或组织需允许 Actions 发布包。参考：[GitHub 官方 GHCR 发布文档](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)。
 

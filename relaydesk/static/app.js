@@ -154,7 +154,7 @@ function renderOverview() {
   for (const side of ['upstream', 'target']) {
     $('#' + side + '-host').textContent = host(config[side + '_base']);
     const status = $('#' + side + '-status'), connection = connections[side];
-    status.textContent = connection ? connection.ok ? '● 已连接' : '● 连接失败' : '未测试';
+    status.textContent = connection ? connection.ok ? '已连接' : '连接失败' : '未测试';
     status.className = 'connection-status' + (connection ? connection.ok ? ' ok' : ' error' : '');
   }
   $('#sync-cadence').textContent = `每 ${config.interval_minutes} 分钟`;
@@ -195,7 +195,7 @@ function renderCountdown() {
   let text = '已暂停';
   if (state.overview.config.sync_enabled) {
     const seconds = Math.max(0, Math.floor(state.overview.next_sync - Date.now() / 1000));
-    text = seconds ? `${String(Math.floor(seconds / 60)).padStart(2, '0')} : ${String(seconds % 60).padStart(2, '0')}` : '即将同步';
+    text = seconds ? `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}` : '即将同步';
   }
   $('#sync-countdown').textContent = text;
 }
@@ -303,7 +303,7 @@ function renderSettings() {
       control.value = ''; control.placeholder = config.secrets_set[control.name] ? '已保存 · 留空保持原值' : '请输入';
     } else control.value = Array.isArray(config[control.name]) ? config[control.name].join(', ') : config[control.name] ?? '';
   }
-  state.settingsDirty = false; $('#settings-dirty').textContent = '已保存'; renderAuthModes();
+  setSettingsDirty(false); renderAuthModes();
   for (const side of ['upstream', 'target']) {
     const result = state.overview.connections[side];
     $('#test-' + side + '-result').textContent = result ? result.message + (result.latency_ms ? ` · ${number(result.latency_ms / 1000, 2)} s` : '') : '保存的凭据不会回显';
@@ -331,9 +331,18 @@ function settingsDraft(side) {
   }
   return result;
 }
-$('#settings-form').addEventListener('input', () => {
-  state.settingsDirty = true; $('#settings-dirty').textContent = '有未保存的更改'; renderAuthModes();
-});
+function setSettingsDirty(dirty) {
+  state.settingsDirty = dirty;
+  $('#settings-dirty').textContent = dirty ? '有未保存的更改' : '已保存';
+  $('#settings-save-bar').classList.toggle('dirty', dirty);
+  $('#settings-discard').disabled = !dirty;
+  $('#nav-settings-dirty').hidden = !dirty;
+}
+$('#settings-form').addEventListener('input', () => { setSettingsDirty(true); renderAuthModes(); });
+$('#settings-discard').onclick = () => { renderSettings(); toast('已恢复为上次保存的配置'); };
+$$('[data-section]').forEach(link => link.addEventListener('click', event => {
+  event.preventDefault(); $(link.getAttribute('href')).scrollIntoView({ behavior: 'smooth', block: 'start' });
+}));
 $('#settings-form').addEventListener('submit', event => {
   event.preventDefault(); action(async () => {
     const previousTarget = state.overview.config.target_base;
@@ -555,8 +564,7 @@ function renderJobs() {
   const root = $('#job-list'); root.replaceChildren();
   if (!state.jobs.length) root.append(empty('还没有执行任务', '首次操作后，执行记录会显示在这里。', 'log'));
   for (const job of state.jobs.slice(0, 30)) {
-    const row = el('button', 'job-row full'); row.type = 'button'; row.style.background = ''; row.style.borderLeft = row.style.borderRight = row.style.borderBottom = '0';
-    row.style.textAlign = 'left'; row.style.borderTopColor = '#f0f3ec';
+    const row = el('button', 'job-row'); row.type = 'button';
     row.append(icon(job.kind.includes('users') ? 'users' : job.kind === 'connect' ? 'link' : 'refresh'), el('span', 'job-name', kinds[job.kind]), el('span', 'job-summary', summary(job)), el('span', 'job-date', date(job.created)), badge(job.status));
     row.onclick = () => openJob(job); root.append(row);
   }

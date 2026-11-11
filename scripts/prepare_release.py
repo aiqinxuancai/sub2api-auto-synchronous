@@ -6,23 +6,66 @@ import argparse
 import hashlib
 import json
 import re
+import tempfile
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TAG = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?")
 
 
-def release_info(repository, tag, project_file=ROOT / "pyproject.toml"):
+def release_info(repository, tag):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("GitHub repository must have the form owner/repository")
     match = TAG.fullmatch(tag)
     if not match:
         raise ValueError("Use a version tag such as v0.4.0 or v0.4.0-rc.1")
-    version = re.search(r'^version\s*=\s*"([^"]+)"', project_file.read_text(encoding="utf-8"), re.M)
-    if not version or version[1] != tag[1:]:
-        raise ValueError("Update the project version in pyproject.toml to match the tag (without v)")
     return {"image": "ghcr.io/" + repository.lower(), "tag": tag,
             "version": tag[1:], "prerelease": "true" if match[4] else "false"}
+
+
+VERSIONED_FILES = ("pyproject.toml", "relaydesk/static/index.html")
+
+
+def prepare_project(info, root=ROOT):
+    """Stamp the tag version into the disposable CI checkout before installation."""
+    project = root / VERSIONED_FILES[0]
+    text = project.read_text(encoding="utf-8")
+    project_text, count = re.subn(r'(^version\s*=\s*)"[^"]+"',
+                                lambda match: match[1] + '"' + info["version"] + '"', text, count=1, flags=re.M)
+    if count != 1:
+        raise ValueError("Cannot find the project version in pyproject.toml")
+    page = root / VERSIONED_FILES[1]
+    page_text, count = re.subn(r'(<span class="version">)[^<]*(</span>)',
+                             lambda match: match[1] + info["tag"] + match[2],
+                             page.read_text(encoding="utf-8"), count=1)
+    if count != 1:
+        raise ValueError("Cannot find the version label in relaydesk/static/index.html")
+    project.write_text(project_text, encoding="utf-8")
+    page.write_text(page_text, encoding="utf-8")
+
+
+def update_source_archive(archive, root=ROOT):
+    """Include the same stamped metadata in the tracked-source ZIP as in the build."""
+    replacements = {name: (root / name).read_bytes() for name in VERSIONED_FILES}
+    with zipfile.ZipFile(archive) as original:
+        if not replacements.keys() <= set(original.namelist()):
+            raise ValueError("Source archive is missing versioned project files")
+        with tempfile.NamedTemporaryFile(dir=archive.parent, suffix=".zip", delete=False) as handle:
+            temporary = Path(handle.name)
+        try:
+            with zipfile.ZipFile(temporary, "w") as updated:
+                updated.comment = original.comment
+                for entry in original.infolist():
+                    updated.writestr(entry, replacements[entry.filename] if entry.filename in replacements
+                                     else original.read(entry))
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        temporary.replace(archive)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def compose_text(image):
@@ -91,18 +134,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--prepare-project", action="store_true",
+                        help="Set the package and Web version from the tag before installing or building")
+    parser.add_argument("--source-archive", type=Path,
+                        help="Update a git archive ZIP with the prepared project version")
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--digest")
     args = parser.parse_args()
     try:
         info = release_info(args.repository, args.tag)
+        if args.prepare_project:
+            prepare_project(info)
+        if args.source_archive:
+            update_source_archive(args.source_archive)
         if args.github_output:
             with args.github_output.open("a", encoding="utf-8") as handle:
                 handle.writelines(key + "=" + value + "\n" for key, value in info.items())
         if args.output:
             write_assets(args.output, info, args.digest or "")
-    except ValueError as error:
+    except (ValueError, OSError, zipfile.BadZipFile) as error:
         parser.exit(1, str(error) + "\n")
 
 
