@@ -40,7 +40,7 @@ def main():
         except (OSError, AssertionError):
             if time.monotonic() >= deadline:
                 raise RuntimeError("Container did not become ready") from None
-            time.sleep(1)
+            time.sleep(0.25)
     if args.phase == "initialize":
         assert request("/api/auth/status")["setup_needed"]
         csrf = request("/api/auth/setup", {"password": PASSWORD})["csrf"]
