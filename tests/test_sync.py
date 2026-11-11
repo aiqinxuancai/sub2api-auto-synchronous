@@ -41,6 +41,9 @@ class FakeSites:
         self.healthy_group_ids = {7}
         self.transient_key_limits = 0
         self.deny_groups = False
+        self.deny_accounts = False
+        self.ignore_account_groups_on_create = False
+        self.ignore_schedulable = False
         self.keys = []
         self.local_groups = [{"id": 1, "name": "Manual", "description": "unrelated",
                               "platform": "openai", "status": "active", "rate_multiplier": 9}]
@@ -99,7 +102,8 @@ class FakeSites:
         if path.startswith("/down/api/v1/admin/accounts/") and path.endswith("/schedulable"):
             item_id = int(path.split("/")[-2])
             row = next(item for item in self.accounts if item["id"] == item_id)
-            row["schedulable"] = body["schedulable"]
+            if not self.ignore_schedulable:
+                row["schedulable"] = body["schedulable"]
             return 200, copy.deepcopy(row)
         collections = {
             "/up/api/v1/keys": self.keys,
@@ -116,6 +120,8 @@ class FakeSites:
                     for item in items:
                         item["credentials"].pop("api_key", None)
                         item["credentials_status"] = {"has_api_key": True}
+                        if not item.get("group_ids"):
+                            item.pop("group_ids", None)  # Real API omits an empty binding.
                 return 200, {"items": items, "total": len(rows)}
             if method == "POST":
                 if path.endswith("keys") and self.transient_key_limits:
@@ -125,6 +131,8 @@ class FakeSites:
                     return 429, None
                 if path.endswith("groups") and self.deny_groups:
                     return 403, None
+                if path.endswith("accounts") and self.deny_accounts:
+                    return 400, {"message": "account rejected"}
                 created = copy.deepcopy(body)
                 created["id"] = max([item["id"] for item in rows] + [10]) + 1
                 created["status"] = "active"
@@ -132,6 +140,8 @@ class FakeSites:
                     created.update({"key": "sk-fake-test-secret", "quota": 0, "quota_used": 0})
                 if path.endswith("accounts"):
                     created["schedulable"] = True
+                    if self.ignore_account_groups_on_create:
+                        created.pop("group_ids", None)
                 rows.append(created)
                 return 200, copy.deepcopy(created)
         for root, rows in collections.items():
@@ -336,6 +346,68 @@ class SyncIntegrationTests(unittest.TestCase):
         self.cycle()
         self.assertEqual(self.fake.local_groups[-1]["status"], "inactive")
         self.assertEqual(self.fake.local_groups[0]["status"], "active")
+
+    def test_group_stays_inactive_until_its_account_is_bound(self):
+        self.fake.deny_accounts = True
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(len(report["errors"]), 1)
+        created = self.fake.local_groups[-1]
+        self.assertIn("[7]", created["name"])
+        self.assertEqual(created["status"], "inactive")
+        self.assertEqual(self.fake.accounts, [])
+        self.fake.deny_accounts = False
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(self.fake.local_groups[-1]["status"], "active")
+        self.assertEqual(self.fake.accounts[0]["group_ids"], [created["id"]])
+
+    def test_account_created_without_group_is_assigned_and_repaired(self):
+        self.fake.ignore_account_groups_on_create = True
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(report["errors"], [])
+        group = self.fake.local_groups[-1]
+        self.assertEqual(self.fake.accounts[0]["group_ids"], [group["id"]])
+        self.assertEqual(group["status"], "active")
+        # An account whose group selection was later cleared is assigned again.
+        self.fake.accounts[0].pop("group_ids")
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(self.fake.accounts[0]["group_ids"], [group["id"]])
+
+    def test_group_without_account_is_held_while_key_is_pending(self):
+        Synchronizer(self.config, State(self.config)).cycle()
+        group = self.fake.local_groups[-1]
+        self.fake.accounts.clear()      # account deleted on the server
+        self.fake.keys.clear()          # and its upstream Key is gone
+        self.config.auto_create_keys = False
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(report["pending"], 1)
+        self.assertEqual(group["status"], "inactive")
+        self.config.auto_create_keys = True
+        Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(group["status"], "active")
+        self.assertEqual(self.fake.accounts[0]["group_ids"], [group["id"]])
+
+    def test_final_audit_disables_group_whose_account_cannot_be_scheduled(self):
+        Synchronizer(self.config, State(self.config)).cycle()
+        group = self.fake.local_groups[-1]
+        self.fake.accounts[0]["schedulable"] = False
+        self.fake.ignore_schedulable = True
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(group["status"], "inactive")
+        self.assertIn("no_bound_account", [row.get("reason") for row in report["actions"]])
+        self.assertEqual(State(self.config).data["groups"]["7"]["last_reason"], "no_bound_account")
+        self.fake.ignore_schedulable = False
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(group["status"], "active")
+
+    def test_account_concurrency_follows_setting(self):
+        Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(self.fake.accounts[0]["concurrency"], 100)
+        self.config.concurrency = 7
+        Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(self.fake.accounts[0]["concurrency"], 7)
 
     def test_key_rate_limit_stops_before_creating_an_empty_local_group(self):
         self.fake.key_limit = True

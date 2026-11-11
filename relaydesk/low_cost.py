@@ -12,11 +12,23 @@ import logging
 from dataclasses import dataclass, field, replace
 
 from provider_ranking import detector_passed, ranked_items
-from sync_sub2api import APIError, SyncError, changed_fields, select_usable
+from sync_sub2api import APIError, SyncError, bound_group_ids, changed_fields, ensure_account_binding, select_usable
 
 from .scoring import DEFAULT_WEIGHTS, WEIGHT_SETTINGS, score_candidates
 
 LOG = logging.getLogger("sub2api-sync")
+NAME_LIMIT = 100
+# Changing only these never needs the disable-update-enable cycle.
+COSMETIC_FIELDS = {"name", "description", "concurrency"}
+
+
+def display_name(base, source_name):
+    """`设置的名称（当前上游分组名）`, trimming the upstream part to fit the name limit."""
+    source = str(source_name or "").strip()
+    room = NAME_LIMIT - len(base) - 2
+    if not source or room < 1:
+        return base[:NAME_LIMIT]
+    return f"{base}（{source[:room]}）"
 
 
 @dataclass
@@ -157,14 +169,15 @@ class StableGroupSelector:
             return self._result(result, "pending")
         self.mapping.setdefault("keys", {})[str(group_id)] = key["id"]
         self.state.save()
-        name = self.settings[self.name_setting]
+        name = display_name(self.settings[self.name_setting], selected.source.get("name"))
         desired = engine.group_payload(selected)
         desired.update(name=name, description=self.marker + f"\n上游分组 #{group_id} · {selected.source['name']}")
         desired.pop("status")
         credentials = {"base_url": config.upstream_base, "api_key": key["key"],
                        "model_mapping": {model: model for model in selected.models}}
         digest = hashlib.sha256(key["key"].encode()).hexdigest()
-        account_desired = {"name": name, "notes": self.marker, "rate_multiplier": selected.source_rate, "status": "active"}
+        account_desired = {"name": name, "notes": self.marker, "rate_multiplier": selected.source_rate,
+                           "concurrency": config.concurrency, "status": "active"}
         group_patch = changed_fields(group or {}, desired)
         account_patch = changed_fields(account or {}, account_desired)
         old_credentials = (account or {}).get("credentials") or {}
@@ -173,12 +186,8 @@ class StableGroupSelector:
                 or old_credentials.get("model_mapping") != credentials["model_mapping"]
                 or (account or {}).get("credentials_status", {}).get("has_api_key") is False):
             account_patch["credentials"] = credentials
-        bound = (account or {}).get("group_ids")
-        if bound is None and isinstance((account or {}).get("groups"), list):
-            bound = [row["id"] for row in account["groups"]]
-        if group and bound != [group["id"]]:
-            account_patch["group_ids"] = [group["id"]]
-        if group_patch or account_patch:
+        unbound = account is not None and group is not None and bound_group_ids(account) != [group["id"]]
+        if unbound or set(group_patch) - COSMETIC_FIELDS or set(account_patch) - COSMETIC_FIELDS:
             self._disable(group, account, "updating")
         if group is None:
             group = engine.target.request("POST", "/admin/groups", {**desired, "subscription_type": "standard", "is_exclusive": False})
@@ -191,8 +200,7 @@ class StableGroupSelector:
             account = engine.target.request("POST", "/admin/accounts", {
                 **{key: value for key, value in account_desired.items() if key != "status"},
                 "platform": "openai", "type": "apikey", "credentials": credentials,
-                "group_ids": [group["id"]], "concurrency": config.concurrency,
-                "priority": config.priority, "upstream_billing_probe_enabled": False})
+                "group_ids": [group["id"]], "priority": config.priority, "upstream_billing_probe_enabled": False})
             self.mapping["local_account_id"] = account["id"]
             self.state.save()
         else:
@@ -201,6 +209,7 @@ class StableGroupSelector:
                 account_patch["status"] = "active"
             if account_patch:
                 engine.target.request("PUT", f"/admin/accounts/{account['id']}", account_patch)
+        ensure_account_binding(engine.target, account, group["id"], self.label)
         if account.get("schedulable") is not True:
             engine.target.request("POST", f"/admin/accounts/{account['id']}/schedulable", {"schedulable": True})
         if group.get("status") != "active":

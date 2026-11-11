@@ -112,7 +112,7 @@ class Config:
     rate_factor: Decimal = Decimal("1.0")
     sync_accounts: bool = True
     auto_create_keys: bool = True
-    concurrency: int = 3
+    concurrency: int = 100
     priority: int = 50
     dry_run: bool = True
     timeout: int = 30
@@ -518,6 +518,30 @@ def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
     return selected, excluded
 
 
+def bound_group_ids(account: dict[str, Any]) -> list[int]:
+    """Sub2API omits `group_ids`/`groups` entirely when an account has no binding."""
+    ids = account.get("group_ids")
+    if ids is None and isinstance(account.get("groups"), list):
+        ids = [group["id"] for group in account["groups"]]
+    return sorted(ids or [])
+
+
+def ensure_account_binding(client: "Client", account: dict[str, Any], local_group_id: int,
+                           label: str) -> None:
+    """Bind the account to exactly this group and confirm it on the server.
+
+    Some Sub2API versions ignore `group_ids` when creating an account, so an
+    account can exist and be enabled while its group still has no account.
+    """
+    if bound_group_ids(account) == [local_group_id]:
+        return
+    client.request("PUT", f"/admin/accounts/{account['id']}", {"group_ids": [local_group_id]})
+    confirmed = client.request("GET", f"/admin/accounts/{account['id']}")
+    if not isinstance(confirmed, dict) or bound_group_ids(confirmed) != [local_group_id]:
+        raise SyncError(f"{label}: 账号 {account['id']} 未能绑定到本地分组 {local_group_id}，分组保持停用")
+    account["group_ids"] = [local_group_id]
+
+
 def changed_fields(current: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in desired.items() if current.get(key) != value}
 
@@ -619,6 +643,38 @@ class Synchronizer:
             raise SyncError(f"上游分组 {group_id}: 无法取得完整 API Key")
         return key
 
+    def _hold_without_account(self, group: dict[str, Any] | None,
+                              account: dict[str, Any] | None) -> None:
+        """Keep a group out of routing while no account has selected it."""
+        if (group and self.config.sync_accounts and group.get("status") != "inactive"
+                and (account is None or bound_group_ids(account) != [group["id"]])):
+            # Sub2API creates groups active; a group without accounts only returns 503.
+            self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
+            group["status"] = "inactive"
+
+    def _audit_bindings(self, report: dict[str, Any]) -> None:
+        """Final pass: every active managed group must have an active account that selected it."""
+        local_groups = self.target.list_all("/admin/groups")
+        accounts = self.target.list_all("/admin/accounts")
+        covered = {group_id for account in accounts
+                   if account.get("status") == "active" and account.get("schedulable") is not False
+                   for group_id in bound_group_ids(account)}
+        for upstream_id, group in sorted(self._discover(local_groups, "description", "local_group_id").items()):
+            if group.get("status") != "active" or group["id"] in covered:
+                continue
+            try:
+                self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
+            except SyncError as error:
+                report["errors"].append({"upstream_id": upstream_id, "error": str(error)})
+                continue
+            mapping = self.state.data["groups"].setdefault(str(upstream_id), {})
+            mapping.update({"last_status": "inactive", "last_reason": "no_bound_account"})
+            self.state.save()
+            report["actions"].append({"upstream_id": upstream_id, "action": "disable", "reason": "no_bound_account"})
+            report["errors"].append({"upstream_id": upstream_id,
+                                     "error": f"本地分组 {group['id']} 没有可用的绑定账号，已停用，下轮自动修复"})
+            LOG.warning("group=%d: 本地分组 %d 没有可用的绑定账号，已停用，下轮自动修复", upstream_id, group["id"])
+
     def _sync_account(self, selected: SelectedGroup, local_group_id: int,
                       account: dict[str, Any] | None, key: dict[str, Any]) -> tuple[int, str]:
         group_id = selected.source["id"]
@@ -627,15 +683,17 @@ class Synchronizer:
                        "model_mapping": {model: model for model in selected.models}}
         digest = hashlib.sha256(key["key"].encode()).hexdigest()
         desired = {"name": self.name(selected.source), "notes": self.marker(group_id),
-                   "rate_multiplier": selected.source_rate, "status": "active"}
+                   "rate_multiplier": selected.source_rate, "concurrency": self.config.concurrency,
+                   "status": "active"}
         if account is None:
             payload = {key: value for key, value in desired.items()
                        if key != "status"}
             payload.update({"platform": selected.source["platform"], "type": "apikey",
                             "credentials": credentials, "group_ids": [local_group_id],
-                            "concurrency": self.config.concurrency, "priority": self.config.priority,
-                            "upstream_billing_probe_enabled": False})
+                            "priority": self.config.priority, "upstream_billing_probe_enabled": False})
             account = self.target.request("POST", "/admin/accounts", payload)
+            mapping["local_account_id"] = account["id"]
+            self.state.save()
             action = "created"
         else:
             if account.get("platform") != selected.source["platform"] or account.get("type") != "apikey":
@@ -649,17 +707,12 @@ class Synchronizer:
                 # Send only the fields we own; the server merges credentials and
                 # does not expose secret values in read responses.
                 patch["credentials"] = credentials
-            bound_ids = account.get("group_ids")
-            if bound_ids is None and isinstance(account.get("groups"), list):
-                bound_ids = [g["id"] for g in account["groups"]]
-            if (bound_ids is not None and sorted(bound_ids) != [local_group_id]) or (
-                    bound_ids is None and mapping.get("local_group_id") != local_group_id):
-                patch["group_ids"] = [local_group_id]
             if patch:
                 self.target.request("PUT", f"/admin/accounts/{account['id']}", patch)
                 action = "updated"
             else:
-                action = "unchanged"
+                action = "unchanged" if bound_group_ids(account) == [local_group_id] else "rebound"
+        ensure_account_binding(self.target, account, local_group_id, f"上游分组 {group_id}")
         if account.get("schedulable") is not True:
             self.target.request("POST", f"/admin/accounts/{account['id']}/schedulable",
                                 {"schedulable": True})
@@ -790,6 +843,7 @@ class Synchronizer:
                 if self.config.sync_accounts and key is None:
                     action["result"] = "pending_upstream_key"
                     report["pending"] += 1
+                    self._hold_without_account(group, account)
                     continue
                 if group is None:
                     create_payload = {key: value for key, value in payload.items() if key != "status"}
@@ -806,6 +860,7 @@ class Synchronizer:
                     if group_patch:
                         self.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
                     action["group_result"] = "updated" if group_patch else "unchanged"
+                self._hold_without_account(group, account)
                 if self.config.sync_accounts:
                     account_id, account_result = self._sync_account(
                         selected_group, group["id"], account, key)
@@ -826,6 +881,10 @@ class Synchronizer:
                          action["group_result"], action.get("account_result", "disabled"),
                          len(selected_group.models))
             except SyncError as error:
+                try:
+                    self._hold_without_account(group, account)
+                except SyncError as hold_error:
+                    report["errors"].append({"upstream_id": group_id, "error": str(hold_error)})
                 if isinstance(error, APIError) and error.code == "API_KEY_CREATE_RATE_LIMITED":
                     self.key_creation_blocked = True
                     report["pending"] += 1
@@ -851,6 +910,11 @@ class Synchronizer:
                     report["sort_updated"] = len(updates)
                 except SyncError as error:
                     report["errors"].append({"error": f"分组排序更新失败：{error}"})
+        if not self.config.dry_run and self.config.sync_accounts:
+            try:
+                self._audit_bindings(report)
+            except SyncError as error:
+                report["errors"].append({"error": f"分组账号绑定检查失败：{error}"})
         report["new_upstream_keys"] = self.new_keys
         write_private_json(self.config.report_file, report)
         LOG.info("%s完成；错误=%d 待后续同步=%d；报告：%s",

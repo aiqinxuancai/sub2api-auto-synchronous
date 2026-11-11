@@ -61,7 +61,7 @@ def default_settings():
         "upstream_email": "", "target_email": "", **{key: "" for key in SECRETS},
         "upstream_auth_mode": "login", "target_auth_mode": "key",
         "interval_minutes": 30, "prefix": "upstream-", "rate_factor": 1.0, "group_ids": [],
-        "sync_accounts": True, "auto_create_keys": True, "concurrency": 3, "priority": 50,
+        "sync_accounts": True, "auto_create_keys": True, "concurrency": 100, "priority": 50,
         "timeout": 30, "providers_path": "/api/v2/public/providers", "max_new_keys": 50,
         "disable_unavailable": True, "request_interval": 1.1, "sync_enabled": False,
     }

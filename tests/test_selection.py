@@ -170,6 +170,31 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(first["local_group_id"], second["local_group_id"])
         self.assertEqual(len(self.fake.keys), 1)
 
+    def test_selector_account_created_without_group_is_assigned(self):
+        self.fake.ignore_account_groups_on_create = True
+        result = self.check()
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(self.fake.accounts[0]["group_ids"], [result["local_group_id"]])
+
+    def test_group_and_account_names_show_current_upstream(self):
+        self.check()
+        self.assertEqual(self.fake.local_groups[-1]["name"], "最低价 OpenAI（Alpha）")
+        self.assertEqual(self.fake.accounts[0]["name"], "最低价 OpenAI（Alpha）")
+        # A rename alone updates in place without a disable/enable cycle.
+        self.fake.groups[0]["name"] = "Alpha-Pro"
+        self.fake.requests.clear()
+        renamed = self.check("health")
+        self.assertEqual(renamed["decision"], "retained")
+        self.assertEqual(self.fake.local_groups[-1]["name"], "最低价 OpenAI（Alpha-Pro）")
+        self.assertEqual(self.fake.accounts[0]["name"], "最低价 OpenAI（Alpha-Pro）")
+        self.assertFalse(any(body.get("status") == "inactive" or body.get("schedulable") is False
+                             for _, _, body in self.fake.mutations() if isinstance(body, dict)))
+        self.healthy = {8, 9}
+        self.check("health")
+        self.assertEqual(self.fake.local_groups[-1]["name"], "最低价 OpenAI（Bad）")
+        long_name = self.check("health", low_cost_name="x" * 99)
+        self.assertEqual(long_name["name"], "x" * 99)
+
     def test_health_failover_disable_recover_same_alias_and_reuse_renamed_key(self):
         first = self.check()
         self.assertEqual(first["upstream_id"], 7)
