@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from sync_sub2api import SyncError
-from .service import Service
+from .service import LOW_COST_MODES, Service
 
 COOKIE = "flow_session"
 STATIC = Path(__file__).parent / "static"
@@ -220,7 +220,7 @@ def create_app(directory=None, *, service=None, start_scheduler=True):
     async def low_cost(request: Request, manager=Depends(current)):
         body = await payload(request)
         mode = body.get("mode", "ranking")
-        if mode not in {"ranking", "health"}:
+        if mode not in LOW_COST_MODES:
             raise SyncError("检测模式无效")
         return {"job_id": manager.submit("low_cost", {"mode": mode})}
 

@@ -21,13 +21,22 @@ from provider_ranking import PLATFORMS
 from .storage import Store
 from .configuration import SECRET_FIELDS
 from .low_cost import LowCostSelector
+from .scoring import DEFAULT_WEIGHTS, WEIGHT_SETTINGS
 
 SECRETS = SECRET_FIELDS
 SELECTION_DEFAULTS = {"sync_platforms": ["openai"], "sync_top_n": 0, "sync_top_scope": "per_platform",
                       "low_cost_enabled": False, "low_cost_name": "最低价 OpenAI",
-                      "low_cost_rank_hours": 1, "low_cost_health_minutes": 5,
-                      "low_cost_require_detection": True, "low_cost_retry_minutes": 1}
-LIVE_SETTINGS = {"sync_enabled", "interval_minutes", "low_cost_rank_hours", "low_cost_health_minutes", "low_cost_retry_minutes"}
+                      "low_cost_score_minutes": 10, "low_cost_health_minutes": 5,
+                      "low_cost_require_detection": True, "low_cost_retry_minutes": 1,
+                      "low_cost_exclude_keywords": [], "low_cost_top_n": 10, "low_cost_rank_tolerance": 2,
+                      **{key: DEFAULT_WEIGHTS[metric] for metric, key in WEIGHT_SETTINGS.items()}}
+# Settings replaced by the composite score; removed from config.json on startup.
+OBSOLETE_SETTINGS = {"low_cost_rank_hours", "low_cost_rate_check_enabled", "low_cost_rate_check_minutes",
+                     "low_cost_rate_rise_percent"}
+MAX_EXCLUDE_KEYWORDS = 50
+MAX_KEYWORD_LENGTH = 50
+LOW_COST_MODES = {"ranking", "health"}
+LIVE_SETTINGS = {"sync_enabled", "interval_minutes", "low_cost_score_minutes", "low_cost_health_minutes", "low_cost_retry_minutes"}
 
 
 def default_settings():
@@ -108,7 +117,8 @@ class Service:
         if self.store.get("config") is None:
             self._initialize_config()
         values = self.store.get("config")
-        migrated = {**copy.deepcopy(SELECTION_DEFAULTS), **values}
+        migrated = {key: value for key, value in {**copy.deepcopy(SELECTION_DEFAULTS), **values}.items()
+                    if key not in OBSOLETE_SETTINGS}
         if migrated != values:
             self.store.put("config", migrated)
         if self.store.get("quota_rule") is None:
@@ -155,7 +165,8 @@ class Service:
                 continue
             values[key] = value
         for key in ("interval_minutes", "concurrency", "timeout", "max_new_keys", "priority",
-                    "sync_top_n", "low_cost_rank_hours", "low_cost_health_minutes", "low_cost_retry_minutes"):
+                    "sync_top_n", "low_cost_score_minutes", "low_cost_health_minutes", "low_cost_retry_minutes",
+                    "low_cost_top_n", "low_cost_rank_tolerance", *WEIGHT_SETTINGS.values()):
             if isinstance(values[key], bool) or not isinstance(values[key], int):
                 raise SyncError("周期、并发和数量必须为整数")
         if not 1 <= values["interval_minutes"] <= 1440:
@@ -172,13 +183,31 @@ class Service:
                 not isinstance(item, str) or item not in PLATFORMS for item in values["sync_platforms"]):
             raise SyncError("请选择有效的平台")
         values["sync_platforms"] = list(dict.fromkeys(values["sync_platforms"]))
-        if not 1 <= values["low_cost_rank_hours"] <= 720 or not 1 <= values["low_cost_health_minutes"] <= 1440:
-            raise SyncError("排名周期应为 1–720 小时，可用性周期应为 1–1440 分钟")
+        if not 1 <= values["low_cost_score_minutes"] <= 1440 or not 1 <= values["low_cost_health_minutes"] <= 1440:
+            raise SyncError("评分检测与可用性检测间隔应为 1–1440 分钟")
         if not 1 <= values["low_cost_retry_minutes"] <= 1440:
             raise SyncError("失败重试间隔应为 1–1440 分钟")
+        if not 1 <= values["low_cost_top_n"] <= 100:
+            raise SyncError("最低价候选范围应为前 1–100 名")
+        if not 0 <= values["low_cost_rank_tolerance"] <= 50:
+            raise SyncError("允许的排名下降应为 0–50 名")
+        weights = [values[key] for key in WEIGHT_SETTINGS.values()]
+        if any(not 0 <= weight <= 100 for weight in weights) or not sum(weights):
+            raise SyncError("评分权重应为 0–100，且至少有一项大于 0")
         if not isinstance(values["low_cost_name"], str) or not 1 <= len(values["low_cost_name"].strip()) <= 100:
             raise SyncError("最低价分组名称需要 1–100 个字符")
         values["low_cost_name"] = values["low_cost_name"].strip()
+        keywords = values["low_cost_exclude_keywords"]
+        if not isinstance(keywords, list) or any(not isinstance(item, str) for item in keywords):
+            raise SyncError("排除关键字必须为文本列表")
+        unique = {}
+        for item in keywords:
+            item = item.strip()
+            if item and item.casefold() not in unique:
+                unique[item.casefold()] = item
+        if len(unique) > MAX_EXCLUDE_KEYWORDS or any(len(item) > MAX_KEYWORD_LENGTH for item in unique.values()):
+            raise SyncError(f"排除关键字最多 {MAX_EXCLUDE_KEYWORDS} 个，每个不超过 {MAX_KEYWORD_LENGTH} 个字符")
+        values["low_cost_exclude_keywords"] = list(unique.values())
         if not isinstance(values["group_ids"], list) or any(
                 type(item) is not int or item <= 0 for item in values["group_ids"]):
             raise SyncError("分组 ID 必须为正整数列表")
@@ -357,9 +386,7 @@ class Service:
             snapshot = engine.load_snapshot()
             low_cost = None
             if not preview and (values["low_cost_enabled"] or state.data.get("low_cost")):
-                schedule = self.store.get("low_cost_schedule", {})
-                mode = "ranking" if schedule.get("next_rank", 0) <= time.time() else "health"
-                low_cost = self._reconcile_low_cost(engine, values, snapshot, mode)
+                low_cost = self._reconcile_low_cost(engine, values, snapshot, self._due_low_cost_mode(values) or "health")
             report = engine.cycle(snapshot=snapshot)
         if not preview:
             self.store.put("report", report)
@@ -373,8 +400,18 @@ class Service:
                 "low_cost": low_cost,
                 "new_keys": report.get("new_upstream_keys", 0)}
 
+    def _due_low_cost_mode(self, values, now=None):
+        """The score check ("ranking") also verifies availability, so it wins when both are due."""
+        now = time.time() if now is None else now
+        schedule = self.store.get("low_cost_schedule", {})
+        if schedule.get("next_rank", 0) <= now:
+            return "ranking"
+        if schedule.get("next_health", 0) <= now:
+            return "health"
+        return None
+
     def _check_low_cost(self, mode):
-        if mode not in {"ranking", "health"}:
+        if mode not in LOW_COST_MODES:
             raise SyncError("检测模式无效")
         values = getattr(self.context, "settings", None) or self.store.get("config")
         config = self.config(values)
@@ -401,8 +438,8 @@ class Service:
             schedule["next_health"] = now + (min(cadence["low_cost_retry_minutes"], cadence["low_cost_health_minutes"])
                                              if result.get("pending") else cadence["low_cost_health_minutes"]) * 60
             if mode == "ranking":
-                schedule["next_rank"] = now + (cadence["low_cost_retry_minutes"] * 60 if result.get("pending")
-                                                else cadence["low_cost_rank_hours"] * 3600)
+                schedule["next_rank"] = now + (cadence["low_cost_retry_minutes"] if result.get("pending")
+                                               else cadence["low_cost_score_minutes"]) * 60
             self.store.put("low_cost_schedule", schedule)
         return result
 
@@ -624,19 +661,19 @@ class Service:
         should_check = (values["low_cost_enabled"] and "openai" in values["sync_platforms"] and values["sync_accounts"])
         needs_disable = low_status.get("status") == "active" and not should_check
         if should_check or needs_disable:
-            rank_due = low_schedule.get("next_rank", 0) <= now.timestamp()
-            health_due = low_schedule.get("next_health", 0) <= now.timestamp()
-            if rank_due or health_due:
+            mode = self._due_low_cost_mode(values, now.timestamp())
+            if mode:
                 with self.pending_lock:
                     idle = not self.busy
                 if idle:
                     try:
-                        self.submit("low_cost", {"mode": "ranking" if rank_due else "health"})
+                        self.submit("low_cost", {"mode": mode})
                         # Successful jobs replace these retries with the configured detection cadence.
+                        retry_at = now.timestamp() + values["low_cost_retry_minutes"] * 60
                         retry_schedule = dict(low_schedule)
-                        retry_schedule["next_health"] = now.timestamp() + values["low_cost_retry_minutes"] * 60
-                        if rank_due:
-                            retry_schedule["next_rank"] = now.timestamp() + values["low_cost_retry_minutes"] * 60
+                        retry_schedule["next_health"] = retry_at
+                        if mode == "ranking":
+                            retry_schedule["next_rank"] = retry_at
                         self.store.put("low_cost_schedule", retry_schedule)
                     except SyncError:
                         pass
@@ -667,6 +704,7 @@ class Service:
                 "next_sync": self.store.get("sync_schedule", {}).get("next_run"),
                 "provider_options": self.store.get("report", {}).get("provider_options", list(PLATFORMS)),
                 "low_cost": self.store.get("low_cost", {}), "low_cost_schedule": self.store.get("low_cost_schedule", {}),
+                "low_cost_weight_defaults": dict(DEFAULT_WEIGHTS),
                 "connections": {side: self.store.get("connection_" + side) for side in ("upstream", "target")},
                 "jobs": self.store.jobs(10), "quota_rule": self.store.get("quota_rule"),
                 "server_time": time.time(), "timezone": "Asia/Shanghai"}

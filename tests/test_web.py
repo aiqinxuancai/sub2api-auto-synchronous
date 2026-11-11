@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from relaydesk.service import Service, next_month
 from relaydesk.low_cost import LowCostSelector
+from relaydesk.scoring import DEFAULT_WEIGHTS
 from relaydesk.web import create_app
 from sync_sub2api import SyncError
 from test_sync import FakeSites
@@ -360,16 +361,73 @@ class WebTests(unittest.TestCase):
         self.assertEqual(config["sync_platforms"], ["openai"])
         for patch_value in ({"sync_platforms": "openai"}, {"sync_platforms": ["fake"]},
                             {"sync_top_n": -1}, {"sync_top_n": True}, {"sync_top_scope": []},
-                            {"low_cost_rank_hours": 0}, {"low_cost_health_minutes": 0}, {"low_cost_enabled": "yes"}):
+                            {"low_cost_score_minutes": 0}, {"low_cost_health_minutes": 0}, {"low_cost_enabled": "yes"}):
             response = self.client.put("/api/config", json=patch_value, headers=self.headers)
             self.assertEqual(response.status_code, 400, patch_value)
         response = self.client.put("/api/config", json={"sync_platforms": ["openai", "gemini"],
-            "sync_top_n": 2, "sync_top_scope": "global", "low_cost_rank_hours": 2}, headers=self.headers)
+            "sync_top_n": 2, "sync_top_scope": "global", "low_cost_score_minutes": 2}, headers=self.headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["sync_top_n"], 2)
 
+    def test_low_cost_exclude_keywords_validation_and_normalization(self):
+        self.assertEqual(self.client.get("/api/config").json()["low_cost_exclude_keywords"], [])
+        for value in ("测试", [1], [None], ["x" * 51], [f"k{index}" for index in range(51)]):
+            response = self.client.put("/api/config", json={"low_cost_exclude_keywords": value}, headers=self.headers)
+            self.assertEqual(response.status_code, 400, value)
+        response = self.client.put("/api/config", json={"low_cost_exclude_keywords": [" 测试 ", "", "Azure", "azure", "公益"]},
+                                   headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["low_cost_exclude_keywords"], ["测试", "Azure", "公益"])
+        document = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(document["config"]["low_cost_exclude_keywords"], ["测试", "Azure", "公益"])
+        self.service.store.put("low_cost_schedule", {"next_rank": 9e12, "next_health": 9e12})
+        self.service.save_config({"low_cost_exclude_keywords": ["Alpha"]})
+        self.assertLess(self.service.store.get("low_cost_schedule")["next_rank"], 9e12)
+
+    def test_low_cost_scoring_settings_validation(self):
+        config = self.client.get("/api/config").json()
+        self.assertEqual((config["low_cost_top_n"], config["low_cost_score_minutes"], config["low_cost_rank_tolerance"]), (10, 10, 2))
+        self.assertEqual({key: config["low_cost_weight_" + key] for key in DEFAULT_WEIGHTS}, DEFAULT_WEIGHTS)
+        zero_weights = {"low_cost_weight_" + key: 0 for key in DEFAULT_WEIGHTS}
+        for value in ({"low_cost_top_n": 0}, {"low_cost_top_n": 101}, {"low_cost_top_n": True}, {"low_cost_top_n": 2.5},
+                      {"low_cost_score_minutes": 0}, {"low_cost_score_minutes": 1441},
+                      {"low_cost_rank_tolerance": -1}, {"low_cost_rank_tolerance": 51}, {"low_cost_rank_tolerance": 1.5},
+                      {"low_cost_weight_price": -1}, {"low_cost_weight_price": 101}, {"low_cost_weight_cache": "x"},
+                      zero_weights, {"low_cost_rank_hours": 2}):
+            self.assertEqual(self.client.put("/api/config", json=value, headers=self.headers).status_code, 400, value)
+        response = self.client.put("/api/config", json={"low_cost_top_n": 25, "low_cost_score_minutes": 15,
+                                                        "low_cost_rank_tolerance": 0, **zero_weights, "low_cost_weight_price": 100},
+                                   headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["low_cost_weight_price"], 100)
+        self.assertEqual(self.client.get("/api/overview").json()["low_cost_weight_defaults"], DEFAULT_WEIGHTS)
+        self.assertEqual(self.client.post("/api/jobs/low-cost", json={"mode": "rate"}, headers=self.headers).status_code, 400)
+
+    def test_obsolete_low_cost_settings_are_removed_on_startup(self):
+        config = self.service.store.get("config")
+        config.update(low_cost_rank_hours=3, low_cost_rate_check_enabled=True, low_cost_rate_rise_percent=20)
+        config.pop("low_cost_score_minutes")
+        self.service.store.put("config", config)
+        self.service.close()
+        self.service = Service(self.root / "data", start_scheduler=False)
+        saved = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))["config"]
+        self.assertNotIn("low_cost_rank_hours", saved)
+        self.assertNotIn("low_cost_rate_check_enabled", saved)
+        self.assertEqual(saved["low_cost_score_minutes"], 10)
+
+    def test_low_cost_job_reports_scores_for_candidates(self):
+        self.service.save_config({"low_cost_enabled": True})
+        job = self.job("/jobs/low-cost")
+        self.assertEqual(job["status"], "success", job)
+        result = job["result"]
+        self.assertEqual(result["score_rank"], 1)
+        self.assertIsNotNone(result["score"])
+        scored = [row for row in result["candidates"] if row["eligible"]]
+        self.assertTrue(all(row["score"] is not None and row["parts"] for row in scored))
+        self.assertEqual([row["score_rank"] for row in scored], list(range(1, len(scored) + 1)))
+
     def test_low_cost_job_and_independent_schedules(self):
-        self.service.save_config({"low_cost_enabled": True, "low_cost_rank_hours": 2, "low_cost_health_minutes": 3})
+        self.service.save_config({"low_cost_enabled": True, "low_cost_score_minutes": 120, "low_cost_health_minutes": 3})
         job = self.job("/jobs/low-cost")
         self.assertEqual(job["status"], "success", job)
         self.assertEqual(job["result"]["upstream_id"], 7)
@@ -388,19 +446,21 @@ class WebTests(unittest.TestCase):
         self.job("/jobs/sync")
         previous = self.service.config().state_file.read_bytes()
         config = self.service.store.get("config")
-        for field in ("sync_platforms", "sync_top_n", "sync_top_scope", "low_cost_enabled", "low_cost_rank_hours"):
+        for field in ("sync_platforms", "sync_top_n", "sync_top_scope", "low_cost_enabled", "low_cost_score_minutes",
+                      "low_cost_exclude_keywords"):
             config.pop(field)
         self.service.store.put("config", config)
         self.service.close()
         self.service = Service(self.root / "data", start_scheduler=False)
         self.assertEqual(self.service.public_config()["sync_platforms"], ["openai"])
+        self.assertEqual(self.service.public_config()["low_cost_exclude_keywords"], [])
         self.assertEqual(self.service.config().state_file.read_bytes(), previous)
         self.assertEqual(len(self.sites.fake.keys), 1)
 
     def test_low_cost_all_intervals_persist_to_file_and_reschedule(self):
         self.service.save_config({"low_cost_enabled": True})
         self.job("/jobs/low-cost")
-        patch_value = {"low_cost_rank_hours": 3, "low_cost_health_minutes": 7, "low_cost_retry_minutes": 4}
+        patch_value = {"low_cost_score_minutes": 180, "low_cost_health_minutes": 7, "low_cost_retry_minutes": 4}
         response = self.client.put("/api/config", json=patch_value, headers=self.headers)
         self.assertEqual(response.status_code, 200)
         document = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))
@@ -416,7 +476,7 @@ class WebTests(unittest.TestCase):
             self.assertEqual(self.client.put("/api/config", json={"low_cost_retry_minutes": value}, headers=self.headers).status_code, 400)
 
     def test_low_cost_pending_key_and_failed_reads_use_configured_retry(self):
-        self.service.save_config({"low_cost_enabled": True, "low_cost_rank_hours": 3,
+        self.service.save_config({"low_cost_enabled": True, "low_cost_score_minutes": 180,
                                   "low_cost_health_minutes": 7, "low_cost_retry_minutes": 4})
         self.sites.fake.hourly_key_limit = True
         job = self.job("/jobs/low-cost")
@@ -446,7 +506,7 @@ class WebTests(unittest.TestCase):
             job_id = self.service.submit("low_cost")
             self.assertTrue(entered.wait(3))
             try:
-                self.service.save_config({"low_cost_rank_hours": 3, "low_cost_health_minutes": 7,
+                self.service.save_config({"low_cost_score_minutes": 180, "low_cost_health_minutes": 7,
                                           "low_cost_retry_minutes": 4})
             finally:
                 release.set()

@@ -123,15 +123,16 @@
 
         <div class="panel low-cost-panel">
           <div class="panel-heading">
-            <div><h2><svg class="icon accent"><use href="#i-tag"/></svg><span id="low-cost-title">最低价 OpenAI</span><span id="low-cost-status"></span></h2><p id="low-cost-note">从排名前 10 名中选择适合的渠道。</p></div>
+            <div><h2><svg class="icon accent"><use href="#i-tag"/></svg><span id="low-cost-title">最低价 OpenAI</span><span id="low-cost-status"></span></h2><p id="low-cost-note">从默认排序前 N 名中选择适合的渠道。</p></div>
             <button class="button" id="check-low-cost" type="button"><svg class="icon"><use href="#i-refresh"/></svg>立即检测</button>
           </div>
           <div class="low-cost-summary">
-            <div><span class="small-label">当前上游渠道</span><strong id="low-cost-source">等待首次检测</strong><small id="low-cost-rank">OpenAI 前 10 名</small></div>
+            <div><span class="small-label">当前上游渠道</span><strong id="low-cost-source">等待首次检测</strong><small id="low-cost-rank">OpenAI 默认排序</small></div>
+            <div><span class="small-label">综合评分</span><strong id="low-cost-score">—</strong><small id="low-cost-score-rank"></small></div>
             <div><span class="small-label">适用倍率 · 上游 → 本地</span><strong id="low-cost-rate">—</strong></div>
             <div><span class="small-label">下一次检测</span><small id="low-cost-next">尚未启用</small></div>
           </div>
-          <details class="candidate-details"><summary>查看前 10 名候选渠道<svg class="icon"><use href="#i-chevron"/></svg></summary><div id="low-cost-candidates"></div></details>
+          <details class="candidate-details"><summary><span id="low-cost-candidates-label">查看候选渠道</span><svg class="icon"><use href="#i-chevron"/></svg></summary><div id="low-cost-candidates"></div></details>
         </div>
 
         <div class="overview-body">
@@ -259,18 +260,37 @@
 
           <div class="panel automation-panel" id="settings-lowcost">
             <div class="panel-heading">
-              <div><h2>最低价 OpenAI</h2><p>在默认排序前 10 名中，选择通过检测且适用倍率最低的渠道。</p></div>
+              <div><h2>最低价 OpenAI · 综合择优</h2><p>对默认排序前 N 名做综合评分（价格为主），自动选用得分最高的渠道。</p></div>
               <label class="switch-label"><span>启用分组</span><input name="low_cost_enabled" type="checkbox" role="switch"><span class="switch-track"></span></label>
             </div>
             <div class="panel-body">
               <div class="form-grid four">
                 <label class="field">本地分组名称<input name="low_cost_name" maxlength="100" required></label>
-                <label class="field">排名检测间隔<span class="input-with-unit"><input name="low_cost_rank_hours" type="number" min="1" max="720" required><span>小时</span></span></label>
-                <label class="field">可用性检测间隔<span class="input-with-unit"><input name="low_cost_health_minutes" type="number" min="1" max="1440" required><span>分钟</span></span></label>
+                <label class="field">候选范围<span class="input-with-unit"><span class="unit-prefix">前</span><input name="low_cost_top_n" type="number" min="1" max="100" required><span>名</span></span><small>只对 OpenAI 默认排序前 N 名评分，1–100</small></label>
+                <label class="field">评分检测间隔<span class="input-with-unit"><input name="low_cost_score_minutes" type="number" min="1" max="1440" required><span>分钟</span></span><small>重新评分并按排名决定是否更换</small></label>
+                <label class="field">允许排名下降<span class="input-with-unit"><input name="low_cost_rank_tolerance" type="number" min="0" max="50" required><span>名</span></span><small>当前渠道跌出前「1 + 此值」名才更换；0 表示始终用第 1 名</small></label>
+                <label class="field">可用性检测间隔<span class="input-with-unit"><input name="low_cost_health_minutes" type="number" min="1" max="1440" required><span>分钟</span></span><small>渠道关闭、无法访问或不健康时立即更换</small></label>
                 <label class="field">失败重试间隔<span class="input-with-unit"><input name="low_cost_retry_minutes" type="number" min="1" max="1440" required><span>分钟</span></span><small>连接失败或等待上游 Key 时重试</small></label>
+                <label class="field span-2">排除关键字<input name="low_cost_exclude_keywords" maxlength="2600" placeholder="留空不排除，如 测试, 公益, Azure"><small>上游分组名称包含任一关键字（不区分大小写）的渠道不参与评分；多个关键字用逗号分隔，最多 50 个。</small></label>
               </div>
               <label class="check-label"><input name="low_cost_require_detection" type="checkbox">仅选择模型检测通过的渠道</label>
-              <p class="hint"><svg class="icon"><use href="#i-info"/></svg>仍在前 10 名且可用时保留当前渠道；跌出前 10 名或检测异常时重新选择。分组 ID 固定，切换后无需重新绑定员工 Key。需同时选择 OpenAI 并开启「同步转发账号」。</p>
+
+              <div class="sub-section">
+                <div class="sub-section-heading">
+                  <div><h3>评分权重</h3><p>每项先在候选中归一化为 0–1，再按权重合成 0–100 分；缺少数据的项按中间值 0.5 计算。</p></div>
+                  <button class="button ghost small" type="button" id="reset-weights"><svg class="icon"><use href="#i-undo"/></svg>恢复默认</button>
+                </div>
+                <div class="form-grid three">
+                  <label class="field weight-field">价格倍率<span class="input-with-unit"><input name="low_cost_weight_price" type="number" min="0" max="100" step="1" required><span class="weight-share" data-weight-share="price">—</span></span><small>适用倍率越低越好，以候选中最便宜者为满分</small></label>
+                  <label class="field weight-field">用户评分<span class="input-with-unit"><input name="low_cost_weight_rating" type="number" min="0" max="100" step="1" required><span class="weight-share" data-weight-share="rating">—</span></span><small>大厅星级，5 星为满分</small></label>
+                  <label class="field weight-field">评价数 / 人气<span class="input-with-unit"><input name="low_cost_weight_popularity" type="number" min="0" max="100" step="1" required><span class="weight-share" data-weight-share="popularity">—</span></span><small>近 1 小时使用占比，按对数与候选中最高者比较</small></label>
+                  <label class="field weight-field">缓存命中率<span class="input-with-unit"><input name="low_cost_weight_cache" type="number" min="0" max="100" step="1" required><span class="weight-share" data-weight-share="cache">—</span></span><small>50% 为 0 分，100% 为满分</small></label>
+                  <label class="field weight-field">首字延迟<span class="input-with-unit"><input name="low_cost_weight_latency" type="number" min="0" max="100" step="1" required><span class="weight-share" data-weight-share="latency">—</span></span><small>以候选中最快者为满分</small></label>
+                  <label class="field weight-field">成功率<span class="input-with-unit"><input name="low_cost_weight_success" type="number" min="0" max="100" step="1" required><span class="weight-share" data-weight-share="success">—</span></span><small>近 1 小时，80% 为 0 分，100% 为满分</small></label>
+                </div>
+              </div>
+
+              <p class="hint"><svg class="icon"><use href="#i-info"/></svg>评分检测时，当前渠道仍在前「1 + 允许下降」名内就保留，避免频繁切换；可用性检测只看渠道是否可用。分组 ID 固定，切换后无需重新绑定员工 Key。需同时选择 OpenAI 并开启「同步转发账号」。</p>
             </div>
           </div>
 

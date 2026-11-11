@@ -9,6 +9,8 @@ from dataclasses import replace
 from provider_ranking import detector_passed, ranked_items
 from sync_sub2api import APIError, SyncError, changed_fields, select_usable
 
+from .scoring import DEFAULT_WEIGHTS, WEIGHT_SETTINGS, score_candidates
+
 LOG = logging.getLogger("sub2api-sync")
 
 
@@ -55,21 +57,39 @@ class LowCostSelector:
         # Validate freshness/completeness even when the selector is being disabled.
         candidate_config = replace(config, sync_platforms={"openai"}, sync_top_n=0)
         usable, excluded = select_usable(groups, rates, providers, candidate_config, now)
-        top = ranked_items(providers, now, {"openai"})[:10]
+        top_n = self.settings.get("low_cost_top_n") or 10
+        top = ranked_items(providers, now, {"openai"})[:top_n]
         top_ids = {item["group_id"] for item in top}
         source_items = {item["group_id"]: item for item in providers["items"]}
-        eligible = {group.source["id"]: group for group in usable if not self.settings["low_cost_require_detection"]
-                    or detector_passed(source_items[group.source["id"]])}
-        candidates = []
         source_groups = {group["id"]: group for group in groups}
+        # Case-insensitive substring match on the upstream group name; excluded channels never backfill the top N.
+        keywords = [keyword.casefold() for keyword in self.settings.get("low_cost_exclude_keywords") or []]
+        blocked = {group_id for group_id, group in source_groups.items()
+                   if keywords and any(keyword in (group.get("name") or "").casefold() for keyword in keywords)}
+        eligible = {group.source["id"]: group for group in usable if group.source["id"] not in blocked
+                    and (not self.settings["low_cost_require_detection"] or detector_passed(source_items[group.source["id"]]))}
+        # Score only channels inside the hall's top N that pass every availability gate.
+        pool = [eligible[item["group_id"]] for item in top if item["group_id"] in eligible]
+        weights = {metric: self.settings.get(key, DEFAULT_WEIGHTS[metric]) for metric, key in WEIGHT_SETTINGS.items()}
+        scores = score_candidates(((row.source["id"], row.source_rate, source_items[row.source["id"]]) for row in pool),
+                                  weights, now)
+        pool.sort(key=lambda row: (-scores[row.source["id"]]["score"], row.provider_rank, row.source["id"]))
+        score_rank = {row.source["id"]: index for index, row in enumerate(pool, 1)}
+        candidates = []
         for rank, item in enumerate(top, 1):
             group_id = item["group_id"]
             selected = eligible.get(group_id)
+            reason = "" if selected else "keyword_excluded" if group_id in blocked else excluded.get(group_id, "model_detection_not_passed")
+            detail = scores.get(group_id, {})
             candidates.append({"upstream_id": group_id, "name": source_groups.get(group_id, {}).get("name", item.get("code", "")),
                                "provider_rank": rank, "eligible": selected is not None,
-                               "source_rate": selected.source_rate if selected else None,
-                               "reason": "" if selected else excluded.get(group_id, "model_detection_not_passed")})
-        result = {"checked_at": now.isoformat(), "mode": mode, "candidates": candidates, "errors": [], "pending": 0}
+                               "source_rate": selected.source_rate if selected else None, "reason": reason,
+                               "score": detail.get("score"), "score_rank": score_rank.get(group_id),
+                               "parts": detail.get("parts"), "metrics": detail.get("metrics")})
+        candidates.sort(key=lambda row: (row["score_rank"] is None, row["score_rank"] or 0, row["provider_rank"]))
+        tolerance = self.settings.get("low_cost_rank_tolerance", 2)
+        result = {"checked_at": now.isoformat(), "mode": mode, "candidates": candidates, "errors": [], "pending": 0,
+                  "top_n": top_n, "rank_tolerance": tolerance, "weights": weights}
         local_groups = engine.target.list_all("/admin/groups")
         accounts = engine.target.list_all("/admin/accounts")
         group = self._discover(local_groups, "description", "local_group_id")
@@ -80,20 +100,36 @@ class LowCostSelector:
             return self._result(result, "disabled")
         current_id = self.mapping.get("upstream_id")
         current = eligible.get(current_id)
-        keep = current is not None and (mode == "health" or current_id in top_ids)
+        current_rank = score_rank.get(current_id)
+        result["current_score_rank"] = current_rank
+        if current_id is None:
+            keep, switch_reason = False, ""
+        elif current is None:
+            # Availability checks switch immediately: closed, unreachable, unhealthy or newly excluded.
+            keep, switch_reason = False, "keyword_excluded" if current_id in blocked else "source_unavailable"
+        elif mode == "health":
+            keep, switch_reason = True, ""
+        elif current_id not in top_ids:
+            keep, switch_reason = False, "outside_top_ten"
+        elif current_rank > 1 + tolerance:
+            keep, switch_reason = False, "rank_dropped"
+            LOG.info("最低价 OpenAI：当前渠道 #%d 综合评分降至第 %d 名，超过允许下降的 %d 名，重新选择",
+                     current_id, current_rank, tolerance)
+        else:
+            keep, switch_reason = True, ""
         if keep:
             selected, decision = current, "retained"
         else:
-            pool = [eligible[item["group_id"]] for item in top if item["group_id"] in eligible]
-            selected = min(pool, key=lambda row: (row.source_rate, row.provider_rank, row.source["id"])) if pool else None
+            selected = pool[0] if pool else None
             decision = "selected" if current_id is None else "replaced"
         if selected is None:
             self._disable(group, account, "no_healthy_candidates")
-            LOG.warning("最低价 OpenAI：前 10 名暂无符合检测条件的可用渠道，分组已停用")
+            LOG.warning("最低价 OpenAI：前 %d 名暂无符合检测条件的可用渠道，分组已停用", top_n)
             return self._result(result, "no_candidates")
+        result["switch_reason"] = switch_reason or None
         # Stop routing when the source no longer meets this check's selection policy.
         if not keep and group:
-            self._disable(group, account, "source_unavailable" if current is None else "outside_top_ten")
+            self._disable(group, account, switch_reason or "updating")
         group_id = selected.source["id"]
         try:
             key = engine._get_key(group_id)
@@ -104,9 +140,7 @@ class LowCostSelector:
             key = None
         if key is None:
             # Creation limits must not prevent failover to a candidate with a retained Key.
-            fallback = sorted((eligible[item["group_id"]] for item in top
-                               if item["group_id"] in eligible and item["group_id"] != group_id),
-                              key=lambda row: (row.source_rate, row.provider_rank))
+            fallback = [row for row in pool if row.source["id"] != group_id]  # best score first
             for alternative in fallback:
                 # Do not create a more expensive Key as a side effect of a per-cycle cap.
                 previous_blocked = engine.key_creation_blocked
@@ -177,12 +211,16 @@ class LowCostSelector:
             engine.target.request("POST", f"/admin/accounts/{account['id']}/schedulable", {"schedulable": True})
         if group.get("status") != "active":
             engine.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "active"})
+        self.mapping.pop("baseline_rate", None)
         self.mapping.update(upstream_id=group_id, name=self.settings["low_cost_name"], source_name=selected.source["name"],
                             source_rate=selected.source_rate, local_rate=selected.local_rate, models=selected.models,
+                            score=scores.get(group_id, {}).get("score"), score_rank=score_rank.get(group_id),
                             key_digest=digest, status="active", reason="healthy_models", provider_rank=selected.provider_rank)
         self.state.save()
-        LOG.info("最低价 OpenAI：%s #%d，排名 %d，适用倍率 %g，模型 %d", "保持" if keep else "选用",
-                 group_id, selected.provider_rank, selected.source_rate, len(selected.models))
+        detail = scores.get(group_id)
+        LOG.info("最低价 OpenAI：%s #%d，大厅排名 %d，综合评分 %s（第 %s 名），适用倍率 %g，模型 %d", "保持" if keep else "选用",
+                 group_id, selected.provider_rank, detail["score"] if detail else "—", score_rank.get(group_id, "—"),
+                 selected.source_rate, len(selected.models))
         return self._result(result, decision)
 
     def _result(self, result, decision):

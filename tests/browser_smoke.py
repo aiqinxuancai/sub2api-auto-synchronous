@@ -71,11 +71,24 @@ def main():
                 page.locator('[name="sync_platforms"][value="gemini"]').uncheck()
                 page.fill('[name="sync_top_n"]', "2")
                 page.locator('[name="low_cost_enabled"]').check()
-                page.fill('[name="low_cost_rank_hours"]', "2")
+                page.fill('[name="low_cost_score_minutes"]', "20")
                 page.fill('[name="low_cost_health_minutes"]', "3")
                 page.fill('[name="low_cost_retry_minutes"]', "2")
+                page.fill('[name="low_cost_exclude_keywords"]', "Alpha，测试, 公益")
+                page.fill('[name="low_cost_top_n"]', "8")
+                page.fill('[name="low_cost_rank_tolerance"]', "1")
+                page.fill('[name="low_cost_weight_price"]', "60")
+                expect(page.locator('[data-weight-share="price"]')).to_have_text("50%")
+                page.click('#reset-weights')
+                expect(page.locator('[name="low_cost_weight_price"]')).to_have_value("40")
+                page.fill('[name="low_cost_weight_latency"]', "0")
                 page.locator('button[form="settings-form"]').click()
                 expect(page.locator('#settings-dirty')).to_have_text("已保存")
+                saved = service.public_config()
+                assert (saved['low_cost_top_n'], saved['low_cost_score_minutes'], saved['low_cost_rank_tolerance'],
+                        saved['low_cost_weight_price'], saved['low_cost_weight_latency']) == (8, 20, 1, 40, 0), saved
+                assert service.public_config()['low_cost_exclude_keywords'] == ["Alpha", "测试", "公益"]
+                expect(page.locator('[name="low_cost_exclude_keywords"]')).to_have_value("Alpha, 测试, 公益")
                 assert service.public_config()['sync_top_n'] == 2
                 assert service.public_config()['sync_platforms'] == ['openai']
                 assert service.public_config()['low_cost_retry_minutes'] == 2
@@ -84,8 +97,12 @@ def main():
                 page.click('#sync-now')
                 expect(page.locator('#stat-active')).to_have_text('3', timeout=15000)
                 expect(page.locator('#low-cost-source')).to_have_text('Claude · 稳定专线')
+                expect(page.locator('#low-cost-candidates-label')).to_have_text('查看前 8 名候选评分')
+                expect(page.locator('#low-cost-score')).to_contain_text('分')
+                expect(page.locator('#low-cost-score-rank')).to_contain_text('跌出前 2 名时更换')
                 page.locator('.candidate-details summary').click()
-                expect(page.locator('#low-cost-candidates')).to_contain_text('0.25 倍')
+                expect(page.locator('#low-cost-candidates')).to_contain_text('名称命中排除关键字')
+                expect(page.locator('#low-cost-candidates')).to_contain_text('0.2 倍')
                 page.click('#check-low-cost')
                 expect(page.locator('#job-dialog')).to_be_visible(timeout=15000)
                 expect(page.locator('#job-detail-content')).to_contain_text('保持当前渠道')

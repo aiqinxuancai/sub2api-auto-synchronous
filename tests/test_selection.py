@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from provider_ranking import default_score, detector_passed, ranked_items
 from relaydesk.low_cost import LowCostSelector
+from relaydesk.scoring import DEFAULT_WEIGHTS, score_candidates
 from relaydesk.service import SELECTION_DEFAULTS
 from sync_sub2api import State, SyncError, Synchronizer, select_usable
 import test_sync
@@ -225,6 +226,86 @@ class LowCostTests(unittest.TestCase):
         self.assertNotIn("7", State(self.config).data["groups"])
         self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], ["model-a"])
 
+    def test_exclude_keywords_skip_matching_names_case_insensitively(self):
+        selected = self.check(low_cost_exclude_keywords=["ALP"])
+        self.assertEqual(selected["upstream_id"], 8)
+        reasons = {row["upstream_id"]: row["reason"] for row in selected["candidates"]}
+        self.assertEqual(reasons[7], "keyword_excluded")
+        self.assertFalse(next(row for row in selected["candidates"] if row["upstream_id"] == 7)["eligible"])
+
+    def test_new_exclude_keyword_replaces_current_even_in_health_mode(self):
+        first = self.check()
+        self.assertEqual(first["upstream_id"], 7)
+        replaced = self.check("health", low_cost_exclude_keywords=["alpha"])
+        self.assertEqual(replaced["upstream_id"], 8)
+        self.assertEqual(replaced["decision"], "replaced")
+        self.assertEqual(replaced["local_group_id"], first["local_group_id"])
+        self.assertEqual(len(self.fake.accounts), 1)
+
+    def test_excluding_every_candidate_disables_group(self):
+        self.check()
+        off = self.check(low_cost_exclude_keywords=["a", "u"])
+        self.assertEqual(off["status"], "inactive")
+        self.assertEqual(off["reason"], "no_healthy_candidates")
+        self.assertFalse(self.fake.accounts[0]["schedulable"])
+        self.assertFalse(any(method == "DELETE" for method, _, _ in self.fake.requests))
+
+    def test_configurable_candidate_top_n(self):
+        self.fake.rates = {"7": .5, "8": .01}
+        narrow = self.check(low_cost_top_n=1)
+        self.assertEqual(narrow["upstream_id"], 7)
+        self.assertEqual(narrow["top_n"], 1)
+        self.assertEqual([row["upstream_id"] for row in narrow["candidates"]], [7])
+        # Leaving a narrowed range replaces the channel on the next ranking check.
+        widened = self.check(low_cost_top_n=3)
+        self.assertEqual(widened["decision"], "retained")
+        self.fake.rates = {"7": .5, "8": .01, "9": .3}
+        self.healthy = {8, 9}
+        moved = self.check("ranking", low_cost_top_n=2)
+        self.assertEqual(moved["upstream_id"], 8)
+        self.assertEqual(moved["local_group_id"], narrow["local_group_id"])
+
+    def test_rank_drop_beyond_tolerance_switches_on_score_check(self):
+        self.fake.rates = {"7": .5, "8": .6, "9": .7}
+        first = self.check()
+        self.assertEqual((first["upstream_id"], first["score_rank"]), (7, 1))
+        self.fake.rates = {"7": .9, "8": .6, "9": .7}
+        kept = self.check(low_cost_rank_tolerance=2)
+        self.assertEqual((kept["decision"], kept["current_score_rank"]), ("retained", 3))
+        switched = self.check(low_cost_rank_tolerance=1)
+        self.assertEqual((switched["upstream_id"], switched["decision"], switched["switch_reason"]), (8, "replaced", "rank_dropped"))
+        self.assertEqual(switched["local_group_id"], first["local_group_id"])
+        self.assertEqual(len(self.fake.accounts), 1)
+
+    def test_zero_tolerance_always_follows_the_top_score(self):
+        self.fake.rates = {"7": .5, "8": .6}
+        self.check()
+        self.fake.rates = {"7": .61, "8": .6}
+        self.assertEqual(self.check(low_cost_rank_tolerance=0)["upstream_id"], 8)
+
+    def test_availability_check_ignores_rank_but_switches_when_unavailable(self):
+        self.fake.rates = {"7": .5, "8": .6, "9": .7}
+        self.check()
+        self.fake.rates = {"7": .9, "8": .6, "9": .7}
+        self.assertEqual(self.check("health", low_cost_rank_tolerance=0)["decision"], "retained")
+        self.healthy = {8, 9}
+        moved = self.check("health", low_cost_rank_tolerance=0)
+        self.assertEqual((moved["upstream_id"], moved["switch_reason"]), (8, "source_unavailable"))
+
+    def test_quality_can_outweigh_a_small_price_gap(self):
+        review = {"review_expires_at": iso_after(), "popularity_expires_at": iso_after()}
+        self.fake.rates = {"7": .10, "8": .11, "9": 5}
+        self.fake.provider_overrides[7] = {"reputation": {**review, "stars": 2.5, "popularity_share": .001},
+                                           "success_rates": {"1h": .85}, "avg_ttft_ms": 20000}
+        self.fake.provider_overrides[8] = {"reputation": {**review, "stars": 4.8, "popularity_share": .12},
+                                           "success_rates": {"1h": 1}, "avg_ttft_ms": 8000,
+                                           "runtime_cache_1h": {"ready": True, "stale": False, "cache_hit_rate": .95}}
+        chosen = self.check()
+        self.assertEqual(chosen["upstream_id"], 8)
+        price_only = {**{f"low_cost_weight_{key}": 0 for key in DEFAULT_WEIGHTS}, "low_cost_weight_price": 100}
+        cheapest = self.check(low_cost_rank_tolerance=0, **price_only)
+        self.assertEqual(cheapest["upstream_id"], 7)
+
     def test_stale_or_incomplete_snapshots_never_mutate(self):
         self.check()
         self.fake.requests.clear()
@@ -312,3 +393,28 @@ class LowCostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScoringTests(unittest.TestCase):
+    now = datetime(2026, 11, 11, tzinfo=timezone.utc)
+
+    def test_missing_measurements_are_neutral(self):
+        scores = score_candidates([(1, .1, {}), (2, .1, {})], DEFAULT_WEIGHTS, self.now)
+        self.assertEqual(scores[1]["score"], scores[2]["score"])
+        parts = scores[1]["parts"]
+        self.assertEqual(parts["price"], 1)
+        self.assertEqual({parts[key] for key in ("rating", "popularity", "cache", "latency", "success")}, {.5})
+
+    def test_free_channel_does_not_zero_other_price_scores(self):
+        scores = score_candidates([(1, 0, {}), (2, .01, {})], {**dict.fromkeys(DEFAULT_WEIGHTS, 0), "price": 1}, self.now)
+        self.assertEqual(scores[1]["parts"]["price"], 1)
+        self.assertEqual(scores[2]["parts"]["price"], .5)
+
+    def test_expired_reputation_and_stale_cache_are_ignored(self):
+        item = {"reputation": {"stars": 5, "review_expires_at": "2026-11-10T00:00:00Z", "popularity_share": .5,
+                               "popularity_expires_at": "2026-11-10T00:00:00Z"},
+                "runtime_cache_1h": {"ready": True, "stale": True, "cache_hit_rate": 1}}
+        metrics = score_candidates([(1, .1, item)], DEFAULT_WEIGHTS, self.now)[1]["metrics"]
+        self.assertIsNone(metrics["stars"])
+        self.assertIsNone(metrics["popularity"])
+        self.assertIsNone(metrics["cache_hit_rate"])
