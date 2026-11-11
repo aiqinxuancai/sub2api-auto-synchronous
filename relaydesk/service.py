@@ -15,7 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sync_sub2api import APIError, Client, Config, State, SyncError, Synchronizer, state_lock
+from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, APIError, Client, Config, State, SyncError, Synchronizer,
+                          account_concurrency, state_lock)
 from provider_ranking import PLATFORMS
 
 from .storage import Store
@@ -41,9 +42,10 @@ STABLE_GROUPS = {
     "best_source": {"selector": BestSourceSelector, "enabled": "best_source_enabled", "retry": "best_source_retry_minutes",
                     "label": "最优源站 OpenAI", "cadence": (("ranking", "next_rank", "best_source_check_minutes"),)},
 }
-# Settings replaced by the composite score; removed from config.json on startup.
+# Settings replaced by the composite score, or renamed (`concurrency` → `account_concurrency`);
+# removed from config.json on startup.
 OBSOLETE_SETTINGS = {"low_cost_rank_hours", "low_cost_rate_check_enabled", "low_cost_rate_check_minutes",
-                     "low_cost_rate_rise_percent"}
+                     "low_cost_rate_rise_percent", "concurrency"}
 MAX_EXCLUDE_KEYWORDS = 50
 MAX_KEYWORD_LENGTH = 50
 LOW_COST_MODES = {"ranking", "health"}
@@ -61,7 +63,8 @@ def default_settings():
         "upstream_email": "", "target_email": "", **{key: "" for key in SECRETS},
         "upstream_auth_mode": "login", "target_auth_mode": "key",
         "interval_minutes": 30, "prefix": "upstream-", "rate_factor": 1.0, "group_ids": [],
-        "sync_accounts": True, "auto_create_keys": True, "concurrency": 100, "priority": 50,
+        "sync_accounts": True, "auto_create_keys": True, "account_concurrency": DEFAULT_ACCOUNT_CONCURRENCY,
+        "priority": 50,
         "timeout": 30, "providers_path": "/api/v2/public/providers", "max_new_keys": 50,
         "disable_unavailable": True, "request_interval": 1.1, "sync_enabled": False,
     }
@@ -154,7 +157,8 @@ class Service:
         if self.store.get("config") is None:
             self._initialize_config()
         values = self.store.get("config")
-        migrated = {key: value for key, value in {**copy.deepcopy(SELECTION_DEFAULTS), **values}.items()
+        migrated = {key: value for key, value in {**copy.deepcopy(SELECTION_DEFAULTS), **values,
+                                                   "account_concurrency": account_concurrency(values)}.items()
                     if key not in OBSOLETE_SETTINGS}
         if migrated != values:
             self.store.put("config", migrated)
@@ -204,7 +208,7 @@ class Service:
             if key in SECRETS and value == "":
                 continue
             values[key] = value
-        for key in ("interval_minutes", "concurrency", "timeout", "max_new_keys", "priority",
+        for key in ("interval_minutes", "account_concurrency", "timeout", "max_new_keys", "priority",
                     "sync_top_n", "low_cost_score_minutes", "low_cost_health_minutes", "low_cost_retry_minutes",
                     "low_cost_top_n", "low_cost_rank_tolerance", *WEIGHT_SETTINGS.values(),
                     "best_source_check_minutes", "best_source_keep_top", "best_source_retry_minutes"):
@@ -212,8 +216,10 @@ class Service:
                 raise SyncError("周期、并发和数量必须为整数")
         if not 1 <= values["interval_minutes"] <= 1440:
             raise SyncError("同步周期应在 1–1440 分钟之间")
-        if not 1 <= values["concurrency"] <= 10000 or not 1 <= values["timeout"] <= 120:
-            raise SyncError("并发或超时时间超出范围")
+        if not 1 <= values["account_concurrency"] <= 10000:
+            raise SyncError("转发账号并发应在 1–10000 之间")
+        if not 1 <= values["timeout"] <= 120:
+            raise SyncError("请求超时应在 1–120 秒之间")
         if not 0 <= values["max_new_keys"] <= 1000 or not 0 <= values["priority"] <= 10000:
             raise SyncError("新增 Key 数量或优先级超出范围")
         if not 0 <= values["sync_top_n"] <= 10000:
@@ -454,7 +460,8 @@ class Service:
                 "pending": report["pending"], "errors": report["errors"],
                 "warnings": report.get("warnings", []), "preview": preview,
                 **stable,
-                "new_keys": report.get("new_upstream_keys", 0)}
+                "new_keys": report.get("new_upstream_keys", 0),
+                "concurrency_fixed": report.get("concurrency_fixed", 0)}
 
     def _due_stable_mode(self, kind, now=None):
         """First due check in cadence order; "ranking" comes first because it covers availability too."""

@@ -373,7 +373,7 @@ function renderModels() {
 }
 $('#model-search').oninput = renderModels;
 
-const numericSettings = new Set(['interval_minutes', 'rate_factor', 'concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval', 'sync_top_n', 'low_cost_score_minutes', 'low_cost_health_minutes', 'low_cost_retry_minutes', 'low_cost_top_n', 'low_cost_rank_tolerance',
+const numericSettings = new Set(['interval_minutes', 'rate_factor', 'account_concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval', 'sync_top_n', 'low_cost_score_minutes', 'low_cost_health_minutes', 'low_cost_retry_minutes', 'low_cost_top_n', 'low_cost_rank_tolerance',
   'best_source_check_minutes', 'best_source_keep_top', 'best_source_retry_minutes',
   ...Object.keys(scoreMetrics).map(key => 'low_cost_weight_' + key)]);
 function renderSettings() {
@@ -653,7 +653,7 @@ function summary(job) {
   if (job.kind === 'connect') return result.message;
   if (job.kind === 'best_source') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · 默认排序 #${result.provider_rank} · ${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
   if (job.kind === 'low_cost') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · ${result.score != null ? `${number(result.score, 1)} 分 · ` : ''}${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : result.switch_reason === 'rank_dropped' ? '评分排名下降，已更换渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
-  if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}`;
+  if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}${result.concurrency_fixed ? ` · 修正 ${result.concurrency_fixed} 个账号并发` : ''}`;
   if (job.kind === 'refresh_users') return `已读取 ${result.count} 位成员`;
   if (job.kind === 'batch_users') return `创建 ${result.created.length} 位 · 跳过 ${result.skipped.length} 位${result.failed ? ` · 失败 ${result.failed} 位` : ''}`;
   if (job.kind === 'quota_reset') return `已重置 ${result.succeeded.length} 位 · $${number(result.amount)}${result.failed ? ` · ${result.failed} 位待处理` : ''}`;

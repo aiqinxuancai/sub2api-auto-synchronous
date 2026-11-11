@@ -209,6 +209,7 @@ class StableGroupSelector:
                 account_patch["status"] = "active"
             if account_patch:
                 engine.target.request("PUT", f"/admin/accounts/{account['id']}", account_patch)
+                engine.concurrency_fixed += "concurrency" in account_patch
         ensure_account_binding(engine.target, account, group["id"], self.label)
         if account.get("schedulable") is not True:
             engine.target.request("POST", f"/admin/accounts/{account['id']}/schedulable", {"schedulable": True})

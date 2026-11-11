@@ -265,7 +265,7 @@
               <summary><svg class="icon"><use href="#i-chevron"/></svg>高级设置<small>Key 限流、并发、超时等</small></summary>
               <div class="panel-body form-grid three">
                 <label class="field">每轮最多新增 Key<input name="max_new_keys" type="number" min="0" max="1000"><small>限流后留待后续周期继续</small></label>
-                <label class="field">转发账号并发<input name="concurrency" type="number" min="1" max="10000"></label>
+                <label class="field">转发账号并发<input name="account_concurrency" type="number" min="1" max="10000"><small>每次同步自动检查并修正全部转发账号，默认 100</small></label>
                 <label class="field">转发账号优先级<input name="priority" type="number" min="0" max="10000"></label>
                 <label class="field">请求超时<span class="input-with-unit"><input name="timeout" type="number" min="1" max="120"><span>秒</span></span></label>
                 <label class="field">请求最小间隔<span class="input-with-unit"><input name="request_interval" type="number" min="0" max="60" step="0.1"><span>秒</span></span></label>

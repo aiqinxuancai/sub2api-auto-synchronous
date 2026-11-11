@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from relaydesk.service import Service, default_settings
 from relaydesk.storage import Store
-from sync_sub2api import SyncError
+from sync_sub2api import Config, SyncError
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -84,6 +84,30 @@ class ConfigurationTests(unittest.TestCase):
             connection.execute("INSERT INTO settings VALUES ('config',?)", (migrated.encrypt(original),))
         self.assertEqual(Store(self.root).get("config")["prefix"], "file-wins-")
         self.assertEqual(mapping.read_bytes(), before)
+
+    def test_legacy_concurrency_setting_migrates_once(self):
+        # 3 was the old untouched default and moves to 100; a changed value is kept.
+        for legacy, expected in ((3, 100), (10, 10)):
+            with self.subTest(legacy=legacy):
+                root = self.root / str(legacy)
+                values = default_settings()
+                del values["account_concurrency"]
+                Store(root).put("config", {**values, "concurrency": legacy})
+                self.assertEqual(Config.from_web({**values, "concurrency": legacy}, root).concurrency, expected)
+                service = Service(root, start_scheduler=False)
+                try:
+                    self.assertEqual(service.public_config()["account_concurrency"], expected)
+                    self.assertNotIn("concurrency", service.store.get("config"))
+                    self.assertEqual(service.config().concurrency, expected)
+                    service.save_config({"account_concurrency": 3})
+                finally:
+                    service.close()
+                restarted = Service(root, start_scheduler=False)
+                try:
+                    self.assertEqual(restarted.public_config()["account_concurrency"], 3)
+                finally:
+                    restarted.close()
+        self.assertEqual(default_settings()["account_concurrency"], 100)
 
     def test_failed_save_preserves_previous_file(self):
         store = Store(self.root)

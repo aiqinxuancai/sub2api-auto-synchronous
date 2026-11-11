@@ -176,6 +176,16 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(result["status"], "active")
         self.assertEqual(self.fake.accounts[0]["group_ids"], [result["local_group_id"]])
 
+    def test_sync_fixes_concurrency_of_selector_accounts_even_when_disabled(self):
+        first = self.check()
+        account = next(row for row in self.fake.accounts if row["id"] == first["local_account_id"])
+        self.assertEqual(account["concurrency"], 100)
+        self.config.concurrency = 9
+        self.check(low_cost_enabled=False)
+        self.assertEqual(account["status"], "inactive")
+        Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(account["concurrency"], 9)
+
     def test_group_and_account_names_show_current_upstream(self):
         self.check()
         self.assertEqual(self.fake.local_groups[-1]["name"], "最低价 OpenAI（Alpha）")

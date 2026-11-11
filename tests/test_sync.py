@@ -406,8 +406,29 @@ class SyncIntegrationTests(unittest.TestCase):
         Synchronizer(self.config, State(self.config)).cycle()
         self.assertEqual(self.fake.accounts[0]["concurrency"], 100)
         self.config.concurrency = 7
-        Synchronizer(self.config, State(self.config)).cycle()
+        report = Synchronizer(self.config, State(self.config)).cycle()
         self.assertEqual(self.fake.accounts[0]["concurrency"], 7)
+        self.assertEqual(report["concurrency_fixed"], 1)
+        self.fake.requests.clear()
+        report = Synchronizer(self.config, State(self.config)).cycle()
+        self.assertEqual(report["concurrency_fixed"], 0)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_every_sync_fixes_concurrency_of_disabled_accounts_but_not_unrelated_ones(self):
+        self.cycle()
+        owned = self.fake.accounts[0]
+        self.fake.health = "failed"
+        self.cycle()
+        self.assertEqual(owned["status"], "inactive")
+        self.fake.accounts.append({"id": 500, "name": "Manual", "notes": "hand-made", "platform": "openai",
+                                   "type": "apikey", "credentials": {}, "status": "active", "concurrency": 3})
+        self.config.concurrency = 9
+        report = self.cycle()
+        self.assertEqual(owned["concurrency"], 9)
+        self.assertEqual(owned["status"], "inactive")  # only the concurrency is corrected
+        self.assertEqual(self.fake.accounts[-1]["concurrency"], 3)
+        self.assertIn({"action": "concurrency", "account_id": owned["id"], "from": 100, "to": 9}, report["actions"])
+        self.assertEqual(report["concurrency_fixed"], 1)
 
     def test_key_rate_limit_stops_before_creating_an_empty_local_group(self):
         self.fake.key_limit = True

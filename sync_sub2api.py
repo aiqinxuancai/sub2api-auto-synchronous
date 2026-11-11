@@ -90,6 +90,24 @@ def normalize_base(value: str, name: str) -> tuple[str, str]:
     return value, value + "/api/v1"
 
 
+DEFAULT_ACCOUNT_CONCURRENCY = 100
+LEGACY_DEFAULT_CONCURRENCY = 3
+
+
+def account_concurrency(values: dict[str, Any]) -> int:
+    """Forwarding-account concurrency from Web settings.
+
+    The setting used to be `concurrency` with a default of 3. An untouched old
+    default moves to the new default; a value the user changed is kept.
+    """
+    if "account_concurrency" in values:
+        return values["account_concurrency"]
+    legacy = values.get("concurrency")
+    if type(legacy) is int and legacy != LEGACY_DEFAULT_CONCURRENCY:
+        return legacy
+    return DEFAULT_ACCOUNT_CONCURRENCY
+
+
 @dataclass
 class Config:
     upstream_base: str
@@ -112,7 +130,7 @@ class Config:
     rate_factor: Decimal = Decimal("1.0")
     sync_accounts: bool = True
     auto_create_keys: bool = True
-    concurrency: int = 100
+    concurrency: int = DEFAULT_ACCOUNT_CONCURRENCY
     priority: int = 50
     dry_run: bool = True
     timeout: int = 30
@@ -164,7 +182,7 @@ class Config:
             sync_top_scope=values.get("sync_top_scope", "per_platform"),
             prefix=values["prefix"], rate_factor=Decimal(str(values["rate_factor"])),
             sync_accounts=values["sync_accounts"], auto_create_keys=values["auto_create_keys"],
-            concurrency=values["concurrency"], priority=values["priority"], timeout=values["timeout"],
+            concurrency=account_concurrency(values), priority=values["priority"], timeout=values["timeout"],
             dry_run=False, state_file=directory / "profiles" / profile / "state.json",
             report_file=directory / "profiles" / profile / "report.json",
             providers_path=values["providers_path"], max_new_keys=values["max_new_keys"],
@@ -555,6 +573,7 @@ class Synchronizer:
             (config.upstream_api + "|" + config.upstream_email).encode()).hexdigest()[:12]
         self.target_id = hashlib.sha256(config.target_api.encode()).hexdigest()[:12]
         self.new_keys = 0
+        self.concurrency_fixed = 0
         self.key_creation_blocked = False
         self.keys: list[dict[str, Any]] | None = None
 
@@ -652,10 +671,29 @@ class Synchronizer:
             self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
             group["status"] = "inactive"
 
-    def _audit_bindings(self, report: dict[str, Any]) -> None:
+    def _enforce_concurrency(self, accounts: list[dict[str, Any]], report: dict[str, Any]) -> None:
+        """Final pass: every account this tool owns, disabled ones included, uses the configured concurrency."""
+        owned = re.compile(r"\[sub2api-(?:sync|lowcost|bestsource):" + re.escape(self.source_id) + r":")
+        wanted = self.config.concurrency
+        for account in accounts:
+            current = account.get("concurrency")
+            if current == wanted or not owned.search(account.get("notes") or ""):
+                continue
+            try:
+                self.target.request("PUT", f"/admin/accounts/{account['id']}", {"concurrency": wanted})
+            except SyncError as error:
+                report["errors"].append({"account_id": account["id"],
+                                         "error": f"账号 {account['id']} 并发修正失败：{error}"})
+                continue
+            account["concurrency"] = wanted
+            self.concurrency_fixed += 1
+            report["actions"].append({"action": "concurrency", "account_id": account["id"],
+                                      "from": current, "to": wanted})
+            LOG.info("账号 %d 并发 %s → %d", account["id"], current, wanted)
+
+    def _audit_bindings(self, local_groups: list[dict[str, Any]], accounts: list[dict[str, Any]],
+                        report: dict[str, Any]) -> None:
         """Final pass: every active managed group must have an active account that selected it."""
-        local_groups = self.target.list_all("/admin/groups")
-        accounts = self.target.list_all("/admin/accounts")
         covered = {group_id for account in accounts
                    if account.get("status") == "active" and account.get("schedulable") is not False
                    for group_id in bound_group_ids(account)}
@@ -709,6 +747,7 @@ class Synchronizer:
                 patch["credentials"] = credentials
             if patch:
                 self.target.request("PUT", f"/admin/accounts/{account['id']}", patch)
+                self.concurrency_fixed += "concurrency" in patch
                 action = "updated"
             else:
                 action = "unchanged" if bound_group_ids(account) == [local_group_id] else "rebound"
@@ -912,10 +951,14 @@ class Synchronizer:
                     report["errors"].append({"error": f"分组排序更新失败：{error}"})
         if not self.config.dry_run and self.config.sync_accounts:
             try:
-                self._audit_bindings(report)
+                local_groups = self.target.list_all("/admin/groups")
+                accounts = self.target.list_all("/admin/accounts")
+                self._enforce_concurrency(accounts, report)
+                self._audit_bindings(local_groups, accounts, report)
             except SyncError as error:
-                report["errors"].append({"error": f"分组账号绑定检查失败：{error}"})
+                report["errors"].append({"error": f"同步后的账号检查失败：{error}"})
         report["new_upstream_keys"] = self.new_keys
+        report["concurrency_fixed"] = self.concurrency_fixed
         write_private_json(self.config.report_file, report)
         LOG.info("%s完成；错误=%d 待后续同步=%d；报告：%s",
                  "预览" if self.config.dry_run else "同步", len(report["errors"]),
