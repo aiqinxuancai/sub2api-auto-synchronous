@@ -367,9 +367,8 @@
               </div>
               <div class="quota-body">
                 <label class="field">重置金额（USD）<span class="money-input"><span>$</span><input id="quota-amount" type="number" min="0" max="100000000" step="0.000001" required value="100"></span></label>
-                <label class="field">适用范围<select id="quota-scope"><option value="selected">左侧选择的成员</option><option value="all">所有员工（含以后新增）</option></select></label>
+                <label class="field">适用范围<select id="quota-scope"><option value="selected">左侧选择的成员</option><option value="all_members">所有成员（含以后新增）</option><option value="all_employees">所有成员（含以后新增，不含管理员）</option></select></label>
                 <label class="field">执行时区<input id="quota-timezone" list="timezones" value="Asia/Shanghai" required><datalist id="timezones"><option value="Asia/Shanghai"><option value="Asia/Tokyo"><option value="Asia/Hong_Kong"><option value="Asia/Singapore"><option value="UTC"><option value="America/New_York"><option value="Europe/London"></datalist></label>
-                <label class="check-label"><input id="quota-admins" type="checkbox">同时包含管理员账号</label>
                 <div class="quota-next"><span class="small-label">下一次执行</span><strong id="quota-next">尚未启用</strong><small>余额将覆盖为设定值，非叠加充值。</small></div>
               </div>
               <div class="quota-actions">

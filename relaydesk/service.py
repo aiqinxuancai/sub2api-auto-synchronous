@@ -47,6 +47,9 @@ OBSOLETE_SETTINGS = {"low_cost_rank_hours", "low_cost_rate_check_enabled", "low_
 MAX_EXCLUDE_KEYWORDS = 50
 MAX_KEYWORD_LENGTH = 50
 LOW_COST_MODES = {"ranking", "health"}
+# selected：左侧勾选的成员（勾选了管理员也会包含）；all_members：所有成员含以后新增；
+# all_employees：所有成员含以后新增，但不包括管理员。
+QUOTA_SCOPES = {"selected", "all_members", "all_employees"}
 LIVE_SETTINGS = {"sync_enabled", "interval_minutes", "low_cost_score_minutes", "low_cost_health_minutes", "low_cost_retry_minutes",
                  "best_source_check_minutes", "best_source_retry_minutes"}
 
@@ -62,6 +65,28 @@ def default_settings():
         "timeout": 30, "providers_path": "/api/v2/public/providers", "max_new_keys": 50,
         "disable_unavailable": True, "request_interval": 1.1, "sync_enabled": False,
     }
+
+
+def quota_rule_normalized(rule):
+    """Map the legacy scope/include_admins pair onto the explicit three-way scope."""
+    rule = dict(rule)
+    include_admins = rule.pop("include_admins", None)
+    if rule.get("scope") == "all":
+        rule["scope"] = "all_members" if include_admins is True else "all_employees"
+    return rule
+
+
+def quota_targets(rule, users):
+    scope = quota_rule_normalized(rule)["scope"]
+    # 旧版任务载荷（升级前已排队/待重试）在 selected 范围下也会排除管理员，保持原语义。
+    legacy_skip_admins = scope == "selected" and "include_admins" in rule and rule["include_admins"] is not True
+    if scope == "all_members":
+        return list(users)
+    if scope == "all_employees":
+        return [user for user in users if user.get("role") != "admin"]
+    selected = set(rule.get("user_ids") or [])
+    return [user for user in users if user["id"] in selected
+            and not (legacy_skip_admins and user.get("role") == "admin")]
 
 
 def utcnow():
@@ -136,7 +161,10 @@ class Service:
         if self.store.get("quota_rule") is None:
             self.store.put("quota_rule", {"enabled": False, "timezone": "Asia/Shanghai",
                                           "amount": 100, "scope": "selected", "user_ids": [],
-                                          "include_admins": False, "next_run_at": None})
+                                          "next_run_at": None})
+        stored_rule = self.store.get("quota_rule")
+        if quota_rule_normalized(stored_rule) != stored_rule:
+            self.store.put("quota_rule", quota_rule_normalized(stored_rule))
         for job_id in recoverable:
             payload = self.store.job_payload(job_id)
             self.busy.add(job_id)
@@ -576,20 +604,24 @@ class Service:
             return self._quota_rule(patch, persist)
 
     def _quota_rule(self, patch, persist):
-        rule = self.store.get("quota_rule")
+        rule = quota_rule_normalized(self.store.get("quota_rule"))
         if set(patch) - {"enabled", "timezone", "amount", "scope", "user_ids", "include_admins"}:
             raise SyncError("额度规则包含未知字段")
+        if "include_admins" in patch and type(patch["include_admins"]) is not bool:
+            raise SyncError("启用状态必须为开关值")
+        # 兼容旧版页面提交的 scope=all + include_admins。
+        patch = quota_rule_normalized(patch)
         previous = copy.deepcopy(rule)
         rule.update(patch)
-        if type(rule["enabled"]) is not bool or type(rule["include_admins"]) is not bool:
+        if type(rule["enabled"]) is not bool:
             raise SyncError("启用状态必须为开关值")
         try:
             ZoneInfo(rule["timezone"])
         except (ZoneInfoNotFoundError, TypeError, ValueError):
             raise SyncError("请选择有效的 IANA 时区") from None
         rule["amount"] = amount(rule["amount"])
-        if not isinstance(rule["scope"], str) or rule["scope"] not in {"all", "selected"}:
-            raise SyncError("请选择所有成员或指定成员")
+        if not isinstance(rule["scope"], str) or rule["scope"] not in QUOTA_SCOPES:
+            raise SyncError("请选择有效的重置范围")
         if not isinstance(rule["user_ids"], list) or any(type(item) is not int or item <= 0 for item in rule["user_ids"]):
             raise SyncError("成员 ID 列表无效")
         rule["user_ids"] = sorted(set(rule["user_ids"]))
@@ -613,9 +645,7 @@ class Service:
         retryable = False
         with state_lock(config.state_file):
             users = client.list_all("/admin/users")
-            selected = [user for user in users if
-                        (rule["scope"] == "all" or user["id"] in rule["user_ids"])
-                        and (rule.get("include_admins") or user.get("role") != "admin")]
+            selected = quota_targets(rule, users)
             for user in selected:
                 user_id = user["id"]
                 if not self.store.claim_receipt(period, user_id, job_id):

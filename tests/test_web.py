@@ -257,11 +257,28 @@ class WebTests(unittest.TestCase):
         self.assertEqual([user["balance"] for user in self.sites.fake.users], [500, 0, 0])
         self.assertTrue(all(method == "PUT" for method, _, _, _ in self.sites.fake.user_mutations))
 
-    def test_include_admins_is_explicit_and_manual_reset_requires_confirmation(self):
-        self.assertEqual(self.post("/jobs/reset-balances", {"rule": {"scope": "all", "amount": 12}}).status_code, 400)
-        self.job("/jobs/reset-balances", {"confirm": True, "rule": {"scope": "selected", "user_ids": [1], "include_admins": True, "amount": 12}})
+    def test_selected_admin_is_reset_and_manual_reset_requires_confirmation(self):
+        self.assertEqual(self.post("/jobs/reset-balances", {"rule": {"scope": "all_members", "amount": 12}}).status_code, 400)
+        self.job("/jobs/reset-balances", {"confirm": True, "rule": {"scope": "selected", "user_ids": [1], "amount": 12}})
         self.assertEqual(self.sites.fake.users[0]["balance"], 12)
         self.assertEqual(self.sites.fake.users[1]["balance"], 7.5)
+
+    def test_all_members_includes_admins_and_all_employees_excludes_them(self):
+        self.job("/jobs/reset-balances", {"confirm": True, "rule": {"scope": "all_members", "amount": 9}})
+        self.assertEqual([user["balance"] for user in self.sites.fake.users], [9, 9, 9])
+        self.job("/jobs/reset-balances", {"confirm": True, "rule": {"scope": "all_employees", "amount": 4}})
+        self.assertEqual([user["balance"] for user in self.sites.fake.users], [9, 4, 4])
+        self.assertEqual(self.client.put("/api/quota", json={"scope": "all"}, headers=self.headers).json()["scope"], "all_employees")
+
+    def test_legacy_include_admins_rule_is_migrated(self):
+        rule = self.service.save_quota_rule({"scope": "all", "include_admins": True})
+        self.assertEqual(rule["scope"], "all_members")
+        self.assertNotIn("include_admins", rule)
+        self.service.store.put("quota_rule", {**rule, "scope": "all", "include_admins": False})
+        self.service.close()
+        self.service = Service(self.root / "data", start_scheduler=False)
+        self.assertEqual(self.service.store.get("quota_rule")["scope"], "all_employees")
+        self.assertNotIn("include_admins", self.service.store.get("quota_rule"))
 
     def test_uncertain_delivery_is_not_repeated_after_balance_spending(self):
         self.sites.fake.uncertain_users = {2}
