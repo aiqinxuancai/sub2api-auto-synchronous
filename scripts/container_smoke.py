@@ -46,15 +46,18 @@ def main():
         csrf = request("/api/auth/setup", {"password": PASSWORD})["csrf"]
         request("/api/config", {"upstream_email": "smoke@example.com", "upstream_password": UPSTREAM_SECRET,
             "target_admin_api_key": ADMIN_SECRET, "prefix": "persisted-smoke-", "sync_enabled": False,
-            "low_cost_enabled": False, "low_cost_rank_hours": 3, "low_cost_health_minutes": 7,
-            "low_cost_retry_minutes": 2}, method="PUT", csrf=csrf)
+            "low_cost_enabled": False, "low_cost_score_minutes": 15, "low_cost_health_minutes": 7,
+            "low_cost_retry_minutes": 2, "low_cost_weight_price": 55,
+            "best_source_enabled": False, "best_source_check_minutes": 12, "best_source_keep_top": 6},
+            method="PUT", csrf=csrf)
     else:
         assert not request("/api/auth/status")["setup_needed"]
         csrf = request("/api/auth/login", {"password": PASSWORD})["csrf"]
     saved = request("/api/config")
     assert saved["prefix"] == "persisted-smoke-"
-    assert saved["low_cost_rank_hours"] == 3 and saved["low_cost_health_minutes"] == 7
-    assert saved["low_cost_retry_minutes"] == 2
+    assert saved["low_cost_score_minutes"] == 15 and saved["low_cost_health_minutes"] == 7
+    assert saved["low_cost_retry_minutes"] == 2 and saved["low_cost_weight_price"] == 55
+    assert saved["best_source_check_minutes"] == 12 and saved["best_source_keep_top"] == 6
     assert saved["secrets_set"]["upstream_password"] and saved["secrets_set"]["target_admin_api_key"]
     raw = (args.data_dir / "config.json").read_text(encoding="utf-8")
     assert UPSTREAM_SECRET not in raw and ADMIN_SECRET not in raw
