@@ -260,7 +260,15 @@ def create_app(directory=None, *, service=None, start_scheduler=True):
 
     @app.get("/api/quota")
     def quota(manager=Depends(current)):
-        return {"rule": manager.store.get("quota_rule"), "receipts": manager.store.receipts(200)}
+        return {"rule": manager.store.get("quota_rule"), "receipts": manager.store.receipts(200),
+                "summaries": manager.store.reset_summaries(12)}
+
+    @app.get("/api/quota/summaries/{job_id}")
+    def reset_summary(job_id: str, manager=Depends(current)):
+        totals, items = manager.store.reset_summary(job_id)
+        if totals is None:
+            raise HTTPException(404, "这次重置没有用量总结")
+        return {"summary": totals, "items": items}
 
     @app.put("/api/quota")
     async def save_quota(request: Request, manager=Depends(current)):

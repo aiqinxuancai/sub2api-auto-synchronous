@@ -285,6 +285,7 @@
               <div class="table-footer"><span id="user-page-info">成员列表</span><div class="pager"><button class="icon-button" id="users-prev" aria-label="上一页成员" type="button">←</button><button class="icon-button" id="users-next" aria-label="下一页成员" type="button">→</button></div></div>
             </div>
             <div id="batch-history" class="batch-history"></div>
+            <div id="reset-history" class="batch-history"></div>
           </div>
 
           <aside class="quota-aside">
@@ -355,6 +356,11 @@
 <dialog id="job-dialog" class="modal wide-modal">
   <div class="modal-heading"><div><span class="eyebrow">任务详情</span><h2 id="job-detail-title">任务详情</h2></div><button class="icon-button" data-close aria-label="关闭" type="button"><svg class="icon"><use href="#i-close"/></svg></button></div>
   <div id="job-detail-content"></div>
+</dialog>
+
+<dialog id="summary-dialog" class="modal wide-modal summary-modal">
+  <div class="modal-heading"><div><span class="eyebrow">重置用量总结</span><h2 id="summary-title">重置用量总结</h2><p id="summary-subtitle" class="muted"></p></div><button class="icon-button" data-close aria-label="关闭" type="button"><svg class="icon"><use href="#i-close"/></svg></button></div>
+  <div id="summary-content"></div>
 </dialog>
 
 <dialog id="batch-dialog" class="modal wide-modal">

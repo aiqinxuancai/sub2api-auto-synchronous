@@ -203,21 +203,65 @@ def main():
                     page.locator("#job-dialog a[download]").click()
                 info.value.save_as(str(artifacts / "test-members.csv"))
                 page.locator("#job-dialog [data-close]").click()
+                page.get_by_role("checkbox", name="选择 alice@example.com", exact=True).check()
                 page.get_by_role("checkbox", name="选择 bob@example.com", exact=True).check()
+                sites.fake.usage[3] = [
+                    {"model": "gpt-5", "requests": 120, "total_tokens": 480000, "input_tokens": 300000, "output_tokens": 60000,
+                     "cache_read_tokens": 120000, "cost": 9.6, "actual_cost": 8.4},
+                    {"model": "deepseek-v3.2", "requests": 40, "total_tokens": 90000, "cost": 0.5, "actual_cost": 0.42},
+                    {"model": "glm-4.6", "requests": 4, "total_tokens": 8000, "cost": 0.02, "actual_cost": 0.018},
+                    {"model": "gemini-2.5-flash", "requests": 2, "total_tokens": 3000, "cost": 0.004, "actual_cost": 0.003}]
                 page.fill("#quota-amount", "100")
                 page.locator("#quota-enabled").check()
                 page.locator('#quota-form button[type="submit"]').click()
                 expect(page.locator("#quota-next")).not_to_have_text("尚未启用")
                 assert sites.fake.users[2]["balance"] == 23
                 page.click("#reset-now")
-                expect(page.locator("#reset-review")).to_contain_text("1 位成员")
+                expect(page.locator("#reset-review")).to_contain_text("2 位成员")
+                expect(page.locator("#reset-review")).to_contain_text("当前 $ 23")
+                page.locator("#confirm-dialog").screenshot(path=str(artifacts / "reset-confirm.png"))
                 page.click("#confirm-reset")
                 expect(page.locator("#confirm-dialog")).not_to_be_visible()
                 expect(page.locator("#user-rows")).to_contain_text("$ 100", timeout=15000)
                 assert sites.fake.users[0]["balance"] == 500
+                history = page.locator("#reset-history")
+                expect(history).to_contain_text("手动重置 · 2 位成员", timeout=15000)
+                expect(history).to_contain_text("本期消费 $101.34")
+                expect(history).to_contain_text("重置前剩余 $30.5")
                 page.screenshot(path=str(artifacts / "members.png"), full_page=True)
+                history.get_by_role("button", name="查看总结").first.click()
+                summary = page.locator("#summary-dialog")
+                expect(summary).to_be_visible()
+                expect(summary.locator(".summary-metrics")).to_contain_text("$101.34")
+                expect(summary.locator(".summary-metrics")).to_contain_text("$30.5")
+                expect(summary.locator(".summary-section")).to_contain_text("claude-sonnet-4-5")
+                rows = summary.locator("#summary-rows tr")
+                expect(rows).to_have_count(2)
+                expect(rows.first).to_contain_text("alice@example.com")
+                expect(rows.nth(1)).to_contain_text("gpt-5 · 95%")
+                expect(rows.nth(1)).to_contain_text("共 4 个")
+                summary.screenshot(path=str(artifacts / "reset-summary.png"))
+                summary.get_by_label("搜索成员或模型").fill("deepseek")
+                expect(rows).to_have_count(1)
+                expect(rows.first).to_contain_text("bob@example.com")
+                with page.expect_download() as info:
+                    summary.get_by_role("button", name="导出 CSV").click()
+                csv_path = artifacts / "reset-summary.csv"
+                info.value.save_as(str(csv_path))
+                exported = csv_path.read_text(encoding="utf-8-sig").splitlines()
+                assert exported[0].startswith("邮箱,姓名,角色,重置前余额,本期消费"), exported[0]
+                assert len(exported) == 3 and exported[1].startswith("alice@example.com,Alice,员工,7.5,92.5"), exported
+                summary.locator("[data-close]").click()
+                expect(summary).not_to_be_visible()
                 page.click('[data-page="logs"]')
                 expect(page.locator("#log-rows")).to_contain_text("余额已重置", timeout=15000)
+                page.locator("#job-list .job-row", has_text="余额重置").first.click()
+                expect(page.locator("#job-detail-content")).to_contain_text("本期消费 $101.34")
+                page.locator("#job-detail-content").get_by_role("button", name="查看用量总结").click()
+                expect(summary).to_be_visible()
+                expect(page.locator("#summary-title")).to_have_text("手动重置")
+                summary.locator("[data-close]").click()
+                page.locator("#job-dialog [data-close]").click()
                 assert "test-password" not in page.locator("#log-rows").inner_text()
                 page.select_option("#log-level", "ERROR")
                 expect(page.locator("#log-rows")).to_contain_text("暂无匹配日志")

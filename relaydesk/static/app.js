@@ -11,7 +11,7 @@ const requestKey = () => {
   return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
 };
 const state = { csrf: '', setup: false, ready: false, page: 'overview', overview: null,
-  groups: [], users: [], jobs: [], logs: [], quota: null, receipts: [], selected: new Set(),
+  groups: [], users: [], jobs: [], logs: [], quota: null, receipts: [], summaries: [], selected: new Set(),
   groupFilter: 'all', groupPage: 0, userPage: 0, settingsDirty: false, quotaDirty: false,
   watched: new Map(), knownJobs: new Map(), batchMode: 'paste', currentGroup: null,
   currentJob: null, batchKey: null, resetRule: null, polling: false, offline: false,
@@ -146,7 +146,7 @@ async function initialize() {
   const [overview, groups, users, quota, jobs] = await Promise.all([
     api('/overview'), api('/groups'), api('/users'), api('/quota'), api('/jobs')]);
   Object.assign(state, { overview, groups: groups.items, users: users.items, quota: quota.rule,
-    receipts: quota.receipts, jobs: jobs.items, ready: true });
+    receipts: quota.receipts, summaries: quota.summaries || [], jobs: jobs.items, ready: true });
   for (const job of state.jobs) state.knownJobs.set(job.id, job.status);
   state.jobHistory = new Map(); state.jobsExhausted = jobs.items.length < JOB_PAGE; rememberJobs(jobs.items);
   state.selected = new Set(state.quota.user_ids);
@@ -788,8 +788,12 @@ $('#reset-now').onclick = () => {
   state.resetRequestKey = requestKey();
   const root = $('#reset-review'); root.replaceChildren(el('p', 'muted small', `将${{ all_members: '所有', all_employees: '所有非管理员', selected: '已选择的' }[rule.scope]} ${users.length} 位成员的余额设为`),
     el('div', 'reset-amount', '$ ' + number(rule.amount, 6)), el('p', 'notice', '本次操作直接覆盖当前余额。确认后立即执行，每月自动重置规则另行保存。'));
-  for (const user of users.slice(0, 8)) root.append(el('p', 'reset-person', user.email + (user.role === 'admin' ? ' · 管理员' : '')));
+  for (const user of users.slice(0, 8)) {
+    const person = el('p', 'reset-person'); person.append(el('span', '', user.email + (user.role === 'admin' ? ' · 管理员' : '')), el('span', 'balance-number', '当前 $ ' + number(user.balance, 6)));
+    root.append(person);
+  }
   if (users.length > 8) root.append(el('p', 'reset-person', `另有 ${users.length - 8} 位成员`));
+  root.append(el('p', 'field-help reset-note', '重置前会逐一记录成员的剩余余额、本期用量和主要模型，完成后可在「重置用量总结」中查看。'));
   $('#confirm-dialog').showModal();
 };
 $('#confirm-reset').onclick = () => action(async () => {
@@ -896,7 +900,7 @@ function summary(job) {
   if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}${result.concurrency_fixed ? ` · 修正 ${result.concurrency_fixed} 个账号并发` : ''}${result.pricing_updated ? ` · 更新 ${result.pricing_updated} 个分组价格` : ''}`;
   if (job.kind === 'refresh_users') return `已读取 ${result.count} 位成员`;
   if (job.kind === 'batch_users') return `创建 ${result.created.length} 位 · 跳过 ${result.skipped.length} 位${result.failed ? ` · 失败 ${result.failed} 位` : ''}`;
-  if (job.kind === 'quota_reset') return `已重置 ${result.succeeded.length} 位 · $${number(result.amount)}${result.failed ? ` · ${result.failed} 位待处理` : ''}`;
+  if (job.kind === 'quota_reset') return `已重置 ${result.succeeded.length} 位 · $${number(result.amount)}${result.failed ? ` · ${result.failed} 位待处理` : ''}${result.usage && result.usage.missing < result.usage.users ? ` · 本期消费 ${money(result.usage.cost)}` : ''}`;
   return statuses[job.status];
 }
 // Polling only returns the newest page; history keeps every job seen so older pages stay contiguous.
@@ -923,7 +927,7 @@ function renderJobs() {
     const more = el('button', 'text-button job-more', state.loadingJobs ? '加载中…' : `已显示 ${history.length} 条 · 加载更早的记录`);
     more.type = 'button'; more.disabled = state.loadingJobs; more.onclick = () => action(loadOlderJobs); root.append(more);
   } else if (history.length > JOB_PAGE) root.append(el('p', 'empty-inline', `已显示全部 ${history.length} 条记录`));
-  renderActivity(); renderBatchHistory(); renderRunning(); renderReceipts();
+  renderActivity(); renderBatchHistory(); renderRunning(); renderReceipts(); renderResetHistory();
 }
 function openJob(job) {
   if (state.jobLog.id !== job.id) state.jobLog = { id: job.id, items: [], loaded: false, final: false, truncated: false };
@@ -1023,12 +1027,14 @@ function renderJobDetail(job) {
       detail.append(el('h3', '', '需要关注的结果'));
       const list = el('ul'); for (const failure of failures) list.append(el('li', '', (subject(failure) ? subject(failure) + '：' : '') + failure.error)); detail.append(list);
     }
+    if (job.kind === 'quota_reset' && result.usage) detail.append(summaryButton(job.id, 'button'));
     if (job.kind === 'batch_users') {
       for (const item of result.created || []) detail.append(el('p', '', '已创建 · ' + item.email));
       if (result.skipped?.length) detail.append(el('p', '', '已存在，跳过 · ' + result.skipped.join('、')));
       if (result.export_available) { detail.append(el('p', 'notice', '凭据文件包含初始登录密码，请保存在团队可信的位置。')); detail.append(credentialLink(job)); }
     }
   }
+  if (job.kind === 'quota_reset' && job.status === 'running') detail.append(summaryButton(job.id, 'button', '查看已统计的成员'));
   root.append(detail);
   if (job.export_available && !result?.export_available) detail.append(credentialLink(job));
   root.append(renderJobLog(job));
@@ -1043,6 +1049,150 @@ function renderReceipts() {
     row.append(el('span', '', receipt.period.startsWith('manual-') ? '手动重置' : receipt.period),
       el('span', '', user?.email || '成员 #' + receipt.user_id), el('span', 'muted', receipt.error || date(receipt.updated)), badge(receipt.state)); root.append(row);
   }
+}
+// ---------- Reset usage summaries ----------
+function money(value) { return value == null ? '—' : '$' + number(value, Math.abs(value) < 1 ? 4 : 2); }
+function compact(value) { return value == null ? '—' : Number(value).toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 }); }
+function resetLabel(period) { return !period || period.startsWith('manual-') ? '手动重置' : `${period} 每月重置`; }
+function summaryButton(jobId, className = 'text-button', text = '查看用量总结') {
+  const button = el('button', className, text); button.type = 'button';
+  if (className === 'button') button.prepend(icon('users'));
+  button.onclick = () => openSummary(jobId); return button;
+}
+function renderResetHistory() {
+  const root = $('#reset-history'); root.replaceChildren();
+  if (!state.summaries.length) return;
+  root.append(el('h3', '', '重置用量总结'));
+  for (const item of state.summaries.slice(0, 6)) {
+    const row = el('div', 'batch-record'), text = el('div');
+    const spent = item.missing >= item.users ? '用量暂不可用' : `本期消费 ${money(item.cost)}${item.missing ? `（${item.missing} 位未读取）` : ''}`;
+    text.append(el('strong', '', `${resetLabel(item.period)} · ${item.users} 位成员`),
+      el('small', '', `${date(item.at)} · ${spent} · 重置前剩余 ${money(item.balance)}`));
+    row.append(text, summaryButton(item.job_id, 'text-button', '查看总结')); root.append(row);
+  }
+}
+async function openSummary(jobId) {
+  await action(async () => {
+    const data = await api(`/quota/summaries/${jobId}`);
+    state.summaryView = { ...data, search: '' };
+    renderSummary(); if (!$('#summary-dialog').open) $('#summary-dialog').showModal();
+  });
+}
+// A member's models with their share of the member's spend (or requests when nothing was charged).
+function modelShares(models, total) {
+  const byCost = total.actual_cost > 0, base = byCost ? total.actual_cost : total.requests;
+  return (models || []).map(model => ({ ...model, share: base ? (byCost ? model.actual_cost : model.requests) / base : 0 }));
+}
+function shareText(share) { return share >= 0.995 ? '100%' : share < 0.01 ? '<1%' : `${Math.round(share * 100)}%`; }
+function teamModels(items) {
+  const models = new Map();
+  for (const item of items) for (const model of item.models || []) {
+    if (model.other) continue;
+    const row = models.get(model.model) || { model: model.model, actual_cost: 0, requests: 0, total_tokens: 0, users: 0 };
+    row.actual_cost += model.actual_cost; row.requests += model.requests; row.total_tokens += model.total_tokens; row.users++;
+    models.set(model.model, row);
+  }
+  return [...models.values()].sort((a, b) => b.actual_cost - a.actual_cost || b.requests - a.requests);
+}
+function renderSummary() {
+  const view = state.summaryView, total = view.summary, items = view.items;
+  $('#summary-title').textContent = resetLabel(total.period);
+  $('#summary-subtitle').textContent = `${date(total.at, null, true)} 执行 · 余额设为 ${money(total.amount)} · ${total.succeeded} / ${total.users} 位成员已重置`;
+  const root = $('#summary-content'); root.replaceChildren();
+  const zone = items.find(item => item.timezone)?.timezone;
+  root.append(el('p', 'summary-window', `统计区间 ${total.since} 至 ${total.until}${zone ? `（${zone} 自然日）` : ''}，截至每位成员重置前`));
+  const metrics = el('div', 'summary-metrics'), available = total.missing < total.users;
+  for (const [label, value, hint] of [
+    ['本期消费', available ? money(total.cost) : '—', '按实际扣费'],
+    ['请求数', available ? number(total.requests, 0) : '—', `${total.users - total.missing} 位成员有用量记录`],
+    ['Tokens', available ? compact(total.tokens) : '—', '输入、输出与缓存合计'],
+    ['重置前剩余', money(total.balance), `${total.users} 位成员合计`]]) {
+    const metric = el('div', 'summary-metric'); metric.append(el('span', '', label), el('strong', '', value), el('small', '', hint)); metrics.append(metric);
+  }
+  root.append(metrics);
+  if (total.missing) {
+    const reason = items.find(item => item.usage_error)?.usage_error;
+    root.append(el('p', 'notice', `${total.missing} 位成员的用量未能读取${reason ? `（${reason}）` : ''}，只记录了重置前余额。`));
+  }
+  const models = teamModels(items).slice(0, 6);
+  if (models.length) {
+    const section = el('div', 'summary-section'); section.append(el('h3', '', '主要模型'));
+    const byCost = models.some(model => model.actual_cost > 0), base = byCost ? total.cost : total.requests;
+    for (const model of models) {
+      const share = base ? (byCost ? model.actual_cost : model.requests) / base : 0;
+      const row = el('div', 'summary-model'), bar = el('div', 'summary-bar'), fill = el('span');
+      fill.style.width = `${Math.min(100, share * 100)}%`; bar.append(fill);
+      row.append(el('span', 'summary-model-name', model.model), bar, el('span', 'summary-model-share', shareText(share)),
+        el('span', 'summary-model-detail', `${money(model.actual_cost)} · ${number(model.requests, 0)} 次 · ${model.users} 位成员`));
+      section.append(row);
+    }
+    root.append(section);
+  }
+  const heading = el('div', 'summary-table-heading'), search = el('label', 'search-field'), input = el('input');
+  input.placeholder = '搜索成员或模型…'; input.setAttribute('aria-label', '搜索成员或模型'); input.value = view.search;
+  input.oninput = () => { view.search = input.value; renderSummaryRows(); };
+  search.append(icon('search'), input);
+  const exportButton = el('button', 'button', '导出 CSV'); exportButton.type = 'button'; exportButton.prepend(icon('download')); exportButton.onclick = exportSummary;
+  const tools = el('div', 'summary-tools'); tools.append(search, exportButton);
+  heading.append(el('h3', '', '成员明细'), tools);
+  const scroll = el('div', 'table-scroll summary-table-scroll'), table = el('table', 'summary-table'), head = el('thead'), headRow = el('tr');
+  for (const title of ['成员', '重置前余额', '本期消费', '请求', 'Tokens', '主要模型', '结果']) headRow.append(el('th', '', title));
+  head.append(headRow); const body = el('tbody'); body.id = 'summary-rows'; table.append(head, body); scroll.append(table);
+  root.append(heading, scroll);
+  renderSummaryRows();
+}
+function renderSummaryRows() {
+  const view = state.summaryView, body = $('#summary-rows'); if (!body) return;
+  const query = view.search.trim().toLowerCase();
+  const items = view.items.filter(item => !query || [item.email, item.username, ...(item.models || []).map(model => model.model)].some(value => value?.toLowerCase().includes(query)));
+  body.replaceChildren();
+  if (!items.length) { const row = el('tr'), cell = el('td', 'empty-inline', '没有匹配的成员'); cell.colSpan = 7; row.append(cell); body.append(row); }
+  for (const item of items) {
+    const row = el('tr'), person = el('td'), identity = el('div', 'member-identity'), copy = el('div');
+    const name = item.username || item.email?.split('@')[0] || `#${item.user_id}`;
+    identity.append(el('span', 'member-avatar', name[0].toUpperCase()));
+    copy.append(el('strong', '', name + (item.role === 'admin' ? ' · 管理员' : '')), el('small', '', item.email || `成员 #${item.user_id}`));
+    identity.append(copy); person.append(identity);
+    const spent = el('td', 'balance-number');
+    if (item.usage) {
+      spent.append(document.createTextNode(money(item.cost)));
+      if (item.since !== view.summary.since) spent.append(el('small', 'summary-since', `自 ${item.since.slice(5)} 起`));
+    } else { spent.textContent = '—'; spent.title = item.usage_error || '用量未读取'; }
+    const models = el('td', 'summary-models');
+    const shares = item.usage ? modelShares(item.models, item.usage) : [];
+    if (!item.usage) models.append(el('span', 'muted', '暂不可用'));
+    else if (!shares.length) models.append(el('span', 'muted', '本期无调用'));
+    for (const model of shares.slice(0, 3)) models.append(el('span', 'model-tag', `${model.model} · ${shareText(model.share)}`));
+    if (shares.length > 3) models.append(el('span', 'muted', `共 ${shares.length} 个`));
+    models.title = shares.map(model => `${model.model}：${money(model.actual_cost)} · ${number(model.requests, 0)} 次 · ${compact(model.total_tokens)} tokens`).join('\n');
+    const result = el('td'); result.append(badge(item.state)); if (item.error) result.title = item.error;
+    row.append(person, el('td', 'balance-number', money(item.balance)), spent,
+      el('td', 'balance-number', item.usage ? number(item.requests, 0) : '—'), el('td', 'balance-number', item.usage ? compact(item.tokens) : '—'), models, result);
+    body.append(row);
+  }
+}
+function csvCell(value) {
+  if (value == null) return '';
+  let text = String(value);
+  // Spreadsheet formula injection protection for names and emails.
+  if (typeof value === 'string' && /^[=+\-@\t\r]/.test(text)) text = "'" + text;
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+function exportSummary() {
+  const { summary: total, items } = state.summaryView;
+  const rows = [['邮箱', '姓名', '角色', '重置前余额', '本期消费', '标准计费', '请求数', 'Tokens', '输入 Tokens', '输出 Tokens', '缓存读取 Tokens', '缓存写入 Tokens', '主要模型', '统计起始', '统计截止', '重置金额', '重置结果', '说明']];
+  for (const item of items) {
+    const usage = item.usage, models = usage ? modelShares(item.models, usage) : [];
+    rows.push([item.email, item.username, item.role === 'admin' ? '管理员' : '员工', item.balance, usage?.actual_cost, usage?.cost, usage?.requests,
+      usage?.total_tokens, usage?.input_tokens, usage?.output_tokens, usage?.cache_read_tokens, usage?.cache_creation_tokens,
+      models.slice(0, 5).map(model => `${model.model} ${shareText(model.share)}`).join('; '), item.since, item.until, item.amount,
+      statuses[item.state] || item.state, item.error || item.usage_error || '']);
+  }
+  const text = rows.map(row => row.map(csvCell).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob(['\uFEFF' + text], { type: 'text/csv;charset=utf-8' }));
+  const stamp = total.period.startsWith('manual-') ? new Date(total.at * 1000).toISOString().slice(0, 10) : total.period;
+  const link = el('a'); link.href = url; link.download = `flow-reset-summary-${stamp}.csv`;
+  link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 async function loadLogs() {
   const params = new URLSearchParams({ level: $('#log-level').value, search: $('#log-search').value });
@@ -1088,7 +1238,7 @@ async function refresh() {
     if (reloadGroups) { state.groups = (await api('/groups')).items; renderGroups(); }
     if (reloadUsers) { const data = await api('/users'); state.users = data.items; renderUsers(data.updated); }
     if (reloadQuota || state.page === 'logs') {
-      const data = await api('/quota'); state.quota = data.rule; state.receipts = data.receipts;
+      const data = await api('/quota'); state.quota = data.rule; state.receipts = data.receipts; state.summaries = data.summaries || [];
       if (!state.quotaDirty) renderQuota();
     }
     renderOverview(); renderJobs();

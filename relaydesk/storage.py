@@ -51,6 +51,13 @@ class Store:
                     PRIMARY KEY(period, user_id));
                 CREATE TABLE IF NOT EXISTS artifacts (
                     job_id TEXT PRIMARY KEY, value BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS reset_summaries (
+                    job_id TEXT NOT NULL, user_id INTEGER NOT NULL, period TEXT NOT NULL,
+                    at REAL NOT NULL, state TEXT NOT NULL, amount REAL NOT NULL,
+                    since TEXT NOT NULL, until TEXT NOT NULL, balance REAL, cost REAL,
+                    requests INTEGER, tokens INTEGER, detail TEXT NOT NULL, error TEXT,
+                    PRIMARY KEY(job_id, user_id));
+                CREATE INDEX IF NOT EXISTS reset_summaries_at ON reset_summaries(at);
             """)
         if os.name != "nt":
             os.chmod(self.path, 0o600)
@@ -208,6 +215,48 @@ class Store:
             return [dict(row) for row in connection.execute(
                 "SELECT * FROM receipts ORDER BY updated DESC LIMIT ?", (limit,)).fetchall()]
 
+    def last_reset(self, user_id):
+        """When this member's balance was last reset successfully."""
+        with self.connect() as connection:
+            row = connection.execute("SELECT MAX(updated) FROM receipts WHERE user_id=? AND state='success'",
+                                     (user_id,)).fetchone()
+        return row[0]
+
+    SUMMARY_FIELDS = ("period", "state", "amount", "since", "until", "balance", "cost", "requests", "tokens")
+
+    def save_reset_summary(self, job_id, user_id, row, detail):
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO reset_summaries (job_id,user_id,at,detail," + ",".join(self.SUMMARY_FIELDS) +
+                ") VALUES (?,?,?,?" + ",?" * len(self.SUMMARY_FIELDS) + ")",
+                (job_id, user_id, time.time(), json.dumps(detail, ensure_ascii=False),
+                 *(row.get(key) for key in self.SUMMARY_FIELDS)))
+
+    def finish_reset_summary(self, job_id, user_id, state, error=None):
+        with self.connect() as connection:
+            connection.execute("UPDATE reset_summaries SET state=?,error=? WHERE job_id=? AND user_id=?",
+                               (state, error, job_id, user_id))
+
+    SUMMARY_TOTALS = ("SELECT job_id, MAX(period) AS period, MIN(at) AS at, MAX(amount) AS amount, "
+                      "MIN(since) AS since, MAX(until) AS until, COUNT(*) AS users, "
+                      "SUM(state='success') AS succeeded, SUM(balance) AS balance, SUM(cost) AS cost, "
+                      "SUM(requests) AS requests, SUM(tokens) AS tokens, SUM(cost IS NULL) AS missing "
+                      "FROM reset_summaries ")
+
+    def reset_summaries(self, limit=12):
+        """Newest resets first, each with its members' combined usage."""
+        with self.connect() as connection:
+            return [dict(row) for row in connection.execute(
+                self.SUMMARY_TOTALS + "GROUP BY job_id ORDER BY at DESC LIMIT ?", (limit,)).fetchall()]
+
+    def reset_summary(self, job_id):
+        with self.connect() as connection:
+            totals = connection.execute(self.SUMMARY_TOTALS + "WHERE job_id=? GROUP BY job_id", (job_id,)).fetchone()
+            rows = connection.execute("SELECT * FROM reset_summaries WHERE job_id=? ORDER BY cost IS NULL, cost DESC, user_id",
+                                      (job_id,)).fetchall()
+        items = [{**{key: row[key] for key in row.keys() if key != "detail"}, **json.loads(row["detail"])} for row in rows]
+        return (dict(totals) if totals else None), items
+
     def save_artifact(self, job_id, value):
         with self.connect() as connection:
             connection.execute("INSERT OR REPLACE INTO artifacts VALUES (?,?)", (job_id, self.encrypt(value)))
@@ -226,4 +275,5 @@ class Store:
                 "WHERE status IN ('queued','running')", (time.time(),))
             # A lost acknowledgement must not cause a second monthly reset.
             connection.execute("UPDATE receipts SET state='uncertain',error='服务重启时执行结果未确认' WHERE state='running'")
+            connection.execute("UPDATE reset_summaries SET state='uncertain',error='服务重启时执行结果未确认' WHERE state='running'")
         return recoverable

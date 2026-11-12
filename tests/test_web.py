@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -38,12 +38,33 @@ class WebSites(FakeSites):
         self.user_mutations = []
         self.fail_users = set()
         self.uncertain_users = set()
+        # Model distribution per member, as /admin/dashboard/models reports it.
+        self.usage = {
+            2: [{"model": "claude-sonnet-4-5", "requests": 30, "input_tokens": 9000, "output_tokens": 3000,
+                 "cache_creation_tokens": 0, "cache_read_tokens": 6000, "total_tokens": 18000,
+                 "cost": 80.0, "actual_cost": 72.5, "account_cost": 40.0},
+                {"model": "gpt-5", "requests": 10, "input_tokens": 1000, "output_tokens": 1000,
+                 "cache_creation_tokens": 0, "cache_read_tokens": 0, "total_tokens": 2000,
+                 "cost": 25.0, "actual_cost": 20.0, "account_cost": 9.0}],
+        }
+        self.usage_queries = []
+        self.usage_status = 200
+        self.timeline = []
 
     def handle(self, method, raw_path, headers, body):
         parsed = urlsplit(raw_path)
         path, query = parsed.path, parse_qs(parsed.query)
         if path == "/up/api/v1/auth/login" and body.get("password") != "test-password":
             return 401, None
+        if path == "/down/api/v1/admin/dashboard/models":
+            if headers.get("x-api-key") != "test-admin-key":
+                return 401, None
+            self.usage_queries.append({key: values[0] for key, values in query.items()})
+            self.timeline.append(("usage", int(query["user_id"][0])))
+            if self.usage_status != 200:
+                return self.usage_status, None
+            return 200, {"models": copy.deepcopy(self.usage.get(int(query["user_id"][0]), [])),
+                         "start_date": query["start_date"][0], "end_date": query["end_date"][0]}
         if path.startswith("/down/api/v1/admin/users"):
             if headers.get("x-api-key") != "test-admin-key":
                 return 401, None
@@ -51,6 +72,8 @@ class WebSites(FakeSites):
                 page, size = int(query.get("page", [1])[0]), int(query.get("page_size", [100])[0])
                 return 200, {"items": copy.deepcopy(self.users[(page - 1) * size:page * size]), "total": len(self.users)}
             self.user_mutations.append((method, path, copy.deepcopy(body), headers.get("Idempotency-Key")))
+            if "/users/" in path:
+                self.timeline.append(("reset", int(path.split("/users/")[1].split("/")[0])))
             if path == "/down/api/v1/admin/users" and method == "POST":
                 if any(user["email"] == body["email"] for user in self.users):
                     return 409, None
@@ -370,6 +393,8 @@ class WebTests(unittest.TestCase):
         store = self.service.store
         job_id, _ = store.create_job("quota_reset", {"rule": rule, "period": "2026-02"})
         store.claim_receipt("2026-02", 2, job_id)
+        store.save_reset_summary(job_id, 2, {"period": "2026-02", "state": "running", "amount": 77,
+                                             "since": "2026-01-01", "until": "2026-02-01", "balance": 7.5}, {})
         self.service.close()
         self.service = Service(self.root / "data", start_scheduler=False)
         result = await_job(self.service, job_id)
@@ -377,6 +402,72 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.sites.fake.users[1]["balance"], 7.5)
         self.assertEqual(self.sites.fake.users[2]["balance"], 77)
         self.assertEqual(next(receipt for receipt in store.receipts() if receipt["user_id"] == 2)["state"], "uncertain")
+        # The member whose reset was cut off keeps its summary, marked for review.
+        _, items = self.service.store.reset_summary(job_id)
+        self.assertEqual({item["user_id"]: item["state"] for item in items}, {2: "uncertain", 3: "success"})
+
+    def test_reset_first_records_each_members_balance_usage_and_models(self):
+        now = datetime(2026, 3, 12, 4, tzinfo=timezone.utc)  # 12:00 in Shanghai
+        with patch("relaydesk.service.utcnow", return_value=now):
+            job = self.job("/jobs/reset-balances", {"confirm": True, "rule": {"scope": "selected", "user_ids": [2, 3], "amount": 100}})
+        self.assertEqual(job["status"], "success")
+        fake = self.sites.fake
+        # Each member is summarized right before that member's own reset.
+        self.assertEqual(fake.timeline, [("usage", 2), ("reset", 2), ("usage", 3), ("reset", 3)])
+        self.assertEqual(fake.usage_queries[0], {"user_id": "2", "start_date": "2026-03-01", "end_date": "2026-03-12",
+                                                 "timezone": "Asia/Shanghai"})
+        self.assertEqual(job["result"]["usage"], {"users": 2, "balance": 30.5, "cost": 92.5, "requests": 40,
+                                                  "tokens": 20000, "missing": 0})
+        listed = self.client.get("/api/quota").json()["summaries"]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual({key: listed[0][key] for key in ("job_id", "users", "succeeded", "balance", "cost", "requests",
+                                                          "tokens", "missing", "since", "until", "amount")},
+                         {"job_id": job["id"], "users": 2, "succeeded": 2, "balance": 30.5, "cost": 92.5,
+                          "requests": 40, "tokens": 20000, "missing": 0, "since": "2026-03-01",
+                          "until": "2026-03-12", "amount": 100})
+        detail = self.client.get(f"/api/quota/summaries/{job['id']}").json()
+        alice, bob = detail["items"]
+        self.assertEqual((alice["email"], alice["balance"], alice["cost"], alice["state"]), ("alice@example.com", 7.5, 92.5, "success"))
+        self.assertEqual([model["model"] for model in alice["models"]], ["claude-sonnet-4-5", "gpt-5"])
+        self.assertEqual((alice["usage"]["cost"], alice["usage"]["cache_read_tokens"]), (105.0, 6000))
+        self.assertEqual((bob["email"], bob["balance"], bob["cost"], bob["models"]), ("bob@example.com", 23, 0, []))
+        self.assertIn("重置前 $7.5，本期消费 $92.50", "\n".join(line["message"] for line in self.service.store.logs(job_id=job["id"])))
+        self.assertEqual(self.client.get("/api/quota/summaries/" + "0" * 32).status_code, 404)
+
+    def test_monthly_summary_covers_the_closed_month_then_starts_at_the_last_reset(self):
+        rule = {**self.service.store.get("quota_rule"), "amount": 50, "scope": "selected", "user_ids": [2]}
+        with patch("relaydesk.service.utcnow", return_value=datetime(2026, 1, 31, 16, 0, 5, tzinfo=timezone.utc)):
+            await_job(self.service, self.service.submit("quota_reset", {"rule": rule, "period": "2026-02"}))
+        self.assertEqual((self.sites.fake.usage_queries[-1]["start_date"], self.sites.fake.usage_queries[-1]["end_date"]),
+                         ("2026-01-01", "2026-02-01"))
+        last = self.service.store.last_reset(2)
+        later = datetime.fromtimestamp(last, timezone.utc) + timedelta(days=3)
+        with patch("relaydesk.service.utcnow", return_value=later):
+            await_job(self.service, self.service.submit("quota_reset", {"rule": rule}))
+        zone = ZoneInfo("Asia/Shanghai")
+        self.assertEqual((self.sites.fake.usage_queries[-1]["start_date"], self.sites.fake.usage_queries[-1]["end_date"]),
+                         (datetime.fromtimestamp(last, zone).date().isoformat(), later.astimezone(zone).date().isoformat()))
+
+    def test_reset_goes_ahead_when_usage_cannot_be_read(self):
+        self.sites.fake.usage_status = 404
+        job = self.job("/jobs/reset-balances", {"confirm": True, "rule": {"scope": "all_employees", "amount": 8}})
+        self.assertEqual(job["status"], "success")
+        self.assertEqual([user["balance"] for user in self.sites.fake.users], [500, 8, 8])
+        # A site without the endpoint is asked once, not once per member.
+        self.assertEqual(len(self.sites.fake.usage_queries), 1)
+        self.assertEqual(job["result"]["usage"]["missing"], 2)
+        _, items = self.service.store.reset_summary(job["id"])
+        self.assertEqual([(item["balance"], item["cost"], item["usage_error"]) for item in items],
+                         [(7.5, None, "本地站点不支持按成员查询用量"), (23, None, "本地站点不支持按成员查询用量")])
+        warnings = [line["message"] for line in self.service.store.logs(job_id=job["id"], level="WARNING")]
+        self.assertEqual(warnings, ["本地站点不支持按成员查询用量（/admin/dashboard/models），本次只记录重置前余额"])
+        self.sites.fake.usage_status = 500
+        job = self.job("/jobs/reset-balances", {"confirm": True, "rule": {"scope": "all_employees", "amount": 9}})
+        self.assertEqual([user["balance"] for user in self.sites.fake.users], [500, 9, 9])
+        self.assertEqual(len(self.sites.fake.usage_queries), 3)
+        _, items = self.service.store.reset_summary(job["id"])
+        self.assertTrue(all("HTTP 500" in item["usage_error"] for item in items))
+        self.assertEqual(self.client.get("/api/quota").json()["summaries"][0]["missing"], 2)
 
     def test_catchup_only_current_month_after_downtime(self):
         with patch("relaydesk.service.utcnow", return_value=datetime(2026, 1, 5, tzinfo=timezone.utc)):

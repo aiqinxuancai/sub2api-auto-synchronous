@@ -20,6 +20,7 @@ from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, DEFAULT_PRICE_SYNC_PLATFO
 from provider_ranking import PLATFORMS
 
 from .storage import Store
+from .usage import member_usage, usage_window
 from .configuration import SECRET_FIELDS
 from .low_cost import BestSourceSelector, LowCostSelector
 from .rules import (CADENCE, DEFAULTS, LEGACY_SETTINGS, new_rule, normalize_rules, rule_key, rule_label,
@@ -691,17 +692,50 @@ class Service:
         period = payload.get("period") or f"manual-{job_id}"
         config, client = self._target()
         succeeded, skipped, failures = [], [], []
-        retryable = False
+        retryable, usage_supported = False, True
+        totals = {"users": 0, "balance": 0.0, "cost": 0.0, "requests": 0, "tokens": 0, "missing": 0}
         with state_lock(config.state_file):
             self.progress("读取成员列表")
             users = client.list_all("/admin/users")
             selected = quota_targets(rule, users)
             for index, user in enumerate(selected, 1):
                 user_id = user["id"]
-                self.progress(f"重置成员余额 {user.get('email') or user_id}", index, len(selected))
+                label = user.get("email") or f"#{user_id}"
                 if not self.store.claim_receipt(period, user_id, job_id):
                     skipped.append(user_id)
                     continue
+                # The summary is taken first; a failed usage read never holds back the reset.
+                since, until = usage_window(rule["timezone"], payload.get("period"), self.store.last_reset(user_id), utcnow())
+                usage, models, usage_error = None, [], "本地站点不支持按成员查询用量"
+                if usage_supported:
+                    self.progress(f"统计成员用量 {label}", index, len(selected))
+                    try:
+                        usage, models = member_usage(client, user_id, since, until, rule["timezone"])
+                        usage_error = None
+                    except SyncError as error:
+                        if isinstance(error, APIError) and error.status in {404, 405}:
+                            usage_supported = False
+                            self.log("WARNING", "本地站点不支持按成员查询用量（/admin/dashboard/models），本次只记录重置前余额")
+                        else:
+                            usage_error = str(error)
+                            self.log("WARNING", f"成员 {label} 用量读取失败，继续重置：{error}")
+                balance = user.get("balance") if isinstance(user.get("balance"), (int, float)) and not isinstance(user.get("balance"), bool) else None
+                self.store.save_reset_summary(job_id, user_id, {
+                    "period": period, "state": "running", "amount": rule["amount"], "since": since.isoformat(),
+                    "until": until.isoformat(), "balance": balance,
+                    "cost": usage["actual_cost"] if usage else None, "requests": usage["requests"] if usage else None,
+                    "tokens": usage["total_tokens"] if usage else None,
+                }, {"email": user.get("email") or "", "username": user.get("username") or "", "role": user.get("role") or "",
+                    "timezone": rule["timezone"], "usage": usage, "models": models, "usage_error": usage_error})
+                totals["users"] += 1
+                totals["balance"] += balance or 0
+                if usage:
+                    totals["cost"] += usage["actual_cost"]
+                    totals["requests"] += usage["requests"]
+                    totals["tokens"] += usage["total_tokens"]
+                else:
+                    totals["missing"] += 1
+                self.progress(f"重置成员余额 {label}", index, len(selected))
                 try:
                     client.idempotency_key = f"flow-reset-{period}-{user_id}"
                     if rule["amount"] == 0:
@@ -711,19 +745,23 @@ class Service:
                             "balance": rule["amount"], "operation": "set",
                             "notes": f"Flow 余额重置 · {period}"})
                     self.store.receipt(period, user_id, "success", job_id)
+                    self.store.finish_reset_summary(job_id, user_id, "success")
                     succeeded.append(user_id)
-                    self.log("INFO", f"成员 {user['email']} 余额已重置为 ${rule['amount']:g}")
+                    spent = f"，本期消费 ${usage['actual_cost']:.2f}" if usage else ""
+                    self.log("INFO", f"成员 {user['email']} 余额已重置为 ${rule['amount']:g}（重置前 ${balance or 0:g}{spent}）")
                 except SyncError as error:
                     # Definite HTTP rejection may be retried; uncertain delivery must be reviewed.
                     definite = isinstance(error, APIError) and error.status < 500
                     retryable = retryable or definite
-                    self.store.receipt(period, user_id, "failed" if definite else "uncertain", job_id, str(error))
+                    state = "failed" if definite else "uncertain"
+                    self.store.receipt(period, user_id, state, job_id, str(error))
+                    self.store.finish_reset_summary(job_id, user_id, state, str(error))
                     failures.append({"user_id": user_id, "error": str(error)})
                     self.log("ERROR", f"成员 {user_id} 额度重置失败：{error}")
         self._refresh_users()
         return {"period": period, "amount": rule["amount"], "succeeded": succeeded,
                 "skipped": skipped, "failures": failures, "failed": len(failures), "total": len(selected),
-                "retryable": retryable}
+                "retryable": retryable, "usage": totals if totals["users"] else None}
 
     def _monthly_retry(self, payload, needed):
         with self.settings_lock:
