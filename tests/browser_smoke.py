@@ -73,6 +73,9 @@ def main():
                 page.locator('[data-platform="gemini"]').uncheck()
                 expect(page.locator('[data-platform-limit="gemini"]')).to_be_disabled()
                 page.fill('[data-platform-limit="openai"]', "2")
+                expect(page.locator('[data-price-platform="deepseek"]')).to_be_checked()
+                expect(page.locator('[data-price-platform="openai"]')).not_to_be_checked()
+                page.locator('[data-price-platform="kimi"]').uncheck()
                 page.click("#stable-add")
                 expect(page.locator("#stable-dialog")).to_be_visible()
                 page.locator('.strategy-choice:has([value="low_cost"])').click()
@@ -121,6 +124,7 @@ def main():
                 assert low["exclude_keywords"] == ["Alpha", "测试", "公益"]
                 expect(rule.locator('[data-field="exclude_keywords"]')).to_have_value("Alpha, 测试, 公益")
                 assert saved["sync_platform_limits"] == {"openai": 2}, saved["sync_platform_limits"]
+                assert saved["price_sync_platforms"] == ["deepseek", "zhipu"], saved["price_sync_platforms"]
                 page.screenshot(path=str(artifacts / "settings-selection.png"), full_page=True)
                 page.click('[data-page="overview"]')
                 page.click('#sync-now')

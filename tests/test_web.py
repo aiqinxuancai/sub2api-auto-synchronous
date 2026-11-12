@@ -409,6 +409,16 @@ class WebTests(unittest.TestCase):
         self.assertEqual(list(response.json()["sync_platform_limits"].items()), [("openai", 0), ("gemini", 3)])
         self.assertEqual(self.service.config().sync_limits, {"openai": 0, "gemini": 3})
 
+    def test_price_sync_platforms_setting(self):
+        self.assertEqual(self.client.get("/api/config").json()["price_sync_platforms"], ["deepseek", "zhipu", "kimi"])
+        for value in ("deepseek", ["fake"], [1], None):
+            response = self.client.put("/api/config", json={"price_sync_platforms": value}, headers=self.headers)
+            self.assertEqual(response.status_code, 400, value)
+        response = self.client.put("/api/config", json={"price_sync_platforms": ["kimi", "openai", "kimi"]}, headers=self.headers)
+        self.assertEqual(response.json()["price_sync_platforms"], ["openai", "kimi"])
+        self.assertEqual(self.service.config().price_sync_platforms, {"openai", "kimi"})
+        self.assertEqual(self.job("/jobs/sync")["result"]["pricing_updated"], 0)
+
     def test_preferred_group_rules_validation_and_defaults(self):
         low, best = new_rule("low_cost", "openai"), new_rule("best_source", "openai")
         invalid = ["x", [{"strategy": "cheap", "platform": "openai"}], [{"strategy": "low_cost", "platform": "fake"}],

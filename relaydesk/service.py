@@ -15,8 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, APIError, Client, Config, State, SyncError, Synchronizer,
-                          account_concurrency, platform_limits, state_lock)
+from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, DEFAULT_PRICE_SYNC_PLATFORMS, APIError, Client, Config, State,
+                          SyncError, Synchronizer, account_concurrency, platform_limits, state_lock)
 from provider_ranking import PLATFORMS
 
 from .storage import Store
@@ -27,8 +27,9 @@ from .rules import (CADENCE, DEFAULTS, LEGACY_SETTINGS, new_rule, normalize_rule
 from .scoring import DEFAULT_WEIGHTS
 
 SECRETS = SECRET_FIELDS
-# Platform -> top N to sync (0 = no limit), and the user's preferred-group rules.
-SELECTION_DEFAULTS = {"sync_platform_limits": {"openai": 0}, "stable_groups": []}
+# Platform -> top N to sync (0 = no limit), the user's preferred-group rules, and platforms billed at upstream prices.
+SELECTION_DEFAULTS = {"sync_platform_limits": {"openai": 0}, "stable_groups": [],
+                      "price_sync_platforms": list(DEFAULT_PRICE_SYNC_PLATFORMS)}
 SELECTORS = {"low_cost": LowCostSelector, "best_source": BestSourceSelector}
 # Settings replaced by the composite score, renamed (`concurrency` → `account_concurrency`), or folded into
 # `sync_platform_limits` and `stable_groups`; removed from config.json on startup.
@@ -221,6 +222,10 @@ class Service:
             raise SyncError("每个平台的同步前 N 个应在 0–10000 之间，0 表示不限制")
         values["sync_platform_limits"] = {platform: limits[platform] for platform in PLATFORMS if platform in limits}
         values["stable_groups"] = normalize_rules(values["stable_groups"])
+        priced = values["price_sync_platforms"]
+        if not isinstance(priced, list) or any(not isinstance(item, str) or item not in PLATFORMS for item in priced):
+            raise SyncError("请选择有效的价格同步平台")
+        values["price_sync_platforms"] = [platform for platform in PLATFORMS if platform in priced]
         if not isinstance(values["group_ids"], list) or any(
                 type(item) is not int or item <= 0 for item in values["group_ids"]):
             raise SyncError("分组 ID 必须为正整数列表")
@@ -448,7 +453,8 @@ class Service:
                 "pending": report["pending"], "errors": report["errors"],
                 "warnings": report.get("warnings", []), "preview": preview, "stable": stable,
                 "new_keys": report.get("new_upstream_keys", 0),
-                "concurrency_fixed": report.get("concurrency_fixed", 0)}
+                "concurrency_fixed": report.get("concurrency_fixed", 0),
+                "pricing_updated": report.get("pricing_updated", 0)}
 
     def _due_stable_mode(self, key, now=None):
         """First due check in cadence order; "ranking" comes first because it covers availability too."""

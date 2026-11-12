@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -92,6 +93,8 @@ def normalize_base(value: str, name: str) -> tuple[str, str]:
 
 DEFAULT_ACCOUNT_CONCURRENCY = 100
 LEGACY_DEFAULT_CONCURRENCY = 3
+# AIHub bills these platforms at the vendors' RMB list figures; mirror its model prices by default.
+DEFAULT_PRICE_SYNC_PLATFORMS = ("deepseek", "zhipu", "kimi")
 
 
 def account_concurrency(values: dict[str, Any]) -> int:
@@ -137,6 +140,8 @@ class Config:
     group_ids: set[int] = field(default_factory=set)
     # Platform -> sync only its top N groups in the hall's default order; 0 = no limit.
     sync_limits: dict[str, int] = field(default_factory=lambda: {"openai": 0})
+    # Platforms whose local groups bill at the upstream hall's model prices.
+    price_sync_platforms: set[str] = field(default_factory=lambda: set(DEFAULT_PRICE_SYNC_PLATFORMS))
     prefix: str = "upstream-"
     rate_factor: Decimal = Decimal("1.0")
     sync_accounts: bool = True
@@ -171,6 +176,8 @@ class Config:
             raise SyncError("同步平台无效")
         if any(type(limit) is not int or not 0 <= limit <= 10000 for limit in self.sync_limits.values()):
             raise SyncError("同步前 N 个必须为 0–10000 的整数，0 表示不限制")
+        if not self.price_sync_platforms <= set(PLATFORMS):
+            raise SyncError("价格同步平台无效")
         if not 0 <= self.request_interval <= 60:
             raise SyncError("REQUEST_MIN_INTERVAL_SECONDS 必须在 0–60 之间")
         if not self.providers_path.startswith("/") or self.providers_path.startswith("//"):
@@ -192,6 +199,7 @@ class Config:
             target_refresh_token=values["target_refresh_token"] if values["target_auth_mode"] == "session" else "",
             interval=values["interval_minutes"] * 60, group_ids=set(values["group_ids"]),
             sync_limits=platform_limits(values),
+            price_sync_platforms=set(values.get("price_sync_platforms", DEFAULT_PRICE_SYNC_PLATFORMS)),
             prefix=values["prefix"], rate_factor=Decimal(str(values["rate_factor"])),
             sync_accounts=values["sync_accounts"], auto_create_keys=values["auto_create_keys"],
             concurrency=account_concurrency(values), priority=values["priority"], timeout=values["timeout"],
@@ -461,6 +469,7 @@ class SelectedGroup:
     provider_rank: int = 0
     sync_order: int = 0
     provider_score: float = 0
+    prices: dict[str, Any] = field(default_factory=dict)  # model -> hall price (USD per 1M tokens)
 
 
 def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
@@ -537,8 +546,11 @@ def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
             continue
         source_rate = multiplier(rates[str(group_id)] if str(group_id) in rates
                                  else group.get("rate_multiplier"))
+        prices = {entry["model"]: entry.get("price") for entry in item.get("group_models", [])
+                  if isinstance(entry, dict) and isinstance(entry.get("model"), str)}
         selected.append(SelectedGroup(group, sorted(models), float(source_rate),
-                                      scaled_rate(source_rate, config.rate_factor), **ranks.get(group_id, {})))
+                                      scaled_rate(source_rate, config.rate_factor), **ranks.get(group_id, {}),
+                                      prices=prices))
     selected.sort(key=lambda group: group.sync_order)
     return selected, excluded
 
@@ -577,8 +589,62 @@ def ensure_account_binding(client: "Client", account: dict[str, Any], local_grou
     account["group_ids"] = [local_group_id]
 
 
+# Sub2API group price card field -> upstream hall price field (USD per 1M tokens).
+HALL_PRICE_FIELDS = {"input_price": "input_per_million", "output_price": "output_per_million",
+                     "cache_read_price": "cache_input_per_million", "cache_write_price": "cache_write_per_million"}
+
+
+def pricing_model_key(model: str) -> str:
+    """Sub2API matches price cards case-insensitively and treats '.' as '-' in claude-* names."""
+    key = model.strip().lower()
+    return key.replace(".", "-") if key.startswith("claude-") else key
+
+
+def per_token(value: Any) -> float | None:
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        return None
+    return float(Decimal(str(value)) / 1_000_000)
+
+
+def hall_model_pricing(platform: str, models: list[str], prices: dict[str, Any]) -> list[dict[str, Any]]:
+    """Group price cards (USD per token) for the routed models; identical prices share one card.
+
+    A model without a complete input/output price keeps the target's built-in price.
+    """
+    cards: dict[tuple, list[str]] = {}
+    seen: set[str] = set()
+    for model in models:
+        price, key = prices.get(model), pricing_model_key(model)
+        if key in seen or not isinstance(price, dict):
+            continue
+        values = {name: per_token(price.get(source)) for name, source in HALL_PRICE_FIELDS.items()}
+        if values["input_price"] is None or values["output_price"] is None:
+            continue
+        seen.add(key)
+        card = tuple(sorted((name, value) for name, value in values.items() if value is not None))
+        cards.setdefault(card, []).append(model)
+    return [{"platform": platform, "models": sorted(names), "billing_mode": "token", **dict(card)}
+            for card, names in sorted(cards.items(), key=lambda item: sorted(item[1]))]
+
+
+def pricing_signature(entries: Any) -> list:
+    """Comparable view of group price cards, ignoring fields the server adds (ids, empty prices)."""
+    view = []
+    for entry in entries if isinstance(entries, list) else []:
+        entry = entry if isinstance(entry, dict) else {}
+        prices = tuple((name, None if type(entry.get(name)) not in (int, float) else round(entry[name] * 1e6, 9))
+                       for name in sorted(HALL_PRICE_FIELDS))
+        view.append((tuple(sorted(pricing_model_key(str(model)) for model in entry.get("models") or [])),
+                     entry.get("billing_mode") or "token", prices))
+    return sorted(view)
+
+
 def changed_fields(current: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in desired.items() if current.get(key) != value}
+    def same(key: str, value: Any) -> bool:
+        if key == "model_pricing":
+            return pricing_signature(current.get(key)) == pricing_signature(value)
+        return current.get(key) == value
+    return {key: value for key, value in desired.items() if not same(key, value)}
 
 
 class Synchronizer:
@@ -591,6 +657,7 @@ class Synchronizer:
         self.target_id = hashlib.sha256(config.target_api.encode()).hexdigest()[:12]
         self.new_keys = 0
         self.concurrency_fixed = 0
+        self.pricing_updated = 0
         self.key_creation_blocked = False
         self.keys: list[dict[str, Any]] | None = None
 
@@ -602,7 +669,8 @@ class Synchronizer:
         return self.config.prefix + str(group["name"])[:100 - len(self.config.prefix)
                                                       - len(suffix)] + suffix
 
-    def group_payload(self, selected: SelectedGroup) -> dict[str, Any]:
+    def group_payload(self, selected: SelectedGroup, priced: bool = False) -> dict[str, Any]:
+        """Local group fields; `priced` means this tool wrote the group's model prices before."""
         group = selected.source
         description = self.marker(group["id"])
         if group.get("description"):
@@ -627,6 +695,10 @@ class Synchronizer:
         for key in ("image_rate_multiplier", "video_rate_multiplier"):
             if key in group:
                 desired[key] = scaled_rate(group[key], self.config.rate_factor)
+        if group["platform"] in self.config.price_sync_platforms:
+            desired["model_pricing"] = hall_model_pricing(group["platform"], selected.models, selected.prices)
+        elif priced:
+            desired["model_pricing"] = []  # price sync turned off: back to the target's built-in prices
         return desired
 
     def _discover(self, local: list[dict[str, Any]], field_name: str,
@@ -887,8 +959,11 @@ class Synchronizer:
             group_id = selected_group.source["id"]
             group = managed_groups.get(group_id)
             account = managed_accounts.get(group_id)
-            payload = self.group_payload(selected_group)
+            priced = self.state.data["groups"].get(str(group_id), {}).get("model_pricing_synced", False)
+            payload = self.group_payload(selected_group, priced)
             group_patch = changed_fields(group or {}, payload)
+            # Empty and missing prices compare equal, so a new group only counts when it gets price cards.
+            repriced = "model_pricing" in group_patch
             planned_action = "create" if group is None else (
                 "enable" if group.get("status") != "active" else "sync")
             action = {"upstream_id": group_id, "action": planned_action,
@@ -918,6 +993,9 @@ class Synchronizer:
                     if group_patch:
                         self.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
                     action["group_result"] = "updated" if group_patch else "unchanged"
+                if repriced:
+                    self.pricing_updated += 1
+                    action["pricing_result"] = "updated"
                 self._hold_without_account(group, account)
                 if self.config.sync_accounts:
                     account_id, account_result = self._sync_account(
@@ -932,14 +1010,16 @@ class Synchronizer:
                                 "last_rate": selected_group.local_rate,
                                 "name": self.name(selected_group.source),
                                 "platform": selected_group.source["platform"],
-                                "source_rate": selected_group.source_rate})
+                                "source_rate": selected_group.source_rate,
+                                "model_pricing_synced": bool(payload.get("model_pricing"))})
                 sorted_groups[group["id"]] = group
                 self.state.save()
                 group_result = action["group_result"]
                 account_result = action.get("account_result", "disabled")
-                LOG.info("%s：分组%s，账号%s，模型 %d", group_label(group_id, selected_group.source.get("name")),
+                LOG.info("%s：分组%s，账号%s，模型 %d%s", group_label(group_id, selected_group.source.get("name")),
                          GROUP_RESULTS.get(group_result, group_result),
-                         ACCOUNT_RESULTS.get(account_result, account_result), len(selected_group.models))
+                         ACCOUNT_RESULTS.get(account_result, account_result), len(selected_group.models),
+                         "，模型价格已更新" if repriced else "")
             except SyncError as error:
                 try:
                     self._hold_without_account(group, account)
@@ -983,6 +1063,7 @@ class Synchronizer:
                 report["errors"].append({"error": f"同步后的账号检查失败：{error}"})
         report["new_upstream_keys"] = self.new_keys
         report["concurrency_fixed"] = self.concurrency_fixed
+        report["pricing_updated"] = self.pricing_updated
         write_private_json(self.config.report_file, report)
         LOG.info("%s完成；错误=%d 待后续同步=%d；报告：%s",
                  "预览" if self.config.dry_run else "同步", len(report["errors"]),

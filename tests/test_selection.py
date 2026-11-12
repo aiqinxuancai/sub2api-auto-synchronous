@@ -505,6 +505,23 @@ class BestSourceTests(unittest.TestCase):
         self.assertEqual(data["best_source:openai"]["local_group_id"], first["local_group_id"])
         self.assertEqual(len(self.fake.keys), 1)
 
+    def test_preferred_group_prices_follow_the_hall_without_stopping_routing(self):
+        self.config.price_sync_platforms = {"openai"}
+        self.fake.model_prices = {"model-a": {"input_per_million": 1, "output_per_million": 4}}
+        first = self.check()
+        group = next(row for row in self.fake.local_groups if row["id"] == first["local_group_id"])
+        self.assertEqual(group["model_pricing"][0]["input_price"], 1e-6)
+        self.fake.model_prices["model-a"]["input_per_million"] = 2
+        self.fake.requests.clear()
+        again = self.check()
+        self.assertEqual(again["decision"], "retained")
+        self.assertEqual(group["model_pricing"][0]["input_price"], 2e-6)
+        self.assertFalse(any(body.get("status") == "inactive" or body.get("schedulable") is False
+                             for _, _, body in self.fake.mutations()))
+        self.config.price_sync_platforms = set()
+        self.check()
+        self.assertFalse(group["model_pricing"])
+
     def test_disabled_selector_stops_routing(self):
         self.check()
         off = self.check(best_source_enabled=False)

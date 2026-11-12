@@ -21,8 +21,8 @@ from .scoring import score_candidates
 
 LOG = logging.getLogger("sub2api-sync")
 NAME_LIMIT = 100
-# Changing only these never needs the disable-update-enable cycle.
-COSMETIC_FIELDS = {"name", "description", "concurrency"}
+# Changing only these never needs the disable-update-enable cycle (prices only affect billing).
+COSMETIC_FIELDS = {"name", "description", "concurrency", "model_pricing"}
 
 
 def display_name(base, source_name):
@@ -178,7 +178,7 @@ class StableGroupSelector:
         self.mapping.setdefault("keys", {})[str(group_id)] = key["id"]
         self.state.save()
         name = display_name(self.rule["name"], selected.source.get("name"))
-        desired = engine.group_payload(selected)
+        desired = engine.group_payload(selected, self.mapping.get("model_pricing_synced", False))
         desired.update(name=name, description=self.marker + f"\n上游分组 #{group_id} · {selected.source['name']}")
         desired.pop("status")
         credentials = {"base_url": config.upstream_base, "api_key": key["key"],
@@ -204,6 +204,7 @@ class StableGroupSelector:
             self._disable(group, None, "updating")
         elif group_patch:
             engine.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
+        engine.pricing_updated += "model_pricing" in group_patch
         if account is None:
             account = engine.target.request("POST", "/admin/accounts", {
                 **{key: value for key, value in account_desired.items() if key != "status"},
@@ -227,7 +228,7 @@ class StableGroupSelector:
         self.mapping.update(upstream_id=group_id, name=name, source_name=selected.source["name"],
                             source_rate=selected.source_rate, local_rate=selected.local_rate, models=selected.models,
                             key_digest=digest, status="active", reason="healthy_models", provider_rank=selected.provider_rank,
-                            **plan.details.get(group_id, {}))
+                            model_pricing_synced=bool(desired.get("model_pricing")), **plan.details.get(group_id, {}))
         self.state.save()
         LOG.info("%s：%s %s，大厅排名 %d%s，适用倍率 %g，模型 %d", self.label, "保持" if keep else "选用",
                  group_label(group_id, selected.source.get("name")), selected.provider_rank,

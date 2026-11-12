@@ -215,6 +215,13 @@
               </div>
 
               <div class="sub-section">
+                <h3>模型价格</h3>
+                <p class="field-help">勾选的平台在同步分组时，把上游大厅里每个模型的价格写入本地分组的「模型价格」，本站按与上游相同的单价计费，倍率照常生效。</p>
+                <div class="provider-choices" id="price-platforms"></div>
+                <p class="hint"><svg class="icon"><use href="#i-info"/></svg>AIHub 的 DeepSeek、智谱、Kimi 按官方人民币价的数字计价，比本站内置的官方美元价高约 5–13 倍，建议勾选；GPT 等与官方美元价一致，无需勾选。优选分组同样适用。取消勾选后，工具写入的价格会在下次同步时清除，恢复本站内置价格。</p>
+              </div>
+
+              <div class="sub-section">
                 <h3>自动化行为</h3>
                 <div class="rule-toggles">
                   <label><input name="disable_unavailable" type="checkbox"><span><strong>自动停用与恢复</strong><small>不可用时停用，恢复后启用同一分组</small></span></label>

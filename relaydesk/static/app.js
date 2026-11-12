@@ -449,7 +449,7 @@ function renderSettings() {
   const form = $('#settings-form'), config = state.overview.config;
   // A page newer than the running backend shows blank fields; say so instead of letting a save fail later.
   const missing = $$('[name]', form).filter(control => control.type !== 'password' && config[control.name] === undefined);
-  $('#settings-version-notice').hidden = !missing.length && config.stable_groups !== undefined && config.sync_platform_limits !== undefined;
+  $('#settings-version-notice').hidden = !missing.length && ['stable_groups', 'sync_platform_limits', 'price_sync_platforms'].every(key => config[key] !== undefined);
   for (const control of $$('[name]', form)) {
     if (control.type === 'checkbox') control.checked = config[control.name];
     else if (control.type === 'password') {
@@ -457,6 +457,7 @@ function renderSettings() {
     } else control.value = Array.isArray(config[control.name]) ? config[control.name].join(', ') : config[control.name] ?? '';
   }
   renderPlatformLimits(config.sync_platform_limits || {});
+  renderPricePlatforms(config.price_sync_platforms || []);
   $('#stable-rules').replaceChildren(...(config.stable_groups || []).map(rule => ruleCard(rule)));
   setSettingsDirty(false); renderAuthModes(); renderRuleState();
   for (const side of ['upstream', 'target']) {
@@ -476,6 +477,13 @@ function renderPlatformLimits(limits) {
     count.append(el('span', 'unit-prefix', '前'), input, el('span', '', '个'));
     row.append(choice, count); root.append(row);
   }
+}
+function renderPricePlatforms(selected) {
+  $('#price-platforms').replaceChildren(...Object.entries(platformNames).map(([platform, label]) => {
+    const choice = el('label', 'provider-choice'), check = el('input');
+    check.type = 'checkbox'; check.dataset.pricePlatform = platform; check.checked = selected.includes(platform);
+    choice.append(check, el('span', '', label)); return choice;
+  }));
 }
 function platformLimitsDraft() {
   return Object.fromEntries($$('[data-platform]', $('#platform-limits')).filter(check => check.checked)
@@ -652,7 +660,10 @@ function settingsDraft(side) {
       if (result.group_ids.some(id => !Number.isInteger(id) || id <= 0)) throw new Error('分组 ID 请填写正整数，以逗号分隔。');
     } else result[control.name] = control.value;
   }
-  if (!side) { result.sync_platform_limits = platformLimitsDraft(); result.stable_groups = rulesDraft(); }
+  if (!side) {
+    result.sync_platform_limits = platformLimitsDraft(); result.stable_groups = rulesDraft();
+    result.price_sync_platforms = $$('[data-price-platform]').filter(check => check.checked).map(check => check.dataset.pricePlatform);
+  }
   return result;
 }
 function setSettingsDirty(dirty) {
@@ -879,7 +890,7 @@ function summary(job) {
   if (job.kind === 'connect') return result.message;
   if (job.kind === 'best_source') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · 默认排序 #${result.provider_rank} · ${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
   if (job.kind === 'low_cost') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · ${result.score != null ? `${number(result.score, 1)} 分 · ` : ''}${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : result.switch_reason === 'rank_dropped' ? '评分排名下降，已更换渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
-  if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}${result.concurrency_fixed ? ` · 修正 ${result.concurrency_fixed} 个账号并发` : ''}`;
+  if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}${result.concurrency_fixed ? ` · 修正 ${result.concurrency_fixed} 个账号并发` : ''}${result.pricing_updated ? ` · 更新 ${result.pricing_updated} 个分组价格` : ''}`;
   if (job.kind === 'refresh_users') return `已读取 ${result.count} 位成员`;
   if (job.kind === 'batch_users') return `创建 ${result.created.length} 位 · 跳过 ${result.skipped.length} 位${result.failed ? ` · 失败 ${result.failed} 位` : ''}`;
   if (job.kind === 'quota_reset') return `已重置 ${result.succeeded.length} 位 · $${number(result.amount)}${result.failed ? ` · ${result.failed} 位待处理` : ''}`;

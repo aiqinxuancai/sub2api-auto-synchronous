@@ -12,7 +12,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
-from sync_sub2api import APIError, Client, Config, State, SyncError, Synchronizer, select_usable
+from sync_sub2api import (APIError, Client, Config, State, SyncError, Synchronizer, changed_fields,
+                          hall_model_pricing, select_usable)
 
 
 def iso_after(seconds=300):
@@ -52,6 +53,7 @@ class FakeSites:
         self.logins = 0
         self.refreshes = 0
         self.provider_overrides = {}
+        self.model_prices = {}  # model -> hall price (USD per 1M tokens)
 
     def providers(self):
         items = []
@@ -66,7 +68,9 @@ class FakeSites:
                           "rate_multiplier": group["rate_multiplier"],
                           "available": group["id"] == 7, "probe_state": "enabled",
                           "detections_enabled": True, "probe_expires_at": iso_after(),
-                          "group_models": [{"model": model} for model in self.model_health],
+                          "group_models": [{"model": model, **({"price": self.model_prices[model]}
+                                                                if model in self.model_prices else {})}
+                                           for model in self.model_health],
                           "model_cards": cards, "model_detection": {"applicable": True, "status": "passed",
                               "stage_enabled": {"detection": True, "text": False},
                               "stages": {"detection": {"state": "completed"}}},
@@ -134,6 +138,8 @@ class FakeSites:
                 if path.endswith("accounts") and self.deny_accounts:
                     return 400, {"message": "account rejected"}
                 created = copy.deepcopy(body)
+                if path.endswith("groups"):
+                    self.store_pricing(created, created)
                 created["id"] = max([item["id"] for item in rows] + [10]) + 1
                 created["status"] = "active"
                 if path.endswith("keys"):
@@ -152,10 +158,21 @@ class FakeSites:
                     return 404, None
                 if method == "PUT":
                     body.pop("schedulable", None)  # Real API requires the separate POST route.
-                    row.update(copy.deepcopy(body))
+                    body = copy.deepcopy(body)
+                    if root.endswith("groups"):
+                        self.store_pricing(body, row)
+                    row.update(body)
                     return 200, copy.deepcopy(row)
                 return 200, copy.deepcopy(row)
         return 404, None
+
+    @staticmethod
+    def store_pricing(body, group):
+        """Like Sub2API: price cards gain ids, the group platform and empty optional prices; [] reads back null."""
+        if "model_pricing" in body:
+            body["model_pricing"] = [{"id": index, "intervals": None, "cache_write_1h_price": None, "fast_multiplier": None,
+                                      **entry, "platform": entry.get("platform") or group.get("platform")}
+                                     for index, entry in enumerate(body["model_pricing"], 1)] or None
 
     def mutations(self):
         return [(method, path, body) for method, path, body in self.requests
@@ -419,6 +436,69 @@ class SyncIntegrationTests(unittest.TestCase):
             self.cycle()
         self.assertIn("「Alpha」#7：分组已启用，账号已新建，模型 1", "\n".join(logs.output))
         self.assertNotIn("group=", "\n".join(logs.output))
+
+    def synced_group(self, upstream_id=7):
+        local_id = State(self.config).data["groups"][str(upstream_id)]["local_group_id"]
+        return next(row for row in self.fake.local_groups if row["id"] == local_id)
+
+    def test_hall_model_prices_become_group_price_cards(self):
+        self.fake.model_prices = {"model-a": {"input_per_million": 1, "output_per_million": 4,
+                                              "cache_input_per_million": 0.02, "cache_write_per_million": 0}}
+        self.assertEqual(self.config.price_sync_platforms, {"deepseek", "zhipu", "kimi"})
+        self.cycle()
+        group = self.synced_group()
+        self.assertNotIn("model_pricing", group)  # openai is not priced by default
+        self.config.price_sync_platforms = {"openai"}
+        with self.assertLogs("sub2api-sync", "INFO") as logs:
+            report = self.cycle()
+        self.assertEqual(report["pricing_updated"], 1)
+        self.assertIn("模型价格已更新", "\n".join(logs.output))
+        card, = group["model_pricing"]
+        self.assertEqual((card["models"], card["platform"], card["billing_mode"]), (["model-a"], "openai", "token"))
+        self.assertEqual((card["input_price"], card["output_price"], card["cache_read_price"], card["cache_write_price"]),
+                         (1e-6, 4e-6, 2e-8, 0.0))
+        self.fake.requests.clear()
+        self.assertEqual(self.cycle()["pricing_updated"], 0)
+        self.assertEqual(self.fake.mutations(), [])  # server-added fields do not cause rewrites
+        self.fake.model_prices["model-a"]["input_per_million"] = 1.5
+        self.fake.requests.clear()
+        self.cycle()
+        writes = [body for method, path, body in self.fake.mutations() if path.endswith(f"/admin/groups/{group['id']}")]
+        self.assertEqual([sorted(body) for body in writes], [["model_pricing"]])
+        self.assertEqual(group["model_pricing"][0]["input_price"], 1.5e-6)
+        # Turning the platform off clears the prices this tool wrote, once.
+        self.config.price_sync_platforms = set()
+        self.cycle()
+        self.assertFalse(group["model_pricing"])
+        self.fake.requests.clear()
+        self.cycle()
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_manual_group_prices_stay_when_price_sync_is_off(self):
+        self.cycle()
+        group = self.synced_group()
+        group["model_pricing"] = [{"models": ["model-a"], "billing_mode": "token", "input_price": 9e-6, "output_price": 9e-6}]
+        self.fake.requests.clear()
+        self.cycle()
+        self.assertEqual(group["model_pricing"][0]["input_price"], 9e-6)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_price_cards_share_identical_prices_and_skip_incomplete_ones(self):
+        flash = {"input_per_million": 1, "output_per_million": 4, "cache_input_per_million": 0.02, "cache_write_per_million": 0}
+        prices = {"deepSeek-v4.1-flash-1017": flash, "deepseek-v4.1-flash-1017": {**flash, "input_per_million": 9},
+                  "deepseek-flash": flash, "deepseek-v4-pro": {"input_per_million": 4.5, "output_per_million": 13.5},
+                  "kimi-k3.1-pro": {"input_per_million": None, "output_per_million": None},
+                  "broken": {"input_per_million": -1, "output_per_million": 2}, "unpriced": None}
+        models = ["deepSeek-v4.1-flash-1017", "deepseek-v4.1-flash-1017", "deepseek-flash", "deepseek-v4-pro",
+                  "kimi-k3.1-pro", "broken", "unpriced", "absent"]
+        cards = hall_model_pricing("deepseek", models, prices)
+        self.assertEqual([card["models"] for card in cards], [["deepSeek-v4.1-flash-1017", "deepseek-flash"], ["deepseek-v4-pro"]])
+        self.assertEqual(cards[1], {"platform": "deepseek", "models": ["deepseek-v4-pro"], "billing_mode": "token",
+                                    "input_price": 4.5e-6, "output_price": 1.35e-5})
+        stored = {"model_pricing": copy.deepcopy(cards)}
+        FakeSites.store_pricing(stored, {"platform": "deepseek"})
+        self.assertEqual(changed_fields(stored, {"model_pricing": cards}), {})
+        self.assertEqual(changed_fields({"model_pricing": None}, {"model_pricing": []}), {})
 
     def test_every_sync_fixes_concurrency_of_disabled_accounts_but_not_unrelated_ones(self):
         self.cycle()
