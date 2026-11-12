@@ -238,16 +238,12 @@
 
           <div class="panel automation-panel" id="settings-stable">
             <div class="panel-heading">
-              <div><h2>优选分组</h2><p>为任意平台添加固定 ID 的本地分组，自动指向最低价或最优的上游渠道；切换渠道时员工无需重新绑定 Key。</p></div>
+              <div><h2>优选分组 <span id="stable-count" class="count-badge">0</span></h2><p>为任意平台添加固定 ID 的本地分组，自动指向最低价或最优的上游渠道；切换渠道时员工无需重新绑定 Key。</p></div>
+              <button class="button" type="button" id="stable-add"><svg class="icon"><use href="#i-plus"/></svg>添加优选分组</button>
             </div>
             <div class="panel-body">
-              <div class="stable-add">
-                <label class="field">平台<select id="stable-add-platform"></select></label>
-                <label class="field">策略<select id="stable-add-strategy"><option value="low_cost">最低价 · 综合评分择优</option><option value="best_source">最优源站 · 跟随默认排序</option></select></label>
-                <button class="button" type="button" id="stable-add"><svg class="icon"><use href="#i-plus"/></svg>添加优选分组</button>
-              </div>
               <div id="stable-rules" class="stable-rules"></div>
-              <p class="hint"><svg class="icon"><use href="#i-info"/></svg>每个平台的同一策略只能添加一次，需同时开启「同步转发账号」。删除后，对应本地分组会在下次检测时停用，上游 Key 继续保留，重新添加时复用原分组与 Key。</p>
+              <p class="hint"><svg class="icon"><use href="#i-info"/></svg>点击分组展开参数。需同时开启「同步转发账号」。删除后，对应本地分组会在下次检测时停用，上游 Key 继续保留，重新添加时复用原分组与 Key。</p>
             </div>
           </div>
 
@@ -382,6 +378,20 @@
   <div class="modal-heading"><div><span class="eyebrow">余额重置</span><h2>确认本次余额重置</h2></div><button class="icon-button" data-close aria-label="关闭" type="button"><svg class="icon"><use href="#i-close"/></svg></button></div>
   <div id="reset-review"></div>
   <div class="modal-actions end"><button class="button ghost" data-close type="button">取消</button><button class="button danger" id="confirm-reset" type="button">确认重置余额</button></div>
+</dialog>
+<dialog id="stable-dialog" class="modal">
+  <div class="modal-heading"><div><span class="eyebrow">优选分组</span><h2>添加优选分组</h2><p class="muted">固定 ID 的本地分组，自动指向所选平台中最合适的上游渠道。</p></div><button class="icon-button" data-close aria-label="关闭" type="button"><svg class="icon"><use href="#i-close"/></svg></button></div>
+  <form id="stable-form">
+    <span class="small-label">选择策略</span>
+    <div class="strategy-choices">
+      <label class="strategy-choice"><input type="radio" name="stable-strategy" value="low_cost" checked><span><svg class="icon"><use href="#i-tag"/></svg><strong>最低价</strong><small>对默认排序前 N 名综合评分（价格为主），选用得分最高的渠道</small></span></label>
+      <label class="strategy-choice"><input type="radio" name="stable-strategy" value="best_source"><span><svg class="icon"><use href="#i-shield"/></svg><strong>最优源站</strong><small>跟随默认排序第 1 名，不跌出前 N 名就保持不换</small></span></label>
+    </div>
+    <span class="small-label">选择平台</span>
+    <div class="provider-choices" id="stable-platforms"></div>
+    <label class="field">本地分组名称<input id="stable-name" maxlength="100" required><small>实际名称会自动追加当前上游，如「名称（A031-Pro）」</small></label>
+    <div class="modal-actions"><p class="field-help" id="stable-dialog-hint">添加后可展开调整参数，保存配置后生效。</p><div class="modal-buttons"><button class="button ghost" data-close type="button">取消</button><button class="button primary" type="submit" id="stable-confirm"><svg class="icon"><use href="#i-check"/></svg>确认添加</button></div></div>
+  </form>
 </dialog>
 <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
 </body>
