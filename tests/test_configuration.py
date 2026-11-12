@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from relaydesk.rules import new_rule
 from relaydesk.service import Service, default_settings
 from relaydesk.storage import Store
 from sync_sub2api import Config, SyncError
@@ -42,8 +43,8 @@ class ConfigurationTests(unittest.TestCase):
     def test_saved_file_encrypts_credentials_and_survives_restart(self):
         service = Service(self.root, start_scheduler=False)
         service.save_config({"upstream_password": "private-password", "target_admin_api_key": "adm_sc_private_key",
-                             "prefix": "saved-", "low_cost_score_minutes": 20, "low_cost_health_minutes": 9,
-                             "low_cost_retry_minutes": 3})
+                             "prefix": "saved-", "sync_platform_limits": {"openai": 0, "kimi": 4},
+                             "stable_groups": [new_rule("low_cost", "kimi", score_minutes=20, retry_minutes=3)]})
         raw = (self.root / "config.json").read_text(encoding="utf-8")
         self.assertNotIn("private-password", raw)
         self.assertNotIn("adm_sc_private_key", raw)
@@ -53,8 +54,9 @@ class ConfigurationTests(unittest.TestCase):
         restarted = Service(self.root, start_scheduler=False)
         try:
             self.assertEqual(restarted.store.get("config")["upstream_password"], "private-password")
-            self.assertEqual(restarted.public_config()["low_cost_retry_minutes"], 3)
-            self.assertEqual(restarted.public_config()["low_cost_score_minutes"], 20)
+            self.assertEqual(restarted.public_config()["sync_platform_limits"], {"openai": 0, "kimi": 4})
+            self.assertEqual(restarted.public_config()["stable_groups"],
+                             [new_rule("low_cost", "kimi", score_minutes=20, retry_minutes=3)])
             with restarted.store.connect() as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM settings WHERE key IN ('config','quota_rule')").fetchone()[0], 0)
             if os.name != "nt":

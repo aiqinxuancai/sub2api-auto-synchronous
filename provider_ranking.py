@@ -10,6 +10,8 @@ import math
 from datetime import datetime, timezone
 
 PLATFORMS = ("openai", "deepseek", "zhipu", "kimi", "anthropic", "grok", "gemini")
+PLATFORM_LABELS = {"openai": "OpenAI", "deepseek": "DeepSeek", "zhipu": "智谱", "kimi": "Kimi",
+                   "anthropic": "Anthropic", "grok": "Grok", "gemini": "Gemini"}
 DEFAULT_WEIGHTS = dict(multiplier=0, effective_price=40, user_speed=20,
                        cache_hit_rate=20, success_rate=40, tps=20)
 

@@ -16,44 +16,29 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, APIError, Client, Config, State, SyncError, Synchronizer,
-                          account_concurrency, state_lock)
+                          account_concurrency, platform_limits, state_lock)
 from provider_ranking import PLATFORMS
 
 from .storage import Store
 from .configuration import SECRET_FIELDS
 from .low_cost import BestSourceSelector, LowCostSelector
-from .scoring import DEFAULT_WEIGHTS, WEIGHT_SETTINGS
+from .rules import (CADENCE, DEFAULTS, LEGACY_SETTINGS, new_rule, normalize_rules, rule_key, rule_label,
+                    stable_rules, without_live_fields)
+from .scoring import DEFAULT_WEIGHTS
 
 SECRETS = SECRET_FIELDS
-SELECTION_DEFAULTS = {"sync_platforms": ["openai"], "sync_top_n": 0, "sync_top_scope": "per_platform",
-                      "low_cost_enabled": False, "low_cost_name": "最低价 OpenAI",
-                      "low_cost_score_minutes": 10, "low_cost_health_minutes": 5,
-                      "low_cost_require_detection": True, "low_cost_retry_minutes": 1,
-                      "low_cost_exclude_keywords": [], "low_cost_top_n": 10, "low_cost_rank_tolerance": 2,
-                      **{key: DEFAULT_WEIGHTS[metric] for metric, key in WEIGHT_SETTINGS.items()},
-                      "best_source_enabled": False, "best_source_name": "最优源站 OpenAI",
-                      "best_source_check_minutes": 10, "best_source_keep_top": 10, "best_source_retry_minutes": 1}
-# Stable local groups: selector, switch setting, retry setting and (mode, schedule key, interval setting) cadence.
-# A "ranking" check also covers every other check, so it refreshes all schedule entries.
-STABLE_GROUPS = {
-    "low_cost": {"selector": LowCostSelector, "enabled": "low_cost_enabled", "retry": "low_cost_retry_minutes",
-                 "label": "最低价 OpenAI", "cadence": (("ranking", "next_rank", "low_cost_score_minutes"),
-                                                      ("health", "next_health", "low_cost_health_minutes"))},
-    "best_source": {"selector": BestSourceSelector, "enabled": "best_source_enabled", "retry": "best_source_retry_minutes",
-                    "label": "最优源站 OpenAI", "cadence": (("ranking", "next_rank", "best_source_check_minutes"),)},
-}
-# Settings replaced by the composite score, or renamed (`concurrency` → `account_concurrency`);
-# removed from config.json on startup.
+# Platform -> top N to sync (0 = no limit), and the user's preferred-group rules.
+SELECTION_DEFAULTS = {"sync_platform_limits": {"openai": 0}, "stable_groups": []}
+SELECTORS = {"low_cost": LowCostSelector, "best_source": BestSourceSelector}
+# Settings replaced by the composite score, renamed (`concurrency` → `account_concurrency`), or folded into
+# `sync_platform_limits` and `stable_groups`; removed from config.json on startup.
 OBSOLETE_SETTINGS = {"low_cost_rank_hours", "low_cost_rate_check_enabled", "low_cost_rate_check_minutes",
-                     "low_cost_rate_rise_percent", "concurrency"}
-MAX_EXCLUDE_KEYWORDS = 50
-MAX_KEYWORD_LENGTH = 50
-LOW_COST_MODES = {"ranking", "health"}
+                     "low_cost_rate_rise_percent", "concurrency", "sync_platforms", "sync_top_n", "sync_top_scope",
+                     *LEGACY_SETTINGS}
 # selected：左侧勾选的成员（勾选了管理员也会包含）；all_members：所有成员含以后新增；
 # all_employees：所有成员含以后新增，但不包括管理员。
 QUOTA_SCOPES = {"selected", "all_members", "all_employees"}
-LIVE_SETTINGS = {"sync_enabled", "interval_minutes", "low_cost_score_minutes", "low_cost_health_minutes", "low_cost_retry_minutes",
-                 "best_source_check_minutes", "best_source_retry_minutes"}
+LIVE_SETTINGS = {"sync_enabled", "interval_minutes"}
 
 
 def default_settings():
@@ -158,10 +143,20 @@ class Service:
             self._initialize_config()
         values = self.store.get("config")
         migrated = {key: value for key, value in {**copy.deepcopy(SELECTION_DEFAULTS), **values,
-                                                   "account_concurrency": account_concurrency(values)}.items()
+                                                   "account_concurrency": account_concurrency(values),
+                                                   "sync_platform_limits": platform_limits(values),
+                                                   "stable_groups": stable_rules(values)}.items()
                     if key not in OBSOLETE_SETTINGS}
         if migrated != values:
             self.store.put("config", migrated)
+        for strategy in DEFAULTS:
+            # Status and schedule of the fixed OpenAI groups move under their rule key.
+            for suffix in ("", "_schedule"):
+                legacy, key = strategy + suffix, rule_key({"strategy": strategy, "platform": "openai"}) + suffix
+                if self.store.get(legacy) is not None:
+                    if self.store.get(key) is None:
+                        self.store.put(key, self.store.get(legacy))
+                    self.store.put(legacy, None)
         if self.store.get("quota_rule") is None:
             self.store.put("quota_rule", {"enabled": False, "timezone": "Asia/Shanghai",
                                           "amount": 100, "scope": "selected", "user_ids": [],
@@ -208,10 +203,7 @@ class Service:
             if key in SECRETS and value == "":
                 continue
             values[key] = value
-        for key in ("interval_minutes", "account_concurrency", "timeout", "max_new_keys", "priority",
-                    "sync_top_n", "low_cost_score_minutes", "low_cost_health_minutes", "low_cost_retry_minutes",
-                    "low_cost_top_n", "low_cost_rank_tolerance", *WEIGHT_SETTINGS.values(),
-                    "best_source_check_minutes", "best_source_keep_top", "best_source_retry_minutes"):
+        for key in ("interval_minutes", "account_concurrency", "timeout", "max_new_keys", "priority"):
             if isinstance(values[key], bool) or not isinstance(values[key], int):
                 raise SyncError("周期、并发和数量必须为整数")
         if not 1 <= values["interval_minutes"] <= 1440:
@@ -222,53 +214,17 @@ class Service:
             raise SyncError("请求超时应在 1–120 秒之间")
         if not 0 <= values["max_new_keys"] <= 1000 or not 0 <= values["priority"] <= 10000:
             raise SyncError("新增 Key 数量或优先级超出范围")
-        if not 0 <= values["sync_top_n"] <= 10000:
-            raise SyncError("同步前 N 个应在 0–10000 之间，0 表示不限制")
-        if values["sync_top_scope"] not in ("per_platform", "global"):
-            raise SyncError("同步数量范围无效")
-        if not isinstance(values["sync_platforms"], list) or any(
-                not isinstance(item, str) or item not in PLATFORMS for item in values["sync_platforms"]):
+        limits = values["sync_platform_limits"]
+        if not isinstance(limits, dict) or any(platform not in PLATFORMS for platform in limits):
             raise SyncError("请选择有效的平台")
-        values["sync_platforms"] = list(dict.fromkeys(values["sync_platforms"]))
-        if not 1 <= values["low_cost_score_minutes"] <= 1440 or not 1 <= values["low_cost_health_minutes"] <= 1440:
-            raise SyncError("评分检测与可用性检测间隔应为 1–1440 分钟")
-        if not 1 <= values["low_cost_retry_minutes"] <= 1440:
-            raise SyncError("失败重试间隔应为 1–1440 分钟")
-        if not 1 <= values["low_cost_top_n"] <= 100:
-            raise SyncError("最低价候选范围应为前 1–100 名")
-        if not 0 <= values["low_cost_rank_tolerance"] <= 50:
-            raise SyncError("允许的排名下降应为 0–50 名")
-        weights = [values[key] for key in WEIGHT_SETTINGS.values()]
-        if any(not 0 <= weight <= 100 for weight in weights) or not sum(weights):
-            raise SyncError("评分权重应为 0–100，且至少有一项大于 0")
-        if not isinstance(values["low_cost_name"], str) or not 1 <= len(values["low_cost_name"].strip()) <= 100:
-            raise SyncError("最低价分组名称需要 1–100 个字符")
-        values["low_cost_name"] = values["low_cost_name"].strip()
-        if not 1 <= values["best_source_check_minutes"] <= 1440 or not 1 <= values["best_source_retry_minutes"] <= 1440:
-            raise SyncError("最优源站检测与重试间隔应为 1–1440 分钟")
-        if not 1 <= values["best_source_keep_top"] <= 100:
-            raise SyncError("最优源站的保持范围应为前 1–100 名")
-        if not isinstance(values["best_source_name"], str) or not 1 <= len(values["best_source_name"].strip()) <= 100:
-            raise SyncError("最优源站分组名称需要 1–100 个字符")
-        values["best_source_name"] = values["best_source_name"].strip()
-        if values["best_source_name"] == values["low_cost_name"]:
-            raise SyncError("最优源站与最低价分组需要使用不同的本地分组名称")
-        keywords = values["low_cost_exclude_keywords"]
-        if not isinstance(keywords, list) or any(not isinstance(item, str) for item in keywords):
-            raise SyncError("排除关键字必须为文本列表")
-        unique = {}
-        for item in keywords:
-            item = item.strip()
-            if item and item.casefold() not in unique:
-                unique[item.casefold()] = item
-        if len(unique) > MAX_EXCLUDE_KEYWORDS or any(len(item) > MAX_KEYWORD_LENGTH for item in unique.values()):
-            raise SyncError(f"排除关键字最多 {MAX_EXCLUDE_KEYWORDS} 个，每个不超过 {MAX_KEYWORD_LENGTH} 个字符")
-        values["low_cost_exclude_keywords"] = list(unique.values())
+        if any(type(limit) is not int or not 0 <= limit <= 10000 for limit in limits.values()):
+            raise SyncError("每个平台的同步前 N 个应在 0–10000 之间，0 表示不限制")
+        values["sync_platform_limits"] = {platform: limits[platform] for platform in PLATFORMS if platform in limits}
+        values["stable_groups"] = normalize_rules(values["stable_groups"])
         if not isinstance(values["group_ids"], list) or any(
                 type(item) is not int or item <= 0 for item in values["group_ids"]):
             raise SyncError("分组 ID 必须为正整数列表")
-        for key in ("sync_enabled", "sync_accounts", "auto_create_keys", "disable_unavailable",
-                    "low_cost_enabled", "low_cost_require_detection", "best_source_enabled"):
+        for key in ("sync_enabled", "sync_accounts", "auto_create_keys", "disable_unavailable"):
             if type(values[key]) is not bool:
                 raise SyncError(f"{key} 必须为开关值")
         for key in SECRETS | {"upstream_base", "target_base", "upstream_email", "target_email",
@@ -292,18 +248,25 @@ class Service:
             previous = self.store.get("config")
             values = self.merge_config(patch)
             with self.pending_lock:
-                if self.busy and any(values[key] != previous[key] for key in values if key not in LIVE_SETTINGS):
+                if self.busy and any(self._busy_view(values, key) != self._busy_view(previous, key)
+                                     for key in values if key not in LIVE_SETTINGS):
                     raise SyncError("任务执行中，请在完成后修改连接与同步参数")
             self.store.put("config", values)
+            old_rules, new_rules = self._rules(previous), self._rules(values)
+            retired = [key for key in self.store.get("stable_retired", []) if key not in new_rules]
+            # A removed rule keeps its local group until a check has stopped it.
+            retired += [key for key in old_rules if key not in new_rules and key not in retired]
             if any(previous.get(key) != values[key] for key in ("upstream_base", "upstream_email", "target_base")):
                 self.store.put("report", {})
                 self.store.put("groups", [])
                 self.store.put("users", [])
                 self.store.put("connection_upstream", None)
                 self.store.put("connection_target", None)
-                for kind in STABLE_GROUPS:
-                    self.store.put(kind, {})
-                    self.store.put(kind + "_schedule", {})
+                for key in {*old_rules, *new_rules, *retired}:
+                    self.store.put(key, {})
+                    self.store.put(key + "_schedule", {})
+                retired = []
+            self.store.put("stable_retired", retired)
             if previous["target_base"] != values["target_base"]:
                 rule = self.store.get("quota_rule")
                 rule.update(enabled=False, user_ids=[], next_run_at=None)
@@ -315,13 +278,30 @@ class Service:
             if previous["interval_minutes"] != values["interval_minutes"] or (
                     not previous["sync_enabled"] and values["sync_enabled"]):
                 self.store.put("sync_schedule", {"next_run": time.time() + values["interval_minutes"] * 60})
-            for kind, spec in STABLE_GROUPS.items():
-                # Re-check immediately when the group's own policy or its prerequisites change.
-                relevant = [key for key in SELECTION_DEFAULTS if key.startswith(kind + "_")] + ["sync_platforms", "sync_accounts"]
-                if any(previous.get(key) != values[key] for key in relevant):
-                    self.store.put(kind + "_schedule", {entry: time.time() for _, entry, _ in spec["cadence"]})
+            # Re-check immediately when a group's own policy or its prerequisites change, or it was removed.
+            prerequisites = previous.get("sync_accounts") != values["sync_accounts"]
+            for key, rule in {**old_rules, **new_rules}.items():
+                if prerequisites or old_rules.get(key) != new_rules.get(key):
+                    self.store.put(key + "_schedule", {entry: time.time() for _, entry, _ in CADENCE[rule["strategy"]]})
             self.log("INFO", "连接与同步设置已保存")
         return self.public_config()
+
+    @staticmethod
+    def _busy_view(values, key):
+        """Setting value compared while work runs; rule intervals may change at any time."""
+        return without_live_fields(values[key]) if key == "stable_groups" else values.get(key)
+
+    def _rules(self, values=None):
+        values = values or getattr(self.context, "settings", None) or self.store.get("config")
+        return {rule_key(rule): rule for rule in stable_rules(values)}
+
+    def _stable_entries(self, values=None):
+        """Configured rules plus removed ones whose local group may still need stopping (as disabled rules)."""
+        entries = self._rules(values)
+        for key in self.store.get("stable_retired", []):
+            strategy, platform = key.split(":", 1)
+            entries.setdefault(key, new_rule(strategy, platform))
+        return entries
 
     def redact(self, message):
         values = self.store.get("config", {})
@@ -337,22 +317,28 @@ class Service:
         self.store.log(level, self.redact(message), job_id or getattr(self.context, "job_id", None))
 
     def submit(self, kind, payload=None, request_key=None):
-        if kind not in {"sync", "preview", "connect", "refresh_users", "batch_users", "quota_reset", *STABLE_GROUPS}:
+        if kind not in {"sync", "preview", "connect", "refresh_users", "batch_users", "quota_reset", *SELECTORS}:
             raise SyncError("未知任务类型")
         payload = copy.deepcopy(payload or {})
         with self.settings_lock, self.pending_lock:
             payload["_settings"] = self.store.get("config")
-            singleton = kind in {"sync", "preview", "refresh_users", "quota_reset", *STABLE_GROUPS}
-            if singleton and kind in self.pending_kinds:
+            singleton = kind in {"sync", "preview", "refresh_users", "quota_reset", *SELECTORS}
+            slot = self._slot(kind, payload)
+            if singleton and slot in self.pending_kinds:
                 raise SyncError("同类任务正在执行，请等待完成")
             job_id, created = self.store.create_job(kind, payload, request_key)
             if not created:
                 return job_id
             if singleton:
-                self.pending_kinds.add(kind)
+                self.pending_kinds.add(slot)
             self.busy.add(job_id)
             self.pool.submit(self._run_job, job_id, kind, payload)
         return job_id
+
+    @staticmethod
+    def _slot(kind, payload):
+        """One queued check per preferred group; jobs queued before rules existed checked the OpenAI groups."""
+        return f"{kind}:{payload.get('platform', 'openai')}" if kind in SELECTORS else kind
 
     def _run_job(self, job_id, kind, payload):
         self.context.job_id = job_id
@@ -360,18 +346,19 @@ class Service:
         self.context.secrets = [row.get("password") for row in payload.get("users", [])]
         self.context.secrets += [value for key, value in payload.get("settings", {}).items() if key in SECRETS]
         self.store.set_job(job_id, "running")
-        self.log("INFO", {"sync": "开始同步可用分组", "preview": "开始同步预览", "connect": "开始连接测试",
-                          "refresh_users": "正在读取成员列表", "batch_users": "开始批量创建成员",
-                          "low_cost": "开始检测最低价 OpenAI 分组", "best_source": "开始检测最优源站 OpenAI 分组",
-                          "quota_reset": "开始重置成员余额"}[kind])
+        self.log("INFO", f"开始检测{rule_label({'strategy': kind, 'platform': payload.get('platform', 'openai')})} 分组"
+                 if kind in SELECTORS else
+                 {"sync": "开始同步可用分组", "preview": "开始同步预览", "connect": "开始连接测试",
+                  "refresh_users": "正在读取成员列表", "batch_users": "开始批量创建成员",
+                  "quota_reset": "开始重置成员余额"}[kind])
         status, result, job_error = "failed", None, None
         try:
             if kind == "connect":
                 result = self._test_connection(payload)
             elif kind in {"sync", "preview"}:
                 result = self._sync(kind == "preview")
-            elif kind in STABLE_GROUPS:
-                result = self._check_stable(kind, payload.get("mode", "ranking"))
+            elif kind in SELECTORS:
+                result = self._check_stable(f"{kind}:{payload.get('platform', 'openai')}", payload.get("mode", "ranking"))
             elif kind == "refresh_users":
                 result = self._refresh_users()
             elif kind == "batch_users":
@@ -397,7 +384,7 @@ class Service:
             logging.getLogger("flow").error("Job %s failed: %s", job_id, type(error).__name__)
         finally:
             with self.pending_lock:
-                self.pending_kinds.discard(kind)
+                self.pending_kinds.discard(self._slot(kind, payload))
                 self.busy.discard(job_id)
                 self.store.set_job(job_id, status, result=result, error=job_error)
             self.context.job_id = None
@@ -444,11 +431,12 @@ class Service:
             state = State(config)
             engine = Synchronizer(config, state)
             snapshot = engine.load_snapshot()
-            stable = {kind: None for kind in STABLE_GROUPS}
-            for kind, spec in STABLE_GROUPS.items():
-                if not preview and (values[spec["enabled"]] or state.data.get(kind)):
-                    fallback = spec["cadence"][-1][0]  # the lightest check when nothing is due
-                    stable[kind] = self._reconcile_stable(kind, engine, values, snapshot, self._due_stable_mode(kind) or fallback)
+            stable = {}
+            for key, rule in self._stable_entries(values).items():
+                created = state.data.get(key) or (rule["platform"] == "openai" and state.data.get(rule["strategy"]))
+                if not preview and (rule["enabled"] or created):
+                    fallback = CADENCE[rule["strategy"]][-1][0]  # the lightest check when nothing is due
+                    stable[key] = self._reconcile_stable(key, engine, values, snapshot, self._due_stable_mode(key) or fallback)
             report = engine.cycle(snapshot=snapshot)
         if not preview:
             self.store.put("report", report)
@@ -458,50 +446,58 @@ class Service:
             self.store.put("preview", report)
         return {"usable_groups": report["usable_groups"], "usable_models": report["usable_models"],
                 "pending": report["pending"], "errors": report["errors"],
-                "warnings": report.get("warnings", []), "preview": preview,
-                **stable,
+                "warnings": report.get("warnings", []), "preview": preview, "stable": stable,
                 "new_keys": report.get("new_upstream_keys", 0),
                 "concurrency_fixed": report.get("concurrency_fixed", 0)}
 
-    def _due_stable_mode(self, kind, now=None):
+    def _due_stable_mode(self, key, now=None):
         """First due check in cadence order; "ranking" comes first because it covers availability too."""
         now = time.time() if now is None else now
-        schedule = self.store.get(kind + "_schedule", {})
-        return next((mode for mode, entry, _ in STABLE_GROUPS[kind]["cadence"] if schedule.get(entry, 0) <= now), None)
+        schedule = self.store.get(key + "_schedule") or {}
+        cadence = CADENCE[key.split(":", 1)[0]]
+        return next((mode for mode, entry, _ in cadence if schedule.get(entry, 0) <= now), None)
 
-    def _check_stable(self, kind, mode):
-        if mode not in {entry[0] for entry in STABLE_GROUPS[kind]["cadence"]}:
+    def _check_stable(self, key, mode):
+        if mode not in {entry[0] for entry in CADENCE[key.split(":", 1)[0]]}:
             raise SyncError("检测模式无效")
         values = getattr(self.context, "settings", None) or self.store.get("config")
         config = self.config(values)
         with state_lock(config.state_file):
             engine = Synchronizer(config, State(config))
-            return self._reconcile_stable(kind, engine, values, engine.load_snapshot(), mode)
+            return self._reconcile_stable(key, engine, values, engine.load_snapshot(), mode)
 
-    def _reconcile_stable(self, kind, engine, values, snapshot, mode):
-        spec = STABLE_GROUPS[kind]
+    def _reconcile_stable(self, key, engine, values, snapshot, mode):
+        rule = self._stable_entries(values).get(key)
+        if rule is None:
+            raise SyncError("该优选分组已删除")
+        selector = SELECTORS[rule["strategy"]](engine, rule)
         try:
-            result = spec["selector"](engine, values).reconcile(snapshot, mode=mode)
+            result = selector.reconcile(snapshot, mode=mode)
         except SyncError:
             # Keep the previous public report, but show a stopped group after a partial write.
-            previous = self.store.get(kind, {})
-            mapping = engine.state.data.get(kind, {})
-            previous.update({key: value for key, value in mapping.items() if key not in {"keys", "key_digest"}})
-            self.store.put(kind, previous)
+            previous = self.store.get(key) or {}
+            previous.update({name: value for name, value in selector.mapping.items() if name not in {"keys", "key_digest"}})
+            self.store.put(key, previous)
             raise
-        self.store.put(kind, result)
+        self.store.put(key, result)
         with self.settings_lock:
+            if key not in self._rules(self.store.get("config")) and result.get("status") != "active":
+                # A removed group has been stopped; its Keys stay in the state file for reuse.
+                self.store.put("stable_retired", [item for item in self.store.get("stable_retired", []) if item != key])
+                self.store.put(key, None)
+                self.store.put(key + "_schedule", None)
+                return result
             # Intervals can change while work is running; schedule from the latest saved values.
-            cadence = self.store.get("config")
-            schedule = self.store.get(kind + "_schedule", {})
+            latest = self._stable_entries(self.store.get("config")).get(key, rule)
+            schedule = self.store.get(key + "_schedule") or {}
             now = time.time()
-            for check, entry, interval in spec["cadence"]:
+            for check, entry, interval in CADENCE[rule["strategy"]]:
                 if mode == "ranking" or check == mode:
-                    minutes = cadence[interval]
+                    minutes = latest[interval]
                     if result.get("pending"):
-                        minutes = min(minutes, cadence[spec["retry"]])
+                        minutes = min(minutes, latest["retry_minutes"])
                     schedule[entry] = now + minutes * 60
-            self.store.put(kind + "_schedule", schedule)
+            self.store.put(key + "_schedule", schedule)
         return result
 
     def _cache_groups(self, config, report):
@@ -719,13 +715,12 @@ class Service:
             self.store.put("quota_rule", rule)
             self.log("INFO", f"本月余额重置已排入任务 · {period}", job_id)
         values = self.store.get("config")
-        for kind, spec in STABLE_GROUPS.items():
-            schedule = self.store.get(kind + "_schedule", {})
-            should_check = values[spec["enabled"]] and "openai" in values["sync_platforms"] and values["sync_accounts"]
-            needs_disable = self.store.get(kind, {}).get("status") == "active" and not should_check
+        for key, rule in self._stable_entries(values).items():
+            should_check = rule["enabled"] and values["sync_accounts"]
+            needs_disable = (self.store.get(key) or {}).get("status") == "active" and not should_check
             if not (should_check or needs_disable):
                 continue
-            mode = self._due_stable_mode(kind, now.timestamp())
+            mode = self._due_stable_mode(key, now.timestamp())
             if not mode:
                 continue
             with self.pending_lock:
@@ -733,15 +728,16 @@ class Service:
             if not idle:
                 continue  # remote work is serial; the next tick tries again
             try:
-                self.submit(kind, {"mode": mode})
+                self.submit(rule["strategy"], {"mode": mode, "platform": rule["platform"]})
             except SyncError:
                 continue
             # Successful jobs replace these retries with the configured detection cadence.
-            retry_at = now.timestamp() + values[spec["retry"]] * 60
-            for check, entry, _ in spec["cadence"]:
+            schedule = self.store.get(key + "_schedule") or {}
+            retry_at = now.timestamp() + rule["retry_minutes"] * 60
+            for check, entry, _ in CADENCE[rule["strategy"]]:
                 if mode == "ranking" or check == mode:
                     schedule[entry] = retry_at
-            self.store.put(kind + "_schedule", schedule)
+            self.store.put(key + "_schedule", schedule)
         scheduled = self.store.get("sync_schedule", {"next_run": time.time() + 1800})
         if values["sync_enabled"] and scheduled["next_run"] <= now.timestamp():
             try:
@@ -755,7 +751,8 @@ class Service:
         report = self.store.get("report", {})
         groups = self.store.get("groups", [])
         states = {status: sum(group["status"] == status for group in groups) for status in ("active", "inactive", "pending")}
-        stable = {kind: self.store.get(kind, {}) for kind in STABLE_GROUPS}
+        rules = self._rules(self.store.get("config"))
+        stable = {key: self.store.get(key) or {} for key in self._stable_entries(self.store.get("config"))}
         key_ids = {group["key_id"] for group in groups if group.get("key_id")}
         stable_models = 0
         for status in stable.values():
@@ -771,8 +768,10 @@ class Service:
                 "report": {key: report.get(key) for key in ("at", "pending", "warnings", "errors", "usable_groups", "usable_models")},
                 "next_sync": self.store.get("sync_schedule", {}).get("next_run"),
                 "provider_options": self.store.get("report", {}).get("provider_options", list(PLATFORMS)),
-                **stable, **{kind + "_schedule": self.store.get(kind + "_schedule", {}) for kind in STABLE_GROUPS},
-                "low_cost_weight_defaults": dict(DEFAULT_WEIGHTS),
+                # Removed groups still being stopped count in the stats above but get no card.
+                "stable_groups": [{"key": key, "label": rule_label(rule), "rule": rule, "status": stable[key],
+                                   "schedule": self.store.get(key + "_schedule") or {}} for key, rule in rules.items()],
+                "stable_defaults": DEFAULTS, "low_cost_weight_defaults": dict(DEFAULT_WEIGHTS),
                 "connections": {side: self.store.get("connection_" + side) for side in ("upstream", "target")},
                 "jobs": self.store.jobs(10), "quota_rule": self.store.get("quota_rule"),
                 "server_time": time.time(), "timezone": "Asia/Shanghai"}

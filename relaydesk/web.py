@@ -18,7 +18,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from sync_sub2api import SyncError
-from .service import LOW_COST_MODES, Service
+from .rules import CADENCE
+from .service import Service
 
 COOKIE = "flow_session"
 STATIC = Path(__file__).parent / "static"
@@ -216,18 +217,22 @@ def create_app(directory=None, *, service=None, start_scheduler=True):
     def refresh_users(manager=Depends(current)):
         return {"job_id": manager.submit("refresh_users")}
 
+    async def stable_check(request, manager, strategy):
+        body = await payload(request)
+        mode, platform = body.get("mode", "ranking"), body.get("platform", "openai")
+        if mode not in {entry[0] for entry in CADENCE[strategy]}:
+            raise SyncError("检测模式无效")
+        if f"{strategy}:{platform}" not in manager._rules():
+            raise SyncError("请先在连接配置中添加并保存这个优选分组")
+        return {"job_id": manager.submit(strategy, {"mode": mode, "platform": platform})}
+
     @app.post("/api/jobs/low-cost")
     async def low_cost(request: Request, manager=Depends(current)):
-        body = await payload(request)
-        mode = body.get("mode", "ranking")
-        if mode not in LOW_COST_MODES:
-            raise SyncError("检测模式无效")
-        return {"job_id": manager.submit("low_cost", {"mode": mode})}
+        return await stable_check(request, manager, "low_cost")
 
     @app.post("/api/jobs/best-source")
     async def best_source(request: Request, manager=Depends(current)):
-        await payload(request)
-        return {"job_id": manager.submit("best_source", {"mode": "ranking"})}
+        return await stable_check(request, manager, "best_source")
 
     @app.post("/api/jobs/batch-users")
     async def batch_users(request: Request, manager=Depends(current)):

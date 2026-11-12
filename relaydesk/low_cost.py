@@ -1,8 +1,9 @@
-"""Stable local OpenAI groups whose upstream channel can change without rebinding users.
+"""Stable local groups (one per preferred-group rule) whose upstream channel can change
+without rebinding users.
 
-Each selector owns one local group and one forwarding account, discovered by a source
-marker. Subclasses only decide *which* upstream channel to route to; creating, updating,
-disabling and Key reuse are shared.
+Each selector owns one local group and one forwarding account on the rule's platform,
+discovered by a source marker. Subclasses only decide *which* upstream channel to route
+to; creating, updating, disabling and Key reuse are shared.
 """
 
 from __future__ import annotations
@@ -15,7 +16,8 @@ from provider_ranking import detector_passed, ranked_items
 from sync_sub2api import (APIError, SyncError, bound_group_ids, changed_fields, ensure_account_binding, group_label,
                           select_usable)
 
-from .scoring import DEFAULT_WEIGHTS, WEIGHT_SETTINGS, score_candidates
+from .rules import rule_key, rule_label
+from .scoring import score_candidates
 
 LOG = logging.getLogger("sub2api-sync")
 NAME_LIMIT = 100
@@ -35,7 +37,7 @@ def display_name(base, source_name):
 @dataclass
 class Context:
     now: object
-    ranked: list            # OpenAI provider items in the hall's default order
+    ranked: list            # provider items of the rule's platform in the hall's default order
     usable: dict            # upstream id -> SelectedGroup passing availability checks
     excluded: dict          # upstream id -> reason
     source_items: dict
@@ -59,18 +61,21 @@ class Plan:
 
 
 class StableGroupSelector:
-    state_key = ""
+    strategy = ""
     marker_tag = ""
-    label = ""
-    enabled_setting = ""
-    name_setting = ""
 
-    def __init__(self, engine, settings):
+    def __init__(self, engine, rule):
         self.engine = engine
-        self.settings = settings
+        self.rule = rule
+        self.platform = rule["platform"]
+        self.label = rule_label(rule)
         self.state = engine.state
-        self.mapping = self.state.data.setdefault(self.state_key, {"keys": {}})
-        self.marker = f"[sub2api-{self.marker_tag}:{engine.source_id}:openai]"
+        key, data = rule_key(rule), self.state.data
+        if key not in data and self.platform == "openai" and self.strategy in data:
+            data[key] = data.pop(self.strategy)  # state saved when only the OpenAI groups existed
+        self.mapping = data.setdefault(key, {"keys": {}})
+        # The marker format predates rules; OpenAI groups keep their existing local resources.
+        self.marker = f"[sub2api-{self.marker_tag}:{engine.source_id}:{self.platform}]"
 
     def plan(self, context, mode, current_id):
         raise NotImplementedError
@@ -84,7 +89,7 @@ class StableGroupSelector:
             raise SyncError(f"{self.label}分组的来源标记被修改，已停止更新")
         row = matches[0] if matches else None
         if row is not None:
-            if row.get("platform") != "openai" or (field_name == "notes" and row.get("type") != "apikey"):
+            if row.get("platform") != self.platform or (field_name == "notes" and row.get("type") != "apikey"):
                 raise SyncError(f"{self.label}分组的平台或转发类型发生变化")
             self.mapping[mapping_key] = row["id"]
         return row
@@ -108,9 +113,9 @@ class StableGroupSelector:
         groups, rates, providers = snapshot
         now = engine.upstream.server_time
         # Validate freshness/completeness even when the selector is being disabled.
-        candidate_config = replace(config, sync_platforms={"openai"}, sync_top_n=0)
+        candidate_config = replace(config, sync_limits={self.platform: 0})
         usable, excluded = select_usable(groups, rates, providers, candidate_config, now)
-        context = Context(now, ranked_items(providers, now, {"openai"}), {row.source["id"]: row for row in usable}, excluded,
+        context = Context(now, ranked_items(providers, now, {self.platform}), {row.source["id"]: row for row in usable}, excluded,
                           {item["group_id"]: item for item in providers["items"]}, {group["id"]: group for group in groups})
         current_id = self.mapping.get("upstream_id")
         plan = self.plan(context, mode, current_id)
@@ -120,7 +125,7 @@ class StableGroupSelector:
         accounts = engine.target.list_all("/admin/accounts")
         group = self._discover(local_groups, "description", "local_group_id")
         account = self._discover(accounts, "notes", "local_account_id")
-        active = self.settings[self.enabled_setting] and "openai" in config.sync_platforms and config.sync_accounts
+        active = self.rule["enabled"] and config.sync_accounts
         if not active:
             self._disable(group, account, "selector_disabled")
             return self._result(result, "disabled")
@@ -172,7 +177,7 @@ class StableGroupSelector:
             return self._result(result, "pending")
         self.mapping.setdefault("keys", {})[str(group_id)] = key["id"]
         self.state.save()
-        name = display_name(self.settings[self.name_setting], selected.source.get("name"))
+        name = display_name(self.rule["name"], selected.source.get("name"))
         desired = engine.group_payload(selected)
         desired.update(name=name, description=self.marker + f"\n上游分组 #{group_id} · {selected.source['name']}")
         desired.pop("status")
@@ -202,7 +207,7 @@ class StableGroupSelector:
         if account is None:
             account = engine.target.request("POST", "/admin/accounts", {
                 **{key: value for key, value in account_desired.items() if key != "status"},
-                "platform": "openai", "type": "apikey", "credentials": credentials,
+                "platform": self.platform, "type": "apikey", "credentials": credentials,
                 "group_ids": [group["id"]], "priority": config.priority, "upstream_billing_probe_enabled": False})
             self.mapping["local_account_id"] = account["id"]
             self.state.save()
@@ -232,31 +237,29 @@ class StableGroupSelector:
     def _result(self, result, decision):
         public = {key: value for key, value in self.mapping.items() if key not in {"key_digest", "keys"}}
         key_ids = sorted(set(self.mapping.get("keys", {}).values()))
-        return {**result, **public, "decision": decision, "retained_keys": len(key_ids), "retained_key_ids": key_ids}
+        return {**result, **public, "decision": decision, "retained_keys": len(key_ids), "retained_key_ids": key_ids,
+                "strategy": self.strategy, "platform": self.platform, "label": self.label}
 
 
 class LowCostSelector(StableGroupSelector):
     """Price-led composite score over the hall's top N, with rank-drop hysteresis."""
 
-    state_key = "low_cost"
+    strategy = "low_cost"
     marker_tag = "lowcost"
-    label = "最低价 OpenAI"
-    enabled_setting = "low_cost_enabled"
-    name_setting = "low_cost_name"
 
     def plan(self, context, mode, current_id):
-        top_n = self.settings.get("low_cost_top_n") or 10
+        top_n = self.rule["top_n"]
         top = context.ranked[:top_n]
         top_ids = {item["group_id"] for item in top}
         # Case-insensitive substring match on the upstream group name; excluded channels never backfill the top N.
-        keywords = [keyword.casefold() for keyword in self.settings.get("low_cost_exclude_keywords") or []]
+        keywords = [keyword.casefold() for keyword in self.rule["exclude_keywords"]]
         blocked = {group_id for group_id, group in context.source_groups.items()
                    if keywords and any(keyword in (group.get("name") or "").casefold() for keyword in keywords)}
         eligible = {group_id: row for group_id, row in context.usable.items() if group_id not in blocked
-                    and (not self.settings["low_cost_require_detection"] or detector_passed(context.source_items[group_id]))}
+                    and (not self.rule["require_detection"] or detector_passed(context.source_items[group_id]))}
         # Score only channels inside the hall's top N that pass every availability gate.
         pool = [eligible[item["group_id"]] for item in top if item["group_id"] in eligible]
-        weights = {metric: self.settings.get(key, DEFAULT_WEIGHTS[metric]) for metric, key in WEIGHT_SETTINGS.items()}
+        weights = self.rule["weights"]
         scores = score_candidates(((row.source["id"], row.source_rate, context.source_items[row.source["id"]]) for row in pool),
                                   weights, context.now)
         pool.sort(key=lambda row: (-scores[row.source["id"]]["score"], row.provider_rank, row.source["id"]))
@@ -273,7 +276,7 @@ class LowCostSelector(StableGroupSelector):
                                "score": detail.get("score"), "score_rank": score_rank.get(group_id),
                                "parts": detail.get("parts"), "metrics": detail.get("metrics")})
         candidates.sort(key=lambda row: (row["score_rank"] is None, row["score_rank"] or 0, row["provider_rank"]))
-        tolerance = self.settings.get("low_cost_rank_tolerance", 2)
+        tolerance = self.rule["rank_tolerance"]
         current = eligible.get(current_id)
         current_rank = score_rank.get(current_id)
         if current_id is None:
@@ -301,14 +304,11 @@ class LowCostSelector(StableGroupSelector):
 class BestSourceSelector(StableGroupSelector):
     """The hall's default #1 available channel, kept until it leaves the top K."""
 
-    state_key = "best_source"
+    strategy = "best_source"
     marker_tag = "bestsource"
-    label = "最优源站 OpenAI"
-    enabled_setting = "best_source_enabled"
-    name_setting = "best_source_name"
 
     def plan(self, context, mode, current_id):
-        keep_top = self.settings.get("best_source_keep_top") or 10
+        keep_top = self.rule["keep_top"]
         top = context.ranked[:keep_top]
         pool = [context.usable[item["group_id"]] for item in top if item["group_id"] in context.usable]
         candidates = [{"upstream_id": item["group_id"], "name": context.name(item["group_id"], item), "provider_rank": rank,

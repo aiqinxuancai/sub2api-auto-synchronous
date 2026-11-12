@@ -15,7 +15,7 @@ const state = { csrf: '', setup: false, ready: false, page: 'overview', overview
   groupFilter: 'all', groupPage: 0, userPage: 0, settingsDirty: false, quotaDirty: false,
   watched: new Map(), knownJobs: new Map(), batchMode: 'paste', currentGroup: null,
   currentJob: null, batchKey: null, resetRule: null, polling: false, offline: false,
-  jobHistory: new Map(), jobsExhausted: false, loadingJobs: false };
+  jobHistory: new Map(), jobsExhausted: false, loadingJobs: false, openCandidates: new Set() };
 const JOB_PAGE = 100;
 const pages = { overview: '同步概览', settings: '连接配置', members: '成员与额度', logs: '运行日志' };
 const kinds = { sync: '同步可用分组', preview: '同步预览', connect: '连接测试', refresh_users: '刷新成员',
@@ -29,7 +29,7 @@ const reasons = { no_healthy_models: '当前没有通过健康检测的模型', 
   availability_unknown: '上游可用性尚未确认',
   platform_not_selected: '未选择同步此平台', outside_sync_top_n: '超出设定的前 N 个分组',
   group_not_selected: '不在限定的分组 ID 范围内', not_visible_in_hall: '未在供应商大厅展示',
-  model_detection_not_passed: '模型检测未通过', selector_disabled: '最低价分组已关闭或 OpenAI 未选中',
+  model_detection_not_passed: '模型检测未通过', selector_disabled: '优选分组已关闭，或未开启同步转发账号',
   no_healthy_candidates: '候选范围内暂无通过检测的可用渠道', pending_upstream_key: '等待上游 Key，稍后自动重试',
   no_bound_account: '分组没有可用的绑定账号，已停用，下轮自动修复',
   rank_dropped: '当前渠道综合评分排名下降超过允许范围',
@@ -188,9 +188,12 @@ function renderOverview() {
   if (report.warnings?.length) messages.push(...report.warnings.filter(warning => !report.pending || !String(warning?.warning || warning).includes('API_KEY_CREATE_RATE_LIMITED')).map(warningText));
   $('#sync-notice').hidden = messages.length === 0;
   $('#sync-notice').textContent = [...new Set(messages)].join(' ');
-  renderLowCost(); renderBestSource(); renderRunning(); renderActivity(); renderCountdown();
+  renderStable(); renderRunning(); renderActivity(); renderCountdown();
 }
 const scoreMetrics = { price: '价格', rating: '评分', popularity: '人气', cache: '缓存', latency: '延迟', success: '成功率' };
+const platformNames = { openai: 'OpenAI', deepseek: 'DeepSeek', zhipu: '智谱', kimi: 'Kimi', anthropic: 'Anthropic', grok: 'Grok', gemini: 'Gemini' };
+const strategyNames = { low_cost: '最低价', best_source: '最优源站' };
+const stableJobs = { low_cost: '/jobs/low-cost', best_source: '/jobs/best-source' };
 function lowCostDecision(data) {
   if (data.decision === 'retained') return data.current_score_rank ? `当前渠道评分第 ${data.current_score_rank} 名，在允许范围内，继续保留。` : '当前渠道保持可用，继续保留。';
   if (data.switch_reason && reasons[data.switch_reason]) return `${reasons[data.switch_reason]}，已更换为评分最高的渠道。`;
@@ -217,23 +220,69 @@ function scoreBar(candidate, weights) {
   bar.title = Object.entries(scoreMetrics).map(([key, label]) => `${label} ${number((candidate.parts?.[key] || 0) * 100, 0)}`).join(' · ');
   return bar;
 }
-function renderLowCost() {
-  const { config, low_cost: data = {}, low_cost_schedule: schedule = {} } = state.overview;
-  const enabled = config.low_cost_enabled && config.sync_platforms.includes('openai') && config.sync_accounts;
-  $('#low-cost-title').textContent = config.low_cost_name;
-  const status = $('#low-cost-status'); status.replaceChildren(badge(enabled ? (data.status || 'pending') : 'inactive'));
-  $('#low-cost-source').textContent = data.source_name || '等待首次检测';
-  $('#low-cost-rate').textContent = data.source_rate == null ? '—' : `${number(data.source_rate)} → ${number(data.local_rate)}`;
-  const topN = config.low_cost_top_n, active = data.status === 'active';
-  const pool = (data.candidates || []).filter(row => row.eligible).length;
-  $('#low-cost-score').textContent = active && data.score != null ? `${number(data.score, 1)} 分` : '—';
-  $('#low-cost-score-rank').textContent = active && data.score_rank ? `第 ${data.score_rank} / ${pool} 名 · 跌出前 ${1 + config.low_cost_rank_tolerance} 名时更换` : '';
-  $('#low-cost-rank').textContent = data.provider_rank ? `大厅 #${data.provider_rank} · 本地 #${data.local_group_id || '待创建'} · ${data.models?.length || 0} 个模型` : `从默认排序前 ${topN} 名中评分择优`;
-  $('#low-cost-candidates-label').textContent = `查看前 ${topN} 名候选评分`;
-  $('#low-cost-next').textContent = enabled ? `评分 ${date(schedule.next_rank)} · 可用性 ${date(schedule.next_health)}` : '在连接配置中开启，选择 OpenAI 并同步转发账号';
-  $('#low-cost-note').textContent = reasons[data.reason] || lowCostDecision(data) || `对前 ${topN} 名综合评分，选用得分最高的渠道。`;
-  $('#check-low-cost').disabled = state.jobs.some(job => ['queued', 'running'].includes(job.status) && job.kind === 'low_cost');
-  const root = $('#low-cost-candidates'); root.replaceChildren();
+function summaryCell(label, value, note, small = false) {
+  const cell = el('div'); cell.append(el('span', 'small-label', label), el(small ? 'small' : 'strong', '', value));
+  if (note !== undefined) cell.append(el('small', '', note));
+  return cell;
+}
+// One card per preferred-group rule; cards are rebuilt on every poll, so remember which candidate lists are open.
+function renderStable() {
+  const root = $('#stable-panels'); root.replaceChildren();
+  const entries = state.overview.stable_groups || [];
+  if (!entries.length) {
+    const panel = el('div', 'panel stable-empty'), text = el('div');
+    const link = el('a', 'text-button', '前往连接配置添加'); link.href = '#settings';
+    text.append(el('strong', '', '还没有优选分组'), el('p', '', '为任意平台添加「最低价」或「最优源站」分组，固定分组 ID，渠道自动切换。'));
+    panel.append(icon('tag'), text, link); root.append(panel); return;
+  }
+  for (const entry of entries) root.append(stableCard(entry));
+}
+function stableCard({ key, rule, status: data = {}, schedule = {} }) {
+  const lowCost = rule.strategy === 'low_cost', enabled = rule.enabled && state.overview.config.sync_accounts;
+  const active = data.status === 'active';
+  const panel = el('div', 'panel low-cost-panel' + (lowCost ? '' : ' best-source-panel'));
+  panel.dataset.key = key;
+  const heading = el('div', 'panel-heading'), copy = el('div'), title = el('h2');
+  title.append(icon(lowCost ? 'tag' : 'shield'), el('span', '', rule.name), el('span', 'platform-tag', `${strategyNames[rule.strategy]} · ${platformNames[rule.platform] || rule.platform}`),
+    badge(enabled ? (data.status || 'pending') : 'inactive'));
+  title.firstChild.classList.add('accent');
+  const check = el('button', 'button'); check.type = 'button'; check.append(icon('refresh'), document.createTextNode('立即检测'));
+  check.disabled = state.jobs.some(job => ['queued', 'running'].includes(job.status) && job.kind === rule.strategy);
+  check.onclick = () => action(() => runJob(stableJobs[rule.strategy], { mode: 'ranking', platform: rule.platform }, job => openJob(job)));
+  const summary = el('div', 'low-cost-summary'), rate = data.source_rate == null ? '—' : `${number(data.source_rate)} → ${number(data.local_rate)}`;
+  const enableHint = '在连接配置中启用该分组，并开启同步转发账号';
+  const details = el('details', 'candidate-details'), list = el('div');
+  details.open = state.openCandidates.has(key);
+  details.ontoggle = () => details.open ? state.openCandidates.add(key) : state.openCandidates.delete(key);
+  let note, label;
+  if (lowCost) {
+    const topN = rule.top_n, pool = (data.candidates || []).filter(row => row.eligible).length;
+    summary.append(
+      summaryCell('当前上游渠道', data.source_name || '等待首次检测', data.provider_rank ? `大厅 #${data.provider_rank} · 本地 #${data.local_group_id || '待创建'} · ${data.models?.length || 0} 个模型` : `从默认排序前 ${topN} 名中评分择优`),
+      summaryCell('综合评分', active && data.score != null ? `${number(data.score, 1)} 分` : '—', active && data.score_rank ? `第 ${data.score_rank} / ${pool} 名 · 跌出前 ${1 + rule.rank_tolerance} 名时更换` : ''),
+      summaryCell('适用倍率 · 上游 → 本地', rate),
+      summaryCell('下一次检测', enabled ? `评分 ${date(schedule.next_rank)} · 可用性 ${date(schedule.next_health)}` : enableHint, undefined, true));
+    note = reasons[data.reason] || lowCostDecision(data) || `对前 ${topN} 名综合评分，选用得分最高的渠道。`;
+    label = `查看前 ${topN} 名候选评分`;
+    renderScoredCandidates(list, data);
+  } else {
+    const keepTop = rule.keep_top;
+    summary.append(
+      summaryCell('当前上游渠道', data.source_name || '等待首次检测', data.local_group_id ? `本地 #${data.local_group_id} · ${data.models?.length || 0} 个模型` : 'providers 默认排序'),
+      summaryCell('默认排序', active && data.provider_rank ? `#${data.provider_rank}` : '—', active ? `跌出前 ${keepTop} 名时更换` : ''),
+      summaryCell('适用倍率 · 上游 → 本地', rate),
+      summaryCell('下一次检测', enabled ? `检测 ${date(schedule.next_rank)} · 每 ${rule.check_minutes} 分钟` : enableHint, undefined, true));
+    note = reasons[data.reason] || (data.switch_reason && reasons[data.switch_reason] ? `${reasons[data.switch_reason]}，已更换为默认排序第一个可用渠道。`
+      : data.decision === 'retained' ? `当前渠道仍在默认排序前 ${keepTop} 名内，继续保留。` : `跟随 providers 默认排序第 1 名，不跌出前 ${keepTop} 名就保持。`);
+    label = `查看默认排序前 ${keepTop} 名`;
+    renderRankedCandidates(list, data);
+  }
+  copy.append(title, el('p', '', note)); heading.append(copy, check);
+  const toggle = el('summary'); toggle.append(el('span', '', label), icon('chevron')); details.append(toggle, list);
+  panel.append(heading, summary, details);
+  return panel;
+}
+function renderScoredCandidates(root, data) {
   if ((data.candidates || []).some(row => row.parts)) {
     const legend = el('div', 'score-legend');
     for (const [key, label] of Object.entries(scoreMetrics)) {
@@ -255,23 +304,7 @@ function renderLowCost() {
   }
   if (!root.childNodes.length) root.append(el('p', 'field-help', '完成检测后显示候选渠道与综合评分。'));
 }
-function renderBestSource() {
-  const { config, best_source: data = {}, best_source_schedule: schedule = {} } = state.overview;
-  const enabled = config.best_source_enabled && config.sync_platforms.includes('openai') && config.sync_accounts;
-  const keepTop = config.best_source_keep_top, active = data.status === 'active';
-  $('#best-title').textContent = config.best_source_name;
-  $('#best-status').replaceChildren(badge(enabled ? (data.status || 'pending') : 'inactive'));
-  $('#best-source').textContent = data.source_name || '等待首次检测';
-  $('#best-local').textContent = data.local_group_id ? `本地 #${data.local_group_id} · ${data.models?.length || 0} 个模型` : 'providers 默认排序';
-  $('#best-rank').textContent = active && data.provider_rank ? `#${data.provider_rank}` : '—';
-  $('#best-keep').textContent = active ? `跌出前 ${keepTop} 名时更换` : '';
-  $('#best-rate').textContent = data.source_rate == null ? '—' : `${number(data.source_rate)} → ${number(data.local_rate)}`;
-  $('#best-next').textContent = enabled ? `检测 ${date(schedule.next_rank)} · 每 ${config.best_source_check_minutes} 分钟` : '在连接配置中开启，选择 OpenAI 并同步转发账号';
-  $('#best-note').textContent = reasons[data.reason] || (data.switch_reason && reasons[data.switch_reason] ? `${reasons[data.switch_reason]}，已更换为默认排序第一个可用渠道。`
-    : data.decision === 'retained' ? `当前渠道仍在默认排序前 ${keepTop} 名内，继续保留。` : `跟随 providers 默认排序第 1 名，不跌出前 ${keepTop} 名就保持。`);
-  $('#best-candidates-label').textContent = `查看默认排序前 ${keepTop} 名`;
-  $('#check-best-source').disabled = state.jobs.some(job => ['queued', 'running'].includes(job.status) && job.kind === 'best_source');
-  const root = $('#best-candidates'); root.replaceChildren();
+function renderRankedCandidates(root, data) {
   for (const candidate of data.candidates || []) {
     const row = el('div', 'candidate-row' + (candidate.eligible ? '' : ' ineligible'));
     row.append(el('span', 'candidate-rank', `#${candidate.provider_rank}`), el('span', '', candidate.name || `分组 #${candidate.upstream_id}`),
@@ -280,6 +313,10 @@ function renderBestSource() {
     root.append(row);
   }
   if (!root.childNodes.length) root.append(el('p', 'field-help', '完成检测后显示默认排序的候选渠道。'));
+}
+function jobTitle(job) {
+  const platform = job.result?.platform;
+  return platform && stableJobs[job.kind] ? `${kinds[job.kind]} · ${platformNames[platform] || platform}` : kinds[job.kind];
 }
 function renderCountdown() {
   if (!state.overview) return;
@@ -294,7 +331,7 @@ function renderRunning() {
   const active = state.jobs.filter(job => ['queued', 'running'].includes(job.status));
   $('#active-job').hidden = !active.length;
   if (active.length) {
-    $('#active-job-label').textContent = `${kinds[active[0].kind]}${active[0].status === 'queued' ? '已排队' : '正在执行'}${active.length > 1 ? ` · 另有 ${active.length - 1} 项任务` : ''}`;
+    $('#active-job-label').textContent = `${jobTitle(active[0])}${active[0].status === 'queued' ? '已排队' : '正在执行'}${active.length > 1 ? ` · 另有 ${active.length - 1} 项任务` : ''}`;
     $('#active-job-detail').onclick = () => openJob(active[0]);
   }
   const syncing = active.some(job => ['sync', 'preview'].includes(job.kind));
@@ -308,7 +345,7 @@ function renderActivity() {
     const row = el('div', 'activity-item'), circle = el('span', 'activity-icon');
     circle.append(icon(job.kind === 'connect' ? 'link' : job.kind.includes('users') ? 'users' : 'refresh'));
     const text = el('div', 'activity-text');
-    const button = el('button', 'text-button', kinds[job.kind]); button.onclick = () => openJob(job);
+    const button = el('button', 'text-button', jobTitle(job)); button.onclick = () => openJob(job);
     text.append(button, el('p', '', summary(job)), el('small', '', timeAgo(job.finished || job.created)));
     row.append(circle, text); root.append(row);
   }
@@ -384,27 +421,154 @@ function renderModels() {
 }
 $('#model-search').oninput = renderModels;
 
-const numericSettings = new Set(['interval_minutes', 'rate_factor', 'account_concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval', 'sync_top_n', 'low_cost_score_minutes', 'low_cost_health_minutes', 'low_cost_retry_minutes', 'low_cost_top_n', 'low_cost_rank_tolerance',
-  'best_source_check_minutes', 'best_source_keep_top', 'best_source_retry_minutes',
-  ...Object.keys(scoreMetrics).map(key => 'low_cost_weight_' + key)]);
+const numericSettings = new Set(['interval_minutes', 'rate_factor', 'account_concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval']);
+// Editable fields of a preferred-group rule: [field, label, help, options].
+const ruleFields = {
+  low_cost: [
+    ['name', '本地分组名称', '实际名称会自动追加当前上游，如「名称（A031-Pro）」', { type: 'text', maxlength: 100 }],
+    ['top_n', '候选范围', '只对该平台默认排序前 N 名评分，1–100', { min: 1, max: 100, prefix: '前', unit: '名' }],
+    ['score_minutes', '评分检测间隔', '重新评分并按排名决定是否更换', { min: 1, max: 1440, unit: '分钟' }],
+    ['rank_tolerance', '允许排名下降', '当前渠道跌出前「1 + 此值」名才更换；0 表示始终用第 1 名', { min: 0, max: 50, unit: '名' }],
+    ['health_minutes', '可用性检测间隔', '渠道关闭、无法访问或不健康时立即更换', { min: 1, max: 1440, unit: '分钟' }],
+    ['retry_minutes', '失败重试间隔', '连接失败或等待上游 Key 时重试', { min: 1, max: 1440, unit: '分钟' }],
+    ['exclude_keywords', '排除关键字', '上游分组名称包含任一关键字（不区分大小写）的渠道不参与评分；多个关键字用逗号分隔，最多 50 个。',
+      { type: 'text', maxlength: 2600, placeholder: '留空不排除，如 测试, 公益, Azure', wide: true }],
+  ],
+  best_source: [
+    ['name', '本地分组名称', '实际名称会自动追加当前上游', { type: 'text', maxlength: 100 }],
+    ['check_minutes', '检测间隔', '每次检测同时检查排名与可用性', { min: 1, max: 1440, unit: '分钟' }],
+    ['keep_top', '保持范围', '当前渠道跌出前 N 名才更换，1–100', { min: 1, max: 100, prefix: '前', unit: '名' }],
+    ['retry_minutes', '失败重试间隔', '连接失败或等待上游 Key 时重试', { min: 1, max: 1440, unit: '分钟' }],
+  ],
+};
+const weightFields = [['price', '价格倍率', '适用倍率越低越好，以候选中最便宜者为满分'], ['rating', '用户评分', '大厅星级，5 星为满分'],
+  ['popularity', '评价数 / 人气', '近 1 小时使用占比，按对数与候选中最高者比较'], ['cache', '缓存命中率', '50% 为 0 分，100% 为满分'],
+  ['latency', '首字延迟', '以候选中最快者为满分'], ['success', '成功率', '近 1 小时，80% 为 0 分，100% 为满分']];
 function renderSettings() {
   const form = $('#settings-form'), config = state.overview.config;
   // A page newer than the running backend shows blank fields; say so instead of letting a save fail later.
   const missing = $$('[name]', form).filter(control => control.type !== 'password' && config[control.name] === undefined);
-  $('#settings-version-notice').hidden = !missing.length;
+  $('#settings-version-notice').hidden = !missing.length && config.stable_groups !== undefined && config.sync_platform_limits !== undefined;
   for (const control of $$('[name]', form)) {
-    if (control.name === 'sync_platforms') control.checked = config.sync_platforms.includes(control.value);
-    else if (control.type === 'checkbox') control.checked = config[control.name];
+    if (control.type === 'checkbox') control.checked = config[control.name];
     else if (control.type === 'password') {
       control.value = ''; control.placeholder = config.secrets_set[control.name] ? '已保存 · 留空保持原值' : '请输入';
     } else control.value = Array.isArray(config[control.name]) ? config[control.name].join(', ') : config[control.name] ?? '';
   }
-  setSettingsDirty(false); renderAuthModes(); renderWeightShares();
+  renderPlatformLimits(config.sync_platform_limits || {});
+  $('#stable-rules').replaceChildren(...(config.stable_groups || []).map(ruleCard));
+  setSettingsDirty(false); renderAuthModes(); renderRuleState();
   for (const side of ['upstream', 'target']) {
     const result = state.overview.connections[side];
     $('#test-' + side + '-result').textContent = result ? result.message + (result.latency_ms ? ` · ${number(result.latency_ms / 1000, 2)} s` : '') : '保存的凭据不会回显';
   }
 }
+function renderPlatformLimits(limits) {
+  const root = $('#platform-limits'); root.replaceChildren();
+  for (const [platform, label] of Object.entries(platformNames)) {
+    const row = el('div', 'platform-limit'), choice = el('label', 'provider-choice'), check = el('input');
+    check.type = 'checkbox'; check.dataset.platform = platform; check.checked = platform in limits;
+    choice.append(check, el('span', '', label));
+    const count = el('span', 'input-with-unit'), input = el('input');
+    input.type = 'number'; input.min = 0; input.max = 10000; input.required = true; input.dataset.platformLimit = platform;
+    input.value = limits[platform] ?? 0; input.setAttribute('aria-label', `${label} 同步前 N 个分组，0 表示不限制`);
+    count.append(el('span', 'unit-prefix', '前'), input, el('span', '', '个'));
+    row.append(choice, count); root.append(row);
+  }
+  $('#stable-add-platform').replaceChildren(...Object.entries(platformNames).map(([value, label]) => { const option = el('option', '', label); option.value = value; return option; }));
+}
+function platformLimitsDraft() {
+  return Object.fromEntries($$('[data-platform]', $('#platform-limits')).filter(check => check.checked)
+    .map(check => [check.dataset.platform, Number($(`[data-platform-limit="${check.dataset.platform}"]`).value)]));
+}
+function ruleInput(field, value, options) {
+  const input = el('input'); input.dataset.field = field;
+  input.type = options.type || 'number'; input.required = field !== 'exclude_keywords';
+  for (const key of ['min', 'max', 'maxlength', 'placeholder']) if (options[key] !== undefined) input.setAttribute(key, options[key]);
+  input.value = Array.isArray(value) ? value.join(', ') : value ?? '';
+  return input;
+}
+function ruleCard(rule) {
+  const card = el('section', 'stable-rule'); card.dataset.strategy = rule.strategy; card.dataset.platform = rule.platform;
+  const head = el('div', 'stable-rule-head'), title = el('div');
+  title.append(el('h3', '', `${strategyNames[rule.strategy]} · ${platformNames[rule.platform] || rule.platform}`),
+    el('p', '', rule.strategy === 'low_cost' ? '对默认排序前 N 名做综合评分（价格为主），自动选用得分最高的渠道。' : '跟随 providers 默认排序的第 1 名，只要不跌出前 N 名就保持不换。'));
+  const toggle = el('label', 'switch-label'), enabled = el('input');
+  enabled.type = 'checkbox'; enabled.setAttribute('role', 'switch'); enabled.dataset.field = 'enabled'; enabled.checked = rule.enabled;
+  toggle.append(el('span', '', '启用分组'), enabled, el('span', 'switch-track'));
+  const remove = el('button', 'button ghost small'); remove.type = 'button'; remove.append(icon('close'), document.createTextNode('删除'));
+  remove.onclick = () => { card.remove(); setSettingsDirty(true); renderRuleState(); };
+  const actions = el('div', 'stable-rule-actions'); actions.append(toggle, remove);
+  head.append(title, actions);
+  const grid = el('div', 'form-grid four');
+  for (const [field, label, help, options] of ruleFields[rule.strategy]) {
+    const wrapper = el('label', 'field' + (options.wide ? ' span-2' : '')), input = ruleInput(field, rule[field], options);
+    wrapper.append(document.createTextNode(label));
+    if (options.unit) {
+      const unit = el('span', 'input-with-unit');
+      if (options.prefix) unit.append(el('span', 'unit-prefix', options.prefix));
+      unit.append(input, el('span', '', options.unit)); wrapper.append(unit);
+    } else wrapper.append(input);
+    wrapper.append(el('small', '', help)); grid.append(wrapper);
+  }
+  card.append(head, grid);
+  if (rule.strategy === 'low_cost') {
+    const detection = el('label', 'check-label'), check = el('input');
+    check.type = 'checkbox'; check.dataset.field = 'require_detection'; check.checked = rule.require_detection;
+    detection.append(check, document.createTextNode('仅选择模型检测通过的渠道'));
+    const section = el('div', 'sub-section'), heading = el('div', 'sub-section-heading'), copy = el('div');
+    copy.append(el('h3', '', '评分权重'), el('p', '', '每项先在候选中归一化为 0–1，再按权重合成 0–100 分；缺少数据的项按中间值 0.5 计算。'));
+    const reset = el('button', 'button ghost small'); reset.type = 'button'; reset.append(icon('undo'), document.createTextNode('恢复默认'));
+    reset.onclick = () => {
+      for (const [key, value] of Object.entries(state.overview.low_cost_weight_defaults || {})) $(`[data-weight="${key}"]`, card).value = value;
+      setSettingsDirty(true); renderRuleState();
+    };
+    heading.append(copy, reset);
+    const weights = el('div', 'form-grid three');
+    for (const [key, label, help] of weightFields) {
+      const wrapper = el('label', 'field weight-field'), unit = el('span', 'input-with-unit'), input = el('input');
+      input.type = 'number'; input.min = 0; input.max = 100; input.step = 1; input.required = true; input.dataset.weight = key;
+      input.value = rule.weights?.[key] ?? 0;
+      unit.append(input, el('span', 'weight-share', '—')); unit.lastChild.dataset.weightShare = key;
+      wrapper.append(document.createTextNode(label), unit, el('small', '', help)); weights.append(wrapper);
+    }
+    section.append(heading, weights); card.append(detection, section);
+  }
+  return card;
+}
+function rulesDraft() {
+  return $$('.stable-rule', $('#stable-rules')).map(card => {
+    const rule = { strategy: card.dataset.strategy, platform: card.dataset.platform };
+    for (const input of $$('[data-field]', card)) {
+      const field = input.dataset.field;
+      if (input.type === 'checkbox') rule[field] = input.checked;
+      else if (field === 'exclude_keywords') rule[field] = input.value.split(/[,，、;；\n]+/).map(item => item.trim()).filter(Boolean);
+      else rule[field] = input.type === 'number' ? Number(input.value) : input.value;
+    }
+    if (rule.strategy === 'low_cost') rule.weights = Object.fromEntries($$('[data-weight]', card).map(input => [input.dataset.weight, Number(input.value)]));
+    return rule;
+  });
+}
+// Weight shares, the count input next to each platform, and which strategies can still be added.
+function renderRuleState() {
+  for (const card of $$('.stable-rule', $('#stable-rules'))) {
+    const inputs = $$('[data-weight]', card), total = inputs.reduce((sum, input) => sum + Math.max(0, Number(input.value) || 0), 0);
+    for (const input of inputs) $(`[data-weight-share="${input.dataset.weight}"]`, card).textContent = total ? `${Math.round(Math.max(0, Number(input.value) || 0) / total * 100)}%` : '—';
+  }
+  for (const check of $$('[data-platform]', $('#platform-limits'))) $(`[data-platform-limit="${check.dataset.platform}"]`).disabled = !check.checked;
+  if (!$$('.stable-rule', $('#stable-rules')).length) $('#stable-rules').replaceChildren(el('p', 'empty-inline', '还没有优选分组，选择平台与策略后点击「添加优选分组」。'));
+  else $$('.empty-inline', $('#stable-rules')).forEach(node => node.remove());
+}
+$('#stable-add').onclick = () => {
+  const platform = $('#stable-add-platform').value, strategy = $('#stable-add-strategy').value;
+  if ($$('.stable-rule', $('#stable-rules')).some(card => card.dataset.platform === platform && card.dataset.strategy === strategy)) {
+    toast(`已经添加过「${strategyNames[strategy]} ${platformNames[platform]}」，每个平台的同一策略只能添加一次。`, true); return;
+  }
+  const defaults = state.overview.stable_defaults?.[strategy] || {};
+  const card = ruleCard({ strategy, platform, enabled: true, name: `${strategyNames[strategy]} ${platformNames[platform]}`, ...structuredClone(defaults) });
+  $('#stable-rules').append(card); setSettingsDirty(true); renderRuleState();
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); $('[data-field="name"]', card).focus();
+};
 function renderAuthModes() {
   $$('[data-auth]').forEach(node => {
     const [side, mode] = node.dataset.auth.split(':');
@@ -415,18 +579,14 @@ function settingsDraft(side) {
   const result = {};
   for (const control of $$('[name]', $('#settings-form'))) {
     if (side && !control.name.startsWith(side + '_')) continue;
-    if (control.name === 'sync_platforms') {
-      result.sync_platforms ??= [];
-      if (control.checked) result.sync_platforms.push(control.value);
-    } else if (control.type === 'checkbox') result[control.name] = control.checked;
+    if (control.type === 'checkbox') result[control.name] = control.checked;
     else if (numericSettings.has(control.name)) result[control.name] = Number(control.value);
     else if (control.name === 'group_ids') {
       result.group_ids = control.value.trim() ? control.value.split(/[,，\s]+/).filter(Boolean).map(Number) : [];
       if (result.group_ids.some(id => !Number.isInteger(id) || id <= 0)) throw new Error('分组 ID 请填写正整数，以逗号分隔。');
-    } else if (control.name === 'low_cost_exclude_keywords') {
-      result.low_cost_exclude_keywords = control.value.split(/[,，、;；\n]+/).map(item => item.trim()).filter(Boolean);
     } else result[control.name] = control.value;
   }
+  if (!side) { result.sync_platform_limits = platformLimitsDraft(); result.stable_groups = rulesDraft(); }
   return result;
 }
 function setSettingsDirty(dirty) {
@@ -436,16 +596,7 @@ function setSettingsDirty(dirty) {
   $('#settings-discard').disabled = !dirty;
   $('#nav-settings-dirty').hidden = !dirty;
 }
-function renderWeightShares() {
-  const values = Object.fromEntries(Object.keys(scoreMetrics).map(key => [key, Math.max(0, Number($(`[name="low_cost_weight_${key}"]`).value) || 0)]));
-  const total = Object.values(values).reduce((sum, value) => sum + value, 0);
-  for (const [key, value] of Object.entries(values)) $(`[data-weight-share="${key}"]`).textContent = total ? `${Math.round(value / total * 100)}%` : '—';
-}
-$('#settings-form').addEventListener('input', () => { setSettingsDirty(true); renderAuthModes(); renderWeightShares(); });
-$('#reset-weights').onclick = () => {
-  for (const [key, value] of Object.entries(state.overview.low_cost_weight_defaults || {})) $(`[name="low_cost_weight_${key}"]`).value = value;
-  setSettingsDirty(true); renderWeightShares();
-};
+$('#settings-form').addEventListener('input', () => { setSettingsDirty(true); renderAuthModes(); renderRuleState(); });
 $('#settings-discard').onclick = () => { renderSettings(); toast('已恢复为上次保存的配置'); };
 $$('[data-section]').forEach(link => link.addEventListener('click', event => {
   event.preventDefault(); $(link.getAttribute('href')).scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -476,8 +627,6 @@ async function runJob(path, body = {}, onDone) {
 }
 $('#sync-now').onclick = () => action(() => runJob('/jobs/sync'));
 $('#preview-sync').onclick = () => action(() => runJob('/jobs/sync', { preview: true }, job => openJob(job)));
-$('#check-low-cost').onclick = () => action(() => runJob('/jobs/low-cost', { mode: 'ranking' }, job => openJob(job)));
-$('#check-best-source').onclick = () => action(() => runJob('/jobs/best-source', {}, job => openJob(job)));
 $('#refresh-users').onclick = () => action(() => runJob('/jobs/refresh-users'));
 
 function filteredUsers() {
@@ -617,7 +766,7 @@ $('#open-batch').onclick = () => {
     const option = el('option', '', `#${group.local_group_id} · ${group.name}`); option.value = group.local_group_id; groups.append(option);
   }
   // Stable groups first: their IDs never change, so they suit long-lived employee access.
-  for (const stable of [state.overview.best_source, state.overview.low_cost]) {
+  for (const { status: stable } of [...(state.overview.stable_groups || [])].reverse()) {
     if (stable?.status === 'active' && stable.local_group_id) {
       const option = el('option', '', `#${stable.local_group_id} · ${stable.name}`);
       option.value = stable.local_group_id; groups.prepend(option);
@@ -687,7 +836,7 @@ function renderJobs() {
   if (!history.length) root.append(empty('还没有执行任务', '首次操作后，执行记录会显示在这里。', 'log'));
   for (const job of history) {
     const row = el('button', 'job-row'); row.type = 'button';
-    row.append(icon(job.kind.includes('users') ? 'users' : job.kind === 'connect' ? 'link' : 'refresh'), el('span', 'job-name', kinds[job.kind]), el('span', 'job-summary', summary(job)), el('span', 'job-date', date(job.created)), badge(job.status));
+    row.append(icon(job.kind.includes('users') ? 'users' : job.kind === 'connect' ? 'link' : 'refresh'), el('span', 'job-name', jobTitle(job)), el('span', 'job-summary', summary(job)), el('span', 'job-date', date(job.created)), badge(job.status));
     row.onclick = () => openJob(job); root.append(row);
   }
   if (history.length && !state.jobsExhausted) {
@@ -701,7 +850,7 @@ function openJob(job) {
   if (!$('#job-dialog').open) $('#job-dialog').showModal();
 }
 function renderJobDetail(job) {
-  $('#job-detail-title').textContent = kinds[job.kind];
+  $('#job-detail-title').textContent = jobTitle(job);
   const root = $('#job-detail-content'); root.replaceChildren();
   const meta = el('dl', 'detail-meta');
   addMeta(meta, '执行状态', badge(job.status)); addMeta(meta, '提交时间', date(job.created, null, true));
@@ -779,7 +928,7 @@ async function refresh() {
       state.knownJobs.set(job.id, job.status);
       if (terminal && state.watched.has(job.id)) {
         const callback = state.watched.get(job.id); state.watched.delete(job.id);
-        toast(`${kinds[job.kind]}${job.status === 'success' ? '完成' : job.status === 'partial' ? '部分完成' : '失败'}：${summary(job)}`, job.status !== 'success');
+        toast(`${jobTitle(job)}${job.status === 'success' ? '完成' : job.status === 'partial' ? '部分完成' : '失败'}：${summary(job)}`, job.status !== 'success');
         if (callback) callback(job);
       }
       if ($('#job-dialog').open && state.currentJob === job.id) renderJobDetail(job);

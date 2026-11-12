@@ -108,6 +108,18 @@ def account_concurrency(values: dict[str, Any]) -> int:
     return DEFAULT_ACCOUNT_CONCURRENCY
 
 
+def platform_limits(values: dict[str, Any]) -> dict[str, int]:
+    """Platforms to sync with their own top N (0 = no limit) from Web settings.
+
+    Settings used to hold one platform list and one shared N; each selected platform
+    keeps that N (a former "all platforms combined" N becomes a per-platform N).
+    """
+    if "sync_platform_limits" in values:
+        return dict(values["sync_platform_limits"])
+    top_n = values.get("sync_top_n", 0)
+    return {platform: top_n for platform in PLATFORMS if platform in values.get("sync_platforms", ["openai"])}
+
+
 @dataclass
 class Config:
     upstream_base: str
@@ -123,9 +135,8 @@ class Config:
     target_refresh_token: str = field(default="", repr=False)
     interval: int = 1800
     group_ids: set[int] = field(default_factory=set)
-    sync_platforms: set[str] = field(default_factory=lambda: {"openai"})
-    sync_top_n: int = 0
-    sync_top_scope: str = "per_platform"
+    # Platform -> sync only its top N groups in the hall's default order; 0 = no limit.
+    sync_limits: dict[str, int] = field(default_factory=lambda: {"openai": 0})
     prefix: str = "upstream-"
     rate_factor: Decimal = Decimal("1.0")
     sync_accounts: bool = True
@@ -144,6 +155,10 @@ class Config:
     upstream_api: str = field(init=False)
     target_api: str = field(init=False)
 
+    @property
+    def sync_platforms(self) -> set[str]:
+        return set(self.sync_limits)
+
     def __post_init__(self) -> None:
         self.upstream_base, self.upstream_api = normalize_base(
             self.upstream_base, "UPSTREAM_BASE_URL")
@@ -154,10 +169,8 @@ class Config:
             raise SyncError("GROUP_NAME_PREFIX 不能超过 50 个字符")
         if not self.sync_platforms <= set(PLATFORMS):
             raise SyncError("同步平台无效")
-        if type(self.sync_top_n) is not int or not 0 <= self.sync_top_n <= 10000:
+        if any(type(limit) is not int or not 0 <= limit <= 10000 for limit in self.sync_limits.values()):
             raise SyncError("同步前 N 个必须为 0–10000 的整数，0 表示不限制")
-        if self.sync_top_scope not in {"per_platform", "global"}:
-            raise SyncError("同步数量范围无效")
         if not 0 <= self.request_interval <= 60:
             raise SyncError("REQUEST_MIN_INTERVAL_SECONDS 必须在 0–60 之间")
         if not self.providers_path.startswith("/") or self.providers_path.startswith("//"):
@@ -178,8 +191,7 @@ class Config:
             target_access_token=values["target_access_token"] if values["target_auth_mode"] == "session" else "",
             target_refresh_token=values["target_refresh_token"] if values["target_auth_mode"] == "session" else "",
             interval=values["interval_minutes"] * 60, group_ids=set(values["group_ids"]),
-            sync_platforms=set(values.get("sync_platforms", ["openai"])), sync_top_n=values.get("sync_top_n", 0),
-            sync_top_scope=values.get("sync_top_scope", "per_platform"),
+            sync_limits=platform_limits(values),
             prefix=values["prefix"], rate_factor=Decimal(str(values["rate_factor"])),
             sync_accounts=values["sync_accounts"], auto_create_keys=values["auto_create_keys"],
             concurrency=account_concurrency(values), priority=values["priority"], timeout=values["timeout"],
@@ -473,14 +485,9 @@ def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
         providers_by_id[group_id] = item
     ranks = rank_metadata(providers, now)
     ranked = ranked_items(providers, now, config.sync_platforms)
-    if config.sync_top_n:
-        if config.sync_top_scope == "global":
-            allowed_ids = {item["group_id"] for item in ranked[:config.sync_top_n]}
-        else:
-            allowed_ids = {item["group_id"] for item in ranked
-                           if ranks[item["group_id"]]["provider_rank"] <= config.sync_top_n}
-    else:
-        allowed_ids = {item["group_id"] for item in ranked}
+    allowed_ids = {item["group_id"] for item in ranked
+                   if not config.sync_limits[item["platform"]]
+                   or ranks[item["group_id"]]["provider_rank"] <= config.sync_limits[item["platform"]]}
     selected: list[SelectedGroup] = []
     excluded: dict[int, str] = {}
     seen: set[int] = set()
@@ -653,8 +660,10 @@ class Synchronizer:
             self.keys = self.upstream.list_all("/keys")
         name = f"sub2api-sync-{self.target_id}-g{group_id}"
         mapped_id = self.state.data["groups"].get(str(group_id), {}).get("upstream_key_id")
-        for stable in ("low_cost", "best_source"):
-            mapped_id = mapped_id or self.state.data.get(stable, {}).get("keys", {}).get(str(group_id))
+        # Keys retained by preferred groups: `low_cost:openai`, `best_source:deepseek`, … (or a pre-rule `low_cost`).
+        for state_key, stable in self.state.data.items():
+            if state_key.split(":", 1)[0] in {"low_cost", "best_source"} and isinstance(stable, dict):
+                mapped_id = mapped_id or stable.get("keys", {}).get(str(group_id))
         candidates = [key for key in self.keys if (key.get("id") == mapped_id or key.get("name") == name)
                       and self._key_is_usable(key, group_id)]
         if candidates:
@@ -800,8 +809,7 @@ class Synchronizer:
                          for group_id, reason in sorted(excluded.items())],
             "groups": [], "actions": [], "errors": [], "pending": 0,
             "warnings": [],
-            "platforms": sorted(self.config.sync_platforms), "sync_top_n": self.config.sync_top_n,
-            "sync_top_scope": self.config.sync_top_scope,
+            "platforms": sorted(self.config.sync_platforms), "sync_limits": dict(self.config.sync_limits),
             "provider_options": providers.get("platform_tabs", list(PLATFORMS)),
             "target_verified": False,
         }

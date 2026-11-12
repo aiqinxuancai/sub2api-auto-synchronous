@@ -9,7 +9,7 @@ from unittest.mock import patch
 from provider_ranking import default_score, detector_passed, ranked_items
 from relaydesk.low_cost import BestSourceSelector, LowCostSelector
 from relaydesk.scoring import DEFAULT_WEIGHTS, score_candidates
-from relaydesk.service import SELECTION_DEFAULTS
+from relaydesk.rules import legacy_rule, new_rule
 from sync_sub2api import State, SyncError, Synchronizer, select_usable
 import test_sync
 from test_sync import iso_after
@@ -84,14 +84,14 @@ class SelectionIntegrationTests(unittest.TestCase):
         self.all_healthy()
         self.cycle()
         previous = copy.deepcopy(State(self.config).data["groups"])
-        self.config.sync_top_n = 1
+        self.config.sync_limits = {"openai": 1}
         self.config.disable_unavailable = False
         report = self.cycle()
         self.assertEqual([row["upstream_id"] for row in report["groups"]], [8])
         self.assertEqual(len(self.fake.keys), 3)
         for source_id in (7, 9):
             self.assertEqual(State(self.config).data["groups"][str(source_id)]["last_status"], "inactive")
-        self.config.sync_top_n = 0
+        self.config.sync_limits = {"openai": 0}
         self.cycle()
         for source_id in (7, 8, 9):
             mapping = State(self.config).data["groups"][str(source_id)]
@@ -104,30 +104,30 @@ class SelectionIntegrationTests(unittest.TestCase):
         self.fake.groups[1]["platform"] = "gemini"
         report = self.cycle()
         self.assertEqual({row["platform"] for row in report["groups"]}, {"openai"})
-        self.config.sync_platforms = {"gemini"}
+        self.config.sync_limits = {"gemini": 0}
         self.config.disable_unavailable = False
         self.cycle()
         self.assertEqual(State(self.config).data["groups"]["7"]["last_status"], "inactive")
         self.assertEqual(State(self.config).data["groups"]["8"]["last_status"], "active")
-        self.config.sync_platforms = set()
+        self.config.sync_limits = {}
         self.cycle()
         self.assertTrue(all(row.get("last_status") == "inactive" for row in State(self.config).data["groups"].values()))
         self.assertEqual(len(self.fake.keys), 3)
 
-    def test_top_n_per_platform_vs_global(self):
+    def test_each_platform_has_its_own_top_n(self):
         self.all_healthy()
         self.fake.groups[0]["platform"] = "gemini"
-        self.config.sync_platforms = {"openai", "gemini"}
-        self.config.sync_top_n = 1
+        self.config.sync_limits = {"openai": 1, "gemini": 1}
         report = self.cycle()
         self.assertEqual({row["upstream_id"] for row in report["groups"]}, {7, 8})
-        self.config.sync_top_scope = "global"
+        self.config.sync_limits = {"openai": 0, "gemini": 1}
         report = self.cycle()
-        self.assertEqual([row["upstream_id"] for row in report["groups"]], [8])
+        self.assertEqual({row["upstream_id"] for row in report["groups"]}, {7, 8, 9})
+        self.assertEqual(report["sync_limits"], {"openai": 0, "gemini": 1})
 
     def test_cap_before_access_and_expiry_checks_does_not_backfill(self):
         self.all_healthy()
-        self.config.sync_top_n = 1
+        self.config.sync_limits = {"openai": 1}
         self.fake.provider_overrides[8]["probe_expires_at"] = iso_after(-30)
         report = self.cycle()
         self.assertEqual(report["usable_groups"], 0)
@@ -154,8 +154,8 @@ class LowCostTests(unittest.TestCase):
     def check(self, mode="ranking", **settings):
         engine = Synchronizer(self.config, State(self.config))
         self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
-        options = {**SELECTION_DEFAULTS, "low_cost_enabled": True, **settings}
-        return LowCostSelector(engine, options).reconcile(engine.load_snapshot(), mode=mode)
+        rule = legacy_rule("low_cost", {"low_cost_enabled": True, **settings})
+        return LowCostSelector(engine, rule).reconcile(engine.load_snapshot(), mode=mode)
 
     def test_lowest_applicable_rate_zero_override_and_stable_retention(self):
         self.fake.rates = {"7": 0, "8": .01}
@@ -255,7 +255,7 @@ class LowCostTests(unittest.TestCase):
 
     def test_detection_gate_and_regular_top_n_independence(self):
         self.fake.provider_overrides[7] = {"model_detection": {"status": "suspected"}}
-        self.config.sync_top_n = 1
+        self.config.sync_limits = {"openai": 1}
         selected = self.check()
         self.assertEqual(selected["upstream_id"], 8)
         self.assertNotIn("7", State(self.config).data["groups"])
@@ -369,9 +369,11 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(result["status"], "active")
         self.assertEqual(result["upstream_id"], 8)
 
-    def test_deselect_openai_disables_alias_without_touching_manual_groups(self):
+    def test_platform_list_does_not_affect_alias_but_account_sync_does(self):
         self.check()
-        self.config.sync_platforms = {"gemini"}
+        self.config.sync_limits = {"gemini": 0}
+        self.assertEqual(self.check("health")["status"], "active")
+        self.config.sync_accounts = False
         result = self.check("health")
         self.assertEqual(result["status"], "inactive")
         self.assertEqual(self.fake.local_groups[0]["status"], "active")
@@ -416,7 +418,7 @@ class LowCostTests(unittest.TestCase):
             return original(method, path, *args, **kwargs)
 
         with patch.object(engine.target, "request", side_effect=reject_account_update):
-            selector = LowCostSelector(engine, {**SELECTION_DEFAULTS, "low_cost_enabled": True})
+            selector = LowCostSelector(engine, legacy_rule("low_cost", {"low_cost_enabled": True}))
             with self.assertRaises(SyncError):
                 selector.reconcile(engine.load_snapshot(), mode="health")
         self.assertEqual(self.fake.local_groups[-1]["status"], "inactive")
@@ -437,8 +439,8 @@ class BestSourceTests(unittest.TestCase):
     def check(self, selector=BestSourceSelector, **settings):
         engine = Synchronizer(self.config, State(self.config))
         self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
-        options = {**SELECTION_DEFAULTS, "best_source_enabled": True, "low_cost_enabled": True, **settings}
-        return selector(engine, options).reconcile(engine.load_snapshot(), mode="ranking")
+        options = {"best_source_enabled": True, "low_cost_enabled": True, **settings}
+        return selector(engine, legacy_rule(selector.strategy, options)).reconcile(engine.load_snapshot(), mode="ranking")
 
     def test_selects_default_first_and_keeps_it_inside_top_k(self):
         first = self.check()
@@ -472,6 +474,35 @@ class BestSourceTests(unittest.TestCase):
         self.assertEqual(best["upstream_id"], cheap["upstream_id"])
         self.assertNotEqual(best["local_group_id"], cheap["local_group_id"])
         self.assertEqual(len(self.fake.accounts), 2)
+        self.assertEqual(len(self.fake.keys), 1)
+
+    def test_rule_for_another_platform_owns_its_own_group_and_account(self):
+        self.fake.groups[1]["platform"] = "deepseek"
+        engine = Synchronizer(self.config, State(self.config))
+        self.fake.healthy_group_ids = {7, 8, 9}
+        deepseek = BestSourceSelector(engine, new_rule("best_source", "deepseek", enabled=True))
+        result = deepseek.reconcile(engine.load_snapshot(), mode="ranking")
+        self.assertEqual((result["upstream_id"], result["platform"], result["label"]), (8, "deepseek", "最优源站 DeepSeek"))
+        group = next(row for row in self.fake.local_groups if row["id"] == result["local_group_id"])
+        self.assertEqual(group["platform"], "deepseek")
+        self.assertIn(f"[sub2api-bestsource:{engine.source_id}:deepseek]", group["description"])
+        self.assertEqual(self.fake.accounts[0]["platform"], "deepseek")
+        openai = self.check()
+        self.assertEqual(openai["upstream_id"], 7)
+        self.assertNotEqual(openai["local_group_id"], result["local_group_id"])
+        self.assertTrue({"best_source:deepseek", "best_source:openai"} <= set(State(self.config).data))
+
+    def test_state_from_fixed_openai_groups_moves_under_rule_key(self):
+        first = self.check()
+        state = State(self.config)
+        state.data["best_source"] = state.data.pop("best_source:openai")
+        state.save()
+        again = self.check()
+        self.assertEqual(again["local_group_id"], first["local_group_id"])
+        self.assertEqual(again["decision"], "retained")
+        data = State(self.config).data
+        self.assertNotIn("best_source", data)
+        self.assertEqual(data["best_source:openai"]["local_group_id"], first["local_group_id"])
         self.assertEqual(len(self.fake.keys), 1)
 
     def test_disabled_selector_stops_routing(self):

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from relaydesk.service import Service, next_month
 from relaydesk.low_cost import LowCostSelector
+from relaydesk.rules import new_rule
 from relaydesk.scoring import DEFAULT_WEIGHTS
 from relaydesk.web import create_app
 from sync_sub2api import SyncError
@@ -389,106 +390,134 @@ class WebTests(unittest.TestCase):
         self.assertEqual(next_month(datetime(2026, 2, 15, tzinfo=timezone.utc), "America/New_York").hour, 5)
         self.assertEqual(next_month(datetime(2026, 3, 15, tzinfo=timezone.utc), "America/New_York").hour, 4)
 
-    def test_platform_top_n_and_low_cost_configuration_validation(self):
+    def rules(self, *rules):
+        return self.service.save_config({"stable_groups": [dict(rule) for rule in rules]})
+
+    def stable(self, key):
+        return next(entry for entry in self.client.get("/api/overview").json()["stable_groups"] if entry["key"] == key)
+
+    def test_each_platform_has_its_own_top_n(self):
         config = self.client.get("/api/config").json()
-        self.assertEqual(config["sync_platforms"], ["openai"])
-        for patch_value in ({"sync_platforms": "openai"}, {"sync_platforms": ["fake"]},
-                            {"sync_top_n": -1}, {"sync_top_n": True}, {"sync_top_scope": []},
-                            {"low_cost_score_minutes": 0}, {"low_cost_health_minutes": 0}, {"low_cost_enabled": "yes"}):
+        self.assertEqual((config["sync_platform_limits"], config["stable_groups"]), ({"openai": 0}, []))
+        for patch_value in ({"sync_platform_limits": ["openai"]}, {"sync_platform_limits": {"fake": 0}},
+                            {"sync_platform_limits": {"openai": -1}}, {"sync_platform_limits": {"openai": True}},
+                            {"sync_platform_limits": {"openai": 10001}}, {"sync_platforms": ["openai"]}, {"sync_top_n": 2}):
             response = self.client.put("/api/config", json=patch_value, headers=self.headers)
             self.assertEqual(response.status_code, 400, patch_value)
-        response = self.client.put("/api/config", json={"sync_platforms": ["openai", "gemini"],
-            "sync_top_n": 2, "sync_top_scope": "global", "low_cost_score_minutes": 2}, headers=self.headers)
+        response = self.client.put("/api/config", json={"sync_platform_limits": {"gemini": 3, "openai": 0}}, headers=self.headers)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["sync_top_n"], 2)
+        self.assertEqual(list(response.json()["sync_platform_limits"].items()), [("openai", 0), ("gemini", 3)])
+        self.assertEqual(self.service.config().sync_limits, {"openai": 0, "gemini": 3})
 
-    def test_low_cost_exclude_keywords_validation_and_normalization(self):
-        self.assertEqual(self.client.get("/api/config").json()["low_cost_exclude_keywords"], [])
-        for value in ("测试", [1], [None], ["x" * 51], [f"k{index}" for index in range(51)]):
-            response = self.client.put("/api/config", json={"low_cost_exclude_keywords": value}, headers=self.headers)
+    def test_preferred_group_rules_validation_and_defaults(self):
+        low, best = new_rule("low_cost", "openai"), new_rule("best_source", "openai")
+        invalid = ["x", [{"strategy": "cheap", "platform": "openai"}], [{"strategy": "low_cost", "platform": "fake"}],
+                   [low, low], [{**low, "name": "A"}, {**best, "platform": "deepseek", "name": "A"}],
+                   [{**low, "name": " "}], [{**low, "enabled": "yes"}], [{**low, "unknown": 1}], [{**best, "top_n": 5}],
+                   [{**low, "top_n": 0}], [{**low, "top_n": 101}], [{**low, "top_n": True}], [{**low, "top_n": 2.5}],
+                   [{**low, "score_minutes": 0}], [{**low, "score_minutes": 1441}], [{**low, "health_minutes": 0}],
+                   [{**low, "retry_minutes": 0}], [{**low, "rank_tolerance": -1}], [{**low, "rank_tolerance": 51}],
+                   [{**low, "weights": {**DEFAULT_WEIGHTS, "price": 101}}], [{**low, "weights": dict.fromkeys(DEFAULT_WEIGHTS, 0)}],
+                   [{**low, "weights": {"price": 1}}], [{**low, "require_detection": 1}], [{**low, "exclude_keywords": "测试"}],
+                   [{**low, "exclude_keywords": ["x" * 51]}], [{**low, "exclude_keywords": [f"k{index}" for index in range(51)]}],
+                   [{**best, "keep_top": 0}], [{**best, "keep_top": 101}], [{**best, "check_minutes": 1441}]]
+        for value in invalid:
+            response = self.client.put("/api/config", json={"stable_groups": value}, headers=self.headers)
             self.assertEqual(response.status_code, 400, value)
-        response = self.client.put("/api/config", json={"low_cost_exclude_keywords": [" 测试 ", "", "Azure", "azure", "公益"]},
-                                   headers=self.headers)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["low_cost_exclude_keywords"], ["测试", "Azure", "公益"])
+        response = self.client.put("/api/config", json={"stable_groups": [
+            {"strategy": "best_source", "platform": "deepseek", "name": " 源站 DS "},
+            {**low, "exclude_keywords": [" 测试 ", "", "Azure", "azure", "公益"]}]}, headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        saved = response.json()["stable_groups"]
+        self.assertEqual(saved[0], new_rule("best_source", "deepseek", name="源站 DS"))
+        self.assertEqual(saved[1]["exclude_keywords"], ["测试", "Azure", "公益"])
         document = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))
-        self.assertEqual(document["config"]["low_cost_exclude_keywords"], ["测试", "Azure", "公益"])
-        self.service.store.put("low_cost_schedule", {"next_rank": 9e12, "next_health": 9e12})
-        self.service.save_config({"low_cost_exclude_keywords": ["Alpha"]})
-        self.assertLess(self.service.store.get("low_cost_schedule")["next_rank"], 9e12)
-
-    def test_low_cost_scoring_settings_validation(self):
-        config = self.client.get("/api/config").json()
-        self.assertEqual((config["low_cost_top_n"], config["low_cost_score_minutes"], config["low_cost_rank_tolerance"]), (10, 10, 2))
-        self.assertEqual({key: config["low_cost_weight_" + key] for key in DEFAULT_WEIGHTS}, DEFAULT_WEIGHTS)
-        zero_weights = {"low_cost_weight_" + key: 0 for key in DEFAULT_WEIGHTS}
-        for value in ({"low_cost_top_n": 0}, {"low_cost_top_n": 101}, {"low_cost_top_n": True}, {"low_cost_top_n": 2.5},
-                      {"low_cost_score_minutes": 0}, {"low_cost_score_minutes": 1441},
-                      {"low_cost_rank_tolerance": -1}, {"low_cost_rank_tolerance": 51}, {"low_cost_rank_tolerance": 1.5},
-                      {"low_cost_weight_price": -1}, {"low_cost_weight_price": 101}, {"low_cost_weight_cache": "x"},
-                      zero_weights, {"low_cost_rank_hours": 2}):
-            self.assertEqual(self.client.put("/api/config", json=value, headers=self.headers).status_code, 400, value)
-        response = self.client.put("/api/config", json={"low_cost_top_n": 25, "low_cost_score_minutes": 15,
-                                                        "low_cost_rank_tolerance": 0, **zero_weights, "low_cost_weight_price": 100},
-                                   headers=self.headers)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["low_cost_weight_price"], 100)
-        self.assertEqual(self.client.get("/api/overview").json()["low_cost_weight_defaults"], DEFAULT_WEIGHTS)
-        self.assertEqual(self.client.post("/api/jobs/low-cost", json={"mode": "rate"}, headers=self.headers).status_code, 400)
-
-    def test_best_source_settings_validation(self):
-        config = self.client.get("/api/config").json()
-        self.assertEqual((config["best_source_enabled"], config["best_source_name"], config["best_source_check_minutes"],
-                          config["best_source_keep_top"], config["best_source_retry_minutes"]), (False, "最优源站 OpenAI", 10, 10, 1))
-        for value in ({"best_source_check_minutes": 0}, {"best_source_check_minutes": 1441}, {"best_source_keep_top": 0},
-                      {"best_source_keep_top": 101}, {"best_source_retry_minutes": 0}, {"best_source_enabled": "yes"},
-                      {"best_source_name": " "}, {"best_source_name": "最低价 OpenAI"}):
-            self.assertEqual(self.client.put("/api/config", json=value, headers=self.headers).status_code, 400, value)
-        response = self.client.put("/api/config", json={"best_source_name": " 源站优选 ", "best_source_keep_top": 5},
-                                   headers=self.headers)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["best_source_name"], "源站优选")
+        self.assertEqual(document["config"]["stable_groups"], saved)
+        overview = self.client.get("/api/overview").json()
+        self.assertEqual([(row["key"], row["label"]) for row in overview["stable_groups"]],
+                         [("best_source:deepseek", "最优源站 DeepSeek"), ("low_cost:openai", "最低价 OpenAI")])
+        self.assertEqual(overview["low_cost_weight_defaults"], DEFAULT_WEIGHTS)
+        self.assertEqual(overview["stable_defaults"]["low_cost"]["weights"], DEFAULT_WEIGHTS)
+        self.assertEqual(self.post("/jobs/low-cost", {"mode": "rate"}).status_code, 400)
+        self.assertEqual(self.post("/jobs/best-source", {"platform": "gemini"}).status_code, 400)
 
     def test_best_source_job_schedule_and_overview(self):
-        self.service.save_config({"best_source_enabled": True, "best_source_check_minutes": 7})
+        self.rules(new_rule("best_source", "openai", enabled=True, check_minutes=7), new_rule("low_cost", "openai"))
         job = self.job("/jobs/best-source")
         self.assertEqual(job["status"], "success", job)
         self.assertEqual((job["result"]["upstream_id"], job["result"]["provider_rank"]), (7, 1))
-        overview = self.client.get("/api/overview").json()
-        self.assertEqual(overview["best_source"]["status"], "active")
-        self.assertAlmostEqual(overview["best_source_schedule"]["next_rank"] - time.time(), 7 * 60, delta=5)
-        self.assertEqual(overview["stats"]["active"], 1)
+        self.assertEqual((job["result"]["platform"], job["result"]["label"]), ("openai", "最优源站 OpenAI"))
+        entry = self.stable("best_source:openai")
+        self.assertEqual(entry["status"]["status"], "active")
+        self.assertAlmostEqual(entry["schedule"]["next_rank"] - time.time(), 7 * 60, delta=5)
+        self.assertEqual(self.client.get("/api/overview").json()["stats"]["active"], 1)
         when = datetime.now(timezone.utc)
-        self.service.store.put("best_source_schedule", {"next_rank": 0})
-        self.service.store.put("low_cost_schedule", {"next_rank": when.timestamp() + 3600, "next_health": when.timestamp() + 3600})
+        self.service.store.put("best_source:openai_schedule", {"next_rank": 0})
         with patch.object(self.service, "submit", return_value="mock-job") as submit:
             self.service.tick(when)
-            submit.assert_called_once_with("best_source", {"mode": "ranking"})
-        self.assertEqual(self.service.store.get("best_source_schedule")["next_rank"], when.timestamp() + 60)
+            submit.assert_called_once_with("best_source", {"mode": "ranking", "platform": "openai"})
+        self.assertEqual(self.service.store.get("best_source:openai_schedule")["next_rank"], when.timestamp() + 60)
 
-    def test_best_source_disabled_after_openai_is_deselected(self):
-        self.service.save_config({"best_source_enabled": True})
-        self.job("/jobs/best-source")
-        self.service.save_config({"sync_platforms": ["gemini"]})
-        self.assertLessEqual(self.service.store.get("best_source_schedule")["next_rank"], time.time())
+    def test_rules_on_several_platforms_get_their_own_checks(self):
+        self.sites.fake.groups[1]["platform"] = "deepseek"
+        self.sites.fake.healthy_group_ids = {7, 8}
+        self.rules(new_rule("best_source", "openai", enabled=True), new_rule("best_source", "deepseek", enabled=True))
+        openai = self.job("/jobs/best-source")
+        deepseek = self.job("/jobs/best-source", {"platform": "deepseek"})
+        self.assertEqual((openai["result"]["upstream_id"], deepseek["result"]["upstream_id"]), (7, 8))
+        self.assertNotEqual(openai["result"]["local_group_id"], deepseek["result"]["local_group_id"])
+        self.assertIn("开始检测最优源站 DeepSeek 分组", [row["message"] for row in self.service.store.logs()])
+        sync = self.job("/jobs/sync")
+        self.assertEqual(set(sync["result"]["stable"]), {"best_source:openai", "best_source:deepseek"})
+
+    def test_removed_rule_stops_its_group_then_is_forgotten(self):
+        self.rules(new_rule("best_source", "openai", enabled=True))
+        first = self.job("/jobs/best-source")
+        self.rules()
+        self.assertEqual(self.service.store.get("stable_retired"), ["best_source:openai"])
+        self.assertLessEqual(self.service.store.get("best_source:openai_schedule")["next_rank"], time.time())
+        self.assertEqual(self.client.get("/api/overview").json()["stable_groups"], [])
+        self.assertEqual(self.post("/jobs/best-source").status_code, 400)
         with patch.object(self.service, "submit", return_value="mock-job") as submit:
             self.service.tick(datetime.now(timezone.utc))
-            submit.assert_any_call("best_source", {"mode": "ranking"})
+            submit.assert_any_call("best_source", {"mode": "ranking", "platform": "openai"})
+        stopped = await_job(self.service, self.service.submit("best_source", {"mode": "ranking", "platform": "openai"}))
+        self.assertEqual((stopped["status"], stopped["result"]["status"]), ("success", "inactive"))
+        group = next(row for row in self.sites.fake.local_groups if row["id"] == first["result"]["local_group_id"])
+        self.assertEqual(group["status"], "inactive")
+        self.assertEqual(self.service.store.get("stable_retired"), [])
+        self.assertIsNone(self.service.store.get("best_source:openai"))
+        # Re-adding the rule reuses the same local group and upstream Key.
+        self.rules(new_rule("best_source", "openai", enabled=True))
+        again = self.job("/jobs/best-source")
+        self.assertEqual(again["result"]["local_group_id"], first["result"]["local_group_id"])
+        self.assertEqual(len(self.sites.fake.keys), 1)
 
-    def test_obsolete_low_cost_settings_are_removed_on_startup(self):
+    def test_legacy_settings_migrate_to_platform_limits_and_rules(self):
         config = self.service.store.get("config")
-        config.update(low_cost_rank_hours=3, low_cost_rate_check_enabled=True, low_cost_rate_rise_percent=20)
-        config.pop("low_cost_score_minutes")
+        for key in ("sync_platform_limits", "stable_groups"):
+            config.pop(key)
+        config.update(sync_platforms=["openai", "gemini"], sync_top_n=5, sync_top_scope="per_platform",
+                      low_cost_enabled=True, low_cost_name="便宜", low_cost_top_n=8, low_cost_weight_price=60,
+                      low_cost_exclude_keywords=["测试"], low_cost_rank_hours=3, best_source_keep_top=4)
         self.service.store.put("config", config)
+        self.service.store.put("low_cost", {"status": "active", "local_group_id": 5})
+        self.service.store.put("low_cost_schedule", {"next_rank": 123})
         self.service.close()
         self.service = Service(self.root / "data", start_scheduler=False)
         saved = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))["config"]
-        self.assertNotIn("low_cost_rank_hours", saved)
-        self.assertNotIn("low_cost_rate_check_enabled", saved)
-        self.assertEqual(saved["low_cost_score_minutes"], 10)
+        self.assertFalse([key for key in saved if key.startswith(("low_cost_", "best_source_", "sync_top", "sync_platforms"))])
+        self.assertEqual(saved["sync_platform_limits"], {"openai": 5, "gemini": 5})
+        low, best = saved["stable_groups"]
+        self.assertEqual(low, new_rule("low_cost", "openai", enabled=True, name="便宜", top_n=8, exclude_keywords=["测试"],
+                                       weights={**DEFAULT_WEIGHTS, "price": 60}))
+        self.assertEqual(best, new_rule("best_source", "openai", keep_top=4))
+        self.assertEqual(self.service.store.get("low_cost:openai"), {"status": "active", "local_group_id": 5})
+        self.assertEqual(self.service.store.get("low_cost:openai_schedule"), {"next_rank": 123})
+        self.assertIsNone(self.service.store.get("low_cost"))
 
     def test_low_cost_job_reports_scores_for_candidates(self):
-        self.service.save_config({"low_cost_enabled": True})
+        self.rules(new_rule("low_cost", "openai", enabled=True))
         job = self.job("/jobs/low-cost")
         self.assertEqual(job["status"], "success", job)
         result = job["result"]
@@ -499,73 +528,72 @@ class WebTests(unittest.TestCase):
         self.assertEqual([row["score_rank"] for row in scored], list(range(1, len(scored) + 1)))
 
     def test_low_cost_job_and_independent_schedules(self):
-        self.service.save_config({"low_cost_enabled": True, "low_cost_score_minutes": 120, "low_cost_health_minutes": 3})
+        self.rules(new_rule("low_cost", "openai", enabled=True, score_minutes=120, health_minutes=3))
         job = self.job("/jobs/low-cost")
         self.assertEqual(job["status"], "success", job)
         self.assertEqual(job["result"]["upstream_id"], 7)
-        overview = self.client.get("/api/overview").json()
-        schedule = overview["low_cost_schedule"]
-        self.assertAlmostEqual(schedule["next_rank"] - schedule["next_health"], 7200 - 180, delta=1)
-        self.assertEqual(overview["low_cost"]["status"], "active")
+        entry = self.stable("low_cost:openai")
+        self.assertAlmostEqual(entry["schedule"]["next_rank"] - entry["schedule"]["next_health"], 7200 - 180, delta=1)
+        self.assertEqual(entry["status"]["status"], "active")
         when = datetime.now(timezone.utc)
-        self.service.store.put("low_cost_schedule", {"next_rank": when.timestamp() + 7200, "next_health": 0})
+        self.service.store.put("low_cost:openai_schedule", {"next_rank": when.timestamp() + 7200, "next_health": 0})
         with patch.object(self.service, "submit", return_value="mock-job") as submit:
             self.service.tick(when)
-            submit.assert_called_once_with("low_cost", {"mode": "health"})
+            submit.assert_called_once_with("low_cost", {"mode": "health", "platform": "openai"})
         self.assertFalse(self.sites.fake.user_mutations)
 
     def test_existing_settings_migrate_and_keep_retained_key_mapping(self):
         self.job("/jobs/sync")
         previous = self.service.config().state_file.read_bytes()
         config = self.service.store.get("config")
-        for field in ("sync_platforms", "sync_top_n", "sync_top_scope", "low_cost_enabled", "low_cost_score_minutes",
-                      "low_cost_exclude_keywords"):
+        for field in ("sync_platform_limits", "stable_groups"):
             config.pop(field)
         self.service.store.put("config", config)
         self.service.close()
         self.service = Service(self.root / "data", start_scheduler=False)
-        self.assertEqual(self.service.public_config()["sync_platforms"], ["openai"])
-        self.assertEqual(self.service.public_config()["low_cost_exclude_keywords"], [])
+        self.assertEqual(self.service.public_config()["sync_platform_limits"], {"openai": 0})
+        self.assertEqual([rule["enabled"] for rule in self.service.public_config()["stable_groups"]], [False, False])
         self.assertEqual(self.service.config().state_file.read_bytes(), previous)
         self.assertEqual(len(self.sites.fake.keys), 1)
 
     def test_low_cost_all_intervals_persist_to_file_and_reschedule(self):
-        self.service.save_config({"low_cost_enabled": True})
+        self.rules(new_rule("low_cost", "openai", enabled=True))
         self.job("/jobs/low-cost")
-        patch_value = {"low_cost_score_minutes": 180, "low_cost_health_minutes": 7, "low_cost_retry_minutes": 4}
-        response = self.client.put("/api/config", json=patch_value, headers=self.headers)
+        rule = new_rule("low_cost", "openai", enabled=True, score_minutes=180, health_minutes=7, retry_minutes=4)
+        response = self.client.put("/api/config", json={"stable_groups": [rule]}, headers=self.headers)
         self.assertEqual(response.status_code, 200)
         document = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))
-        for field, value in patch_value.items():
-            self.assertEqual(document["config"][field], value)
-        schedule = self.service.store.get("low_cost_schedule")
+        self.assertEqual(document["config"]["stable_groups"], [rule])
+        schedule = self.service.store.get("low_cost:openai_schedule")
         self.assertLessEqual(schedule["next_rank"], time.time())
         self.assertLessEqual(schedule["next_health"], time.time())
         self.job("/jobs/low-cost")
-        schedule = self.service.store.get("low_cost_schedule")
+        schedule = self.service.store.get("low_cost:openai_schedule")
         self.assertAlmostEqual(schedule["next_rank"] - schedule["next_health"], 3 * 3600 - 7 * 60, delta=1)
         for value in (0, True, 1441):
-            self.assertEqual(self.client.put("/api/config", json={"low_cost_retry_minutes": value}, headers=self.headers).status_code, 400)
+            response = self.client.put("/api/config", json={"stable_groups": [{**rule, "retry_minutes": value}]}, headers=self.headers)
+            self.assertEqual(response.status_code, 400)
 
     def test_low_cost_pending_key_and_failed_reads_use_configured_retry(self):
-        self.service.save_config({"low_cost_enabled": True, "low_cost_score_minutes": 180,
-                                  "low_cost_health_minutes": 7, "low_cost_retry_minutes": 4})
+        self.rules(new_rule("low_cost", "openai", enabled=True, score_minutes=180, health_minutes=7, retry_minutes=4))
         self.sites.fake.hourly_key_limit = True
         job = self.job("/jobs/low-cost")
         self.assertEqual(job["result"]["pending"], 1)
-        schedule = self.service.store.get("low_cost_schedule")
+        schedule = self.service.store.get("low_cost:openai_schedule")
         self.assertAlmostEqual(schedule["next_rank"] - time.time(), 4 * 60, delta=2)
         self.assertAlmostEqual(schedule["next_health"] - time.time(), 4 * 60, delta=2)
         when = datetime.now(timezone.utc)
-        self.service.store.put("low_cost_schedule", {"next_rank": 0, "next_health": 0})
+        self.service.store.put("low_cost:openai_schedule", {"next_rank": 0, "next_health": 0})
         with patch.object(self.service, "submit", return_value="mock-job"):
             self.service.tick(when)
-        schedule = self.service.store.get("low_cost_schedule")
+        schedule = self.service.store.get("low_cost:openai_schedule")
         self.assertEqual(schedule["next_rank"], when.timestamp() + 4 * 60)
         self.assertEqual(schedule["next_health"], when.timestamp() + 4 * 60)
 
     def test_interval_changes_during_detection_are_used_for_the_next_schedule(self):
-        self.service.save_config({"low_cost_enabled": True})
+        rule = new_rule("low_cost", "openai", enabled=True)
+        other_rule = new_rule("best_source", "deepseek", enabled=True)
+        self.rules(rule, other_rule)
         entered, release = threading.Event(), threading.Event()
         original = LowCostSelector.reconcile
 
@@ -578,14 +606,18 @@ class WebTests(unittest.TestCase):
             job_id = self.service.submit("low_cost")
             self.assertTrue(entered.wait(3))
             try:
-                self.service.save_config({"low_cost_score_minutes": 180, "low_cost_health_minutes": 7,
-                                          "low_cost_retry_minutes": 4})
+                with self.assertRaises(SyncError):
+                    self.service.submit("low_cost", {"platform": "openai"})
+                other = self.service.submit("best_source", {"platform": "deepseek"})
+                with self.assertRaises(SyncError):
+                    self.rules({**rule, "top_n": 5}, other_rule)
+                self.rules({**rule, "score_minutes": 180, "health_minutes": 7, "retry_minutes": 4}, other_rule)
             finally:
                 release.set()
             self.assertEqual(await_job(self.service, job_id)["status"], "success")
-        schedule = self.service.store.get("low_cost_schedule")
+            await_job(self.service, other)
+        schedule = self.service.store.get("low_cost:openai_schedule")
         self.assertAlmostEqual(schedule["next_rank"] - schedule["next_health"], 3 * 3600 - 7 * 60, delta=1)
-
 
 if __name__ == "__main__":
     unittest.main()
