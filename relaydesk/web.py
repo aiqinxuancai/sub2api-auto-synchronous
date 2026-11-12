@@ -187,12 +187,12 @@ def create_app(directory=None, *, service=None, start_scheduler=True):
         return {"items": manager.store.get("users", []), "updated": manager.store.get("users_updated")}
 
     @app.get("/api/jobs")
-    def jobs(manager=Depends(current)):
-        return {"items": manager.store.jobs(100)}
+    def jobs(before: float | None = None, limit: int = 100, manager=Depends(current)):
+        return {"items": manager.store.jobs(max(1, min(limit, 200)), before)}
 
     @app.get("/api/jobs/{job_id}")
     def job(job_id: str, manager=Depends(current)):
-        found = next((item for item in manager.store.jobs(200) if item["id"] == job_id), None)
+        found = manager.store.job(job_id)
         if not found:
             raise HTTPException(404, "任务不存在")
         return found

@@ -113,7 +113,7 @@ class LocalSites:
 def await_job(service, job_id, timeout=12):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        job = next((job for job in service.store.jobs(200) if job["id"] == job_id), None)
+        job = service.store.job(job_id)
         if job and job["status"] not in {"queued", "running"}:
             return job
         time.sleep(0.02)
@@ -146,6 +146,22 @@ class WebTests(unittest.TestCase):
         response = self.post(path, body)
         self.assertEqual(response.status_code, 200, response.text)
         return await_job(self.service, response.json()["job_id"])
+
+    def test_job_history_pages_back_beyond_the_polled_page(self):
+        store = self.service.store
+        ids = []
+        for index in range(5):
+            job_id, _ = store.create_job("connect", {"index": index})
+            with store.connect() as connection:
+                connection.execute("UPDATE jobs SET status='success', created=? WHERE id=?", (1000 + index, job_id))
+            ids.append(job_id)
+        page = lambda query: [item["id"] for item in self.client.get("/api/jobs?" + query).json()["items"]]
+        self.assertEqual(page("before=1005&limit=2"), [ids[4], ids[3]])
+        self.assertEqual(page("before=1003&limit=2"), [ids[2], ids[1]])
+        self.assertEqual(page("before=1001&limit=2"), [ids[0]])
+        self.assertEqual(len(page("limit=100000")), len(page("limit=200")))
+        self.assertEqual(self.client.get(f"/api/jobs/{ids[0]}").json()["id"], ids[0])
+        self.assertEqual(self.client.get("/api/jobs/missing").status_code, 404)
 
     def test_authentication_csrf_origin_and_logout(self):
         with TestClient(create_app(service=self.service)) as other:

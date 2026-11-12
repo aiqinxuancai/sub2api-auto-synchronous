@@ -452,6 +452,7 @@ tbody tr:hover { background: var(--surface-2); }
 .job-list { max-height: 360px; overflow: auto; border-top: 1px solid var(--line); }
 .job-row { display: flex; align-items: center; gap: 14px; width: 100%; padding: 11px 22px; border: 0; border-bottom: 1px solid var(--line); background: transparent; text-align: left; font-size: 14px; transition: background .1s; }
 .job-row:last-child { border-bottom: 0; }
+.job-more { display: flex; justify-content: center; width: 100%; padding: 12px 22px; }
 .job-row:hover { background: var(--surface-2); }
 .job-row > .icon { width: 16px; height: 16px; color: var(--subtle); }
 .job-name { min-width: 120px; font-weight: 550; }

@@ -414,6 +414,12 @@ class SyncIntegrationTests(unittest.TestCase):
         self.assertEqual(report["concurrency_fixed"], 0)
         self.assertEqual(self.fake.mutations(), [])
 
+    def test_logs_name_the_upstream_group(self):
+        with self.assertLogs("sub2api-sync", "INFO") as logs:
+            self.cycle()
+        self.assertIn("「Alpha」#7：分组已启用，账号已新建，模型 1", "\n".join(logs.output))
+        self.assertNotIn("group=", "\n".join(logs.output))
+
     def test_every_sync_fixes_concurrency_of_disabled_accounts_but_not_unrelated_ones(self):
         self.cycle()
         owned = self.fake.accounts[0]

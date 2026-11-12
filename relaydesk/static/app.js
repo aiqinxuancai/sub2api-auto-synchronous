@@ -14,7 +14,9 @@ const state = { csrf: '', setup: false, ready: false, page: 'overview', overview
   groups: [], users: [], jobs: [], logs: [], quota: null, receipts: [], selected: new Set(),
   groupFilter: 'all', groupPage: 0, userPage: 0, settingsDirty: false, quotaDirty: false,
   watched: new Map(), knownJobs: new Map(), batchMode: 'paste', currentGroup: null,
-  currentJob: null, batchKey: null, resetRule: null, polling: false, offline: false };
+  currentJob: null, batchKey: null, resetRule: null, polling: false, offline: false,
+  jobHistory: new Map(), jobsExhausted: false, loadingJobs: false };
+const JOB_PAGE = 100;
 const pages = { overview: '同步概览', settings: '连接配置', members: '成员与额度', logs: '运行日志' };
 const kinds = { sync: '同步可用分组', preview: '同步预览', connect: '连接测试', refresh_users: '刷新成员',
   batch_users: '批量创建成员', quota_reset: '余额重置', low_cost: '最低价渠道检测', best_source: '最优源站检测' };
@@ -71,7 +73,15 @@ function warningText(value) {
   if (typeof value === 'string') return value;
   const text = value?.warning || value?.error || '请查看运行日志';
   if (text.includes('API_KEY_CREATE_RATE_LIMITED')) return '上游暂时限制新增 Key，待同步分组将在后续周期继续处理。';
-  return (value?.upstream_id ? `分组 #${value.upstream_id}：` : '') + text;
+  const label = subject(value); return (label ? label + '：' : '') + text;
+}
+// Who a job warning or failure is about: member, upstream group (with name when known) or account.
+function subject(value) {
+  if (value?.email) return value.email;
+  if (value?.user_id) return '成员 #' + value.user_id;
+  if (value?.upstream_id) return value.name ? `「${value.name}」#${value.upstream_id}` : `分组 #${value.upstream_id}`;
+  if (value?.account_id) return '账号 #' + value.account_id;
+  return '';
 }
 function empty(message, hint, name = 'grid') {
   const node = el('div', 'empty-state'); node.append(icon(name), el('strong', '', message));
@@ -137,6 +147,7 @@ async function initialize() {
   Object.assign(state, { overview, groups: groups.items, users: users.items, quota: quota.rule,
     receipts: quota.receipts, jobs: jobs.items, ready: true });
   for (const job of state.jobs) state.knownJobs.set(job.id, job.status);
+  state.jobHistory = new Map(); state.jobsExhausted = jobs.items.length < JOB_PAGE; rememberJobs(jobs.items);
   state.selected = new Set(state.quota.user_ids);
   $('#auth-screen').hidden = true; $('#workspace').hidden = false;
   $('#today').textContent = new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' });
@@ -659,14 +670,30 @@ function summary(job) {
   if (job.kind === 'quota_reset') return `已重置 ${result.succeeded.length} 位 · $${number(result.amount)}${result.failed ? ` · ${result.failed} 位待处理` : ''}`;
   return statuses[job.status];
 }
+// Polling only returns the newest page; history keeps every job seen so older pages stay contiguous.
+function rememberJobs(items) { for (const job of items) state.jobHistory.set(job.id, job); }
+function jobHistory() { return [...state.jobHistory.values()].sort((a, b) => b.created - a.created); }
+async function loadOlderJobs() {
+  const oldest = jobHistory().at(-1); if (!oldest || state.loadingJobs) return;
+  state.loadingJobs = true; renderJobs();
+  try {
+    const data = await api(`/jobs?before=${oldest.created}&limit=${JOB_PAGE}`);
+    rememberJobs(data.items); if (data.items.length < JOB_PAGE) state.jobsExhausted = true;
+  } finally { state.loadingJobs = false; renderJobs(); }
+}
 function renderJobs() {
   const root = $('#job-list'); root.replaceChildren();
-  if (!state.jobs.length) root.append(empty('还没有执行任务', '首次操作后，执行记录会显示在这里。', 'log'));
-  for (const job of state.jobs.slice(0, 30)) {
+  const history = jobHistory();
+  if (!history.length) root.append(empty('还没有执行任务', '首次操作后，执行记录会显示在这里。', 'log'));
+  for (const job of history) {
     const row = el('button', 'job-row'); row.type = 'button';
     row.append(icon(job.kind.includes('users') ? 'users' : job.kind === 'connect' ? 'link' : 'refresh'), el('span', 'job-name', kinds[job.kind]), el('span', 'job-summary', summary(job)), el('span', 'job-date', date(job.created)), badge(job.status));
     row.onclick = () => openJob(job); root.append(row);
   }
+  if (history.length && !state.jobsExhausted) {
+    const more = el('button', 'text-button job-more', state.loadingJobs ? '加载中…' : `已显示 ${history.length} 条 · 加载更早的记录`);
+    more.type = 'button'; more.disabled = state.loadingJobs; more.onclick = () => action(loadOlderJobs); root.append(more);
+  } else if (history.length > JOB_PAGE) root.append(el('p', 'empty-inline', `已显示全部 ${history.length} 条记录`));
   renderActivity(); renderBatchHistory(); renderRunning(); renderReceipts();
 }
 function openJob(job) {
@@ -696,7 +723,7 @@ function renderJobDetail(job) {
     const failures = result.failures || result.errors || [];
     if (failures.length) {
       detail.append(el('h3', '', '需要关注的结果'));
-      const list = el('ul'); for (const failure of failures) list.append(el('li', '', `${failure.email || (failure.user_id ? '成员 #' + failure.user_id : '分组 #' + failure.upstream_id)}：${failure.error}`)); detail.append(list);
+      const list = el('ul'); for (const failure of failures) list.append(el('li', '', (subject(failure) ? subject(failure) + '：' : '') + failure.error)); detail.append(list);
     }
     if (job.kind === 'batch_users') {
       for (const item of result.created || []) detail.append(el('p', '', '已创建 · ' + item.email));
@@ -739,7 +766,7 @@ async function refresh() {
   if (!state.ready || state.polling) return; state.polling = true;
   try {
     const [overview, jobs] = await Promise.all([api('/overview'), api('/jobs')]);
-    state.overview = overview; state.jobs = jobs.items;
+    state.overview = overview; state.jobs = jobs.items; rememberJobs(jobs.items);
     let reloadGroups = false, reloadUsers = false, reloadQuota = false;
     for (const job of state.jobs) {
       const terminal = !['queued', 'running'].includes(job.status);

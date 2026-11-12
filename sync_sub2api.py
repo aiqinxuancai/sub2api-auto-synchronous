@@ -536,6 +536,16 @@ def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
     return selected, excluded
 
 
+def group_label(group_id: int, name: Any = None) -> str:
+    """Readable log label for an upstream group or local resource: 「S064-Plus-3」#470."""
+    return f"「{name}」#{group_id}" if name else f"#{group_id}"
+
+
+GROUP_RESULTS = {"created": "已新建", "updated": "已更新", "unchanged": "无变化", "enabled": "已启用"}
+ACCOUNT_RESULTS = {"created": "已新建", "updated": "已更新", "unchanged": "无变化", "rebound": "已重新绑定",
+                   "disabled": "未同步"}
+
+
 def bound_group_ids(account: dict[str, Any]) -> list[int]:
     """Sub2API omits `group_ids`/`groups` entirely when an account has no binding."""
     ids = account.get("group_ids")
@@ -682,14 +692,14 @@ class Synchronizer:
             try:
                 self.target.request("PUT", f"/admin/accounts/{account['id']}", {"concurrency": wanted})
             except SyncError as error:
-                report["errors"].append({"account_id": account["id"],
-                                         "error": f"账号 {account['id']} 并发修正失败：{error}"})
+                report["errors"].append({"account_id": account["id"], "error":
+                                         f"账号 {group_label(account['id'], account.get('name'))} 并发修正失败：{error}"})
                 continue
             account["concurrency"] = wanted
             self.concurrency_fixed += 1
             report["actions"].append({"action": "concurrency", "account_id": account["id"],
                                       "from": current, "to": wanted})
-            LOG.info("账号 %d 并发 %s → %d", account["id"], current, wanted)
+            LOG.info("账号 %s 并发 %s → %d", group_label(account["id"], account.get("name")), current, wanted)
 
     def _audit_bindings(self, local_groups: list[dict[str, Any]], accounts: list[dict[str, Any]],
                         report: dict[str, Any]) -> None:
@@ -703,15 +713,15 @@ class Synchronizer:
             try:
                 self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
             except SyncError as error:
-                report["errors"].append({"upstream_id": upstream_id, "error": str(error)})
+                report["errors"].append({"upstream_id": upstream_id, "name": group.get("name"), "error": str(error)})
                 continue
             mapping = self.state.data["groups"].setdefault(str(upstream_id), {})
             mapping.update({"last_status": "inactive", "last_reason": "no_bound_account"})
             self.state.save()
             report["actions"].append({"upstream_id": upstream_id, "action": "disable", "reason": "no_bound_account"})
-            report["errors"].append({"upstream_id": upstream_id,
-                                     "error": f"本地分组 {group['id']} 没有可用的绑定账号，已停用，下轮自动修复"})
-            LOG.warning("group=%d: 本地分组 %d 没有可用的绑定账号，已停用，下轮自动修复", upstream_id, group["id"])
+            message = f"本地分组 {group_label(group['id'], group.get('name'))} 没有可用的绑定账号，已停用，下轮自动修复"
+            report["errors"].append({"upstream_id": upstream_id, "name": group.get("name"), "error": message})
+            LOG.warning("%s", message)
 
     def _sync_account(self, selected: SelectedGroup, local_group_id: int,
                       account: dict[str, Any] | None, key: dict[str, Any]) -> tuple[int, str]:
@@ -862,7 +872,8 @@ class Synchronizer:
                     mapping.update({"last_status": "inactive", "last_reason": reason})
                     self.state.save()
                 except SyncError as error:
-                    report["errors"].append({"upstream_id": group_id, "error": str(error)})
+                    report["errors"].append({"upstream_id": group_id, "name": (group or account or {}).get("name"),
+                                             "error": str(error)})
         sorted_groups = {}
         for index, selected_group in enumerate(selected):
             group_id = selected_group.source["id"]
@@ -916,22 +927,27 @@ class Synchronizer:
                                 "source_rate": selected_group.source_rate})
                 sorted_groups[group["id"]] = group
                 self.state.save()
-                LOG.info("group=%d 分组=%s 账号=%s 模型=%d", group_id,
-                         action["group_result"], action.get("account_result", "disabled"),
-                         len(selected_group.models))
+                group_result = action["group_result"]
+                account_result = action.get("account_result", "disabled")
+                LOG.info("%s：分组%s，账号%s，模型 %d", group_label(group_id, selected_group.source.get("name")),
+                         GROUP_RESULTS.get(group_result, group_result),
+                         ACCOUNT_RESULTS.get(account_result, account_result), len(selected_group.models))
             except SyncError as error:
                 try:
                     self._hold_without_account(group, account)
                 except SyncError as hold_error:
-                    report["errors"].append({"upstream_id": group_id, "error": str(hold_error)})
+                    report["errors"].append({"upstream_id": group_id, "name": selected_group.source.get("name"),
+                                             "error": str(hold_error)})
                 if isinstance(error, APIError) and error.code == "API_KEY_CREATE_RATE_LIMITED":
                     self.key_creation_blocked = True
                     report["pending"] += 1
-                    report["warnings"].append({"upstream_id": group_id, "warning": str(error)})
+                    report["warnings"].append({"upstream_id": group_id, "name": selected_group.source.get("name"),
+                                               "warning": str(error)})
                     LOG.warning("上游 Key 创建额度用尽，剩余新增留待后续周期；继续更新已有分组")
                     continue
-                report["errors"].append({"upstream_id": group_id, "error": str(error)})
-                LOG.error("group=%d: %s", group_id, error)
+                report["errors"].append({"upstream_id": group_id, "name": selected_group.source.get("name"),
+                                         "error": str(error)})
+                LOG.error("%s：%s", group_label(group_id, selected_group.source.get("name")), error)
                 if isinstance(error, APIError) and error.status in {401, 403, 429}:
                     report["pending"] += len(selected) - index
                     break

@@ -146,14 +146,23 @@ class Store:
                 (status, status, time.time(), None if status in {"queued", "running"} else time.time(),
                  json.dumps(result, ensure_ascii=False) if result is not None else None, error, job_id))
 
-    def jobs(self, limit=30):
+    JOB_COLUMNS = ("SELECT id,kind,status,created,started,finished,result,error, "
+                   "EXISTS(SELECT 1 FROM artifacts WHERE artifacts.job_id=jobs.id) AS export_available FROM jobs ")
+
+    def jobs(self, limit=30, before=None):
+        """Newest first; `before` pages back through older history by creation time."""
+        query, params = self.JOB_COLUMNS, []
+        if before is not None:
+            query += "WHERE created<? "
+            params.append(before)
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT id,kind,status,created,started,finished,result,error, "
-                "EXISTS(SELECT 1 FROM artifacts WHERE artifacts.job_id=jobs.id) AS export_available "
-                "FROM jobs ORDER BY created DESC LIMIT ?",
-                (limit,)).fetchall()
+            rows = connection.execute(query + "ORDER BY created DESC LIMIT ?", (*params, limit)).fetchall()
         return [dict(row, result=json.loads(row["result"]) if row["result"] else None) for row in rows]
+
+    def job(self, job_id):
+        with self.connect() as connection:
+            row = connection.execute(self.JOB_COLUMNS + "WHERE id=?", (job_id,)).fetchone()
+        return dict(row, result=json.loads(row["result"]) if row["result"] else None) if row else None
 
     def log(self, level, message, job_id=None):
         with self.connect() as connection:

@@ -12,7 +12,8 @@ import logging
 from dataclasses import dataclass, field, replace
 
 from provider_ranking import detector_passed, ranked_items
-from sync_sub2api import APIError, SyncError, bound_group_ids, changed_fields, ensure_account_binding, select_usable
+from sync_sub2api import (APIError, SyncError, bound_group_ids, changed_fields, ensure_account_binding, group_label,
+                          select_usable)
 
 from .scoring import DEFAULT_WEIGHTS, WEIGHT_SETTINGS, score_candidates
 
@@ -157,7 +158,8 @@ class StableGroupSelector:
                     engine.key_creation_blocked = previous_blocked
                 if key is not None:
                     selected, group_id, keep, decision = alternative, alternative.source["id"], False, "fallback_existing_key"
-                    LOG.warning("%s：Key 创建受限，改用已保留 Key 的可用候选 #%d", self.label, group_id)
+                    LOG.warning("%s：Key 创建受限，改用已保留 Key 的可用候选 %s", self.label,
+                                group_label(group_id, alternative.source.get("name")))
                     break
         if key is None:
             if group_id == current_id:
@@ -165,7 +167,8 @@ class StableGroupSelector:
             result["pending"] = 1
             self.mapping["reason"] = "pending_upstream_key"
             self.state.save()
-            LOG.warning("%s：候选 #%d 等待上游 Key，保留已有 Key，后续自动重试", self.label, group_id)
+            LOG.warning("%s：候选 %s 等待上游 Key，保留已有 Key，后续自动重试", self.label,
+                        group_label(group_id, selected.source.get("name")))
             return self._result(result, "pending")
         self.mapping.setdefault("keys", {})[str(group_id)] = key["id"]
         self.state.save()
@@ -221,8 +224,9 @@ class StableGroupSelector:
                             key_digest=digest, status="active", reason="healthy_models", provider_rank=selected.provider_rank,
                             **plan.details.get(group_id, {}))
         self.state.save()
-        LOG.info("%s：%s #%d，大厅排名 %d%s，适用倍率 %g，模型 %d", self.label, "保持" if keep else "选用",
-                 group_id, selected.provider_rank, plan.notes.get(group_id, ""), selected.source_rate, len(selected.models))
+        LOG.info("%s：%s %s，大厅排名 %d%s，适用倍率 %g，模型 %d", self.label, "保持" if keep else "选用",
+                 group_label(group_id, selected.source.get("name")), selected.provider_rank,
+                 plan.notes.get(group_id, ""), selected.source_rate, len(selected.models))
         return self._result(result, decision)
 
     def _result(self, result, decision):
@@ -283,8 +287,8 @@ class LowCostSelector(StableGroupSelector):
             keep, switch_reason = False, "outside_top_ten"
         elif current_rank > 1 + tolerance:
             keep, switch_reason = False, "rank_dropped"
-            LOG.info("%s：当前渠道 #%d 综合评分降至第 %d 名，超过允许下降的 %d 名，重新选择",
-                     self.label, current_id, current_rank, tolerance)
+            LOG.info("%s：当前渠道 %s 综合评分降至第 %d 名，超过允许下降的 %d 名，重新选择",
+                     self.label, group_label(current_id, context.name(current_id)), current_rank, tolerance)
         else:
             keep, switch_reason = True, ""
         details = {group_id: {"score": detail["score"], "score_rank": score_rank[group_id]} for group_id, detail in scores.items()}
@@ -320,7 +324,8 @@ class BestSourceSelector(StableGroupSelector):
             keep, switch_reason = False, "source_unavailable"
         elif rank_of.get(current_id, keep_top + 1) > keep_top:
             keep, switch_reason = False, "outside_top_ten"
-            LOG.info("%s：当前渠道 #%d 跌出默认排序前 %d 名，重新选择", self.label, current_id, keep_top)
+            LOG.info("%s：当前渠道 %s 跌出默认排序前 %d 名，重新选择", self.label,
+                     group_label(current_id, context.name(current_id)), keep_top)
         else:
             keep, switch_reason = True, ""
         return Plan(pool, candidates, current, keep, switch_reason, keep_top,
