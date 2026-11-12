@@ -15,8 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, DEFAULT_PRICE_SYNC_PLATFORMS, APIError, Client, Config, State,
-                          SyncError, Synchronizer, account_concurrency, platform_limits, state_lock)
+from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, DEFAULT_PRICE_SYNC_PLATFORMS, PROGRESS, APIError, Client,
+                          Config, State, SyncError, Synchronizer, account_concurrency, platform_limits, state_lock)
 from provider_ranking import PLATFORMS
 
 from .storage import Store
@@ -120,7 +120,14 @@ class JobLogHandler(logging.Handler):
 
     def emit(self, record):
         job_id = getattr(self.service.context, "job_id", None)
-        if job_id:
+        if not job_id:
+            return
+        if record.name == PROGRESS.name:
+            if hasattr(record, "progress"):
+                self.service.progress(**record.progress)
+            else:
+                self.service.track(job_id, request=record.request, request_at=time.time())
+        else:
             self.service.log(record.levelname, record.getMessage(), job_id)
 
 
@@ -133,12 +140,14 @@ class Service:
         self.pending_lock = threading.Lock()
         self.pending_kinds = set()
         self.busy = set()
+        self.live = {}  # job id -> what the running job is doing now (step, item counts, pending request)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="flow-worker")
         self.stop = threading.Event()
         self.scheduler_thread = None
         self.handler = JobLogHandler(self)
         logging.getLogger("sub2api-sync").addHandler(self.handler)
         logging.getLogger("sub2api-sync").setLevel(logging.INFO)
+        PROGRESS.addHandler(self.handler)
         recoverable = self.store.recover_jobs()
         if self.store.get("config") is None:
             self._initialize_config()
@@ -181,6 +190,7 @@ class Service:
             self.scheduler_thread.join(timeout=3)
         self.pool.shutdown(wait=True, cancel_futures=True)
         logging.getLogger("sub2api-sync").removeHandler(self.handler)
+        PROGRESS.removeHandler(self.handler)
 
     def _initialize_config(self):
         self.store.put("config", default_settings())
@@ -321,6 +331,31 @@ class Service:
     def log(self, level, message, job_id=None):
         self.store.log(level, self.redact(message), job_id or getattr(self.context, "job_id", None))
 
+    def track(self, job_id, **fields):
+        # Replace rather than mutate: request threads read entries without a lock.
+        self.live[job_id] = {**self.live.get(job_id, {}), **fields, "updated": time.time()}
+
+    def progress(self, step, done=None, total=None):
+        """The running job's current step; a new step clears the previous step's request."""
+        job_id = getattr(self.context, "job_id", None)
+        if job_id:
+            self.track(job_id, step=self.redact(step), done=done, total=total, request=None)
+
+    def jobs(self, limit=30, before=None):
+        return [self._with_progress(job) for job in self.store.jobs(limit, before)]
+
+    def job(self, job_id):
+        return self._with_progress(self.store.job(job_id))
+
+    def _with_progress(self, job):
+        live = self.live.get(job["id"]) if job and job["status"] == "running" else None
+        if live:
+            request = live.get("request")
+            job["progress"] = {"step": live.get("step"), "done": live.get("done"), "total": live.get("total"),
+                               "request": self.redact(request) if request else None,
+                               "request_seconds": int(time.time() - live["request_at"]) if request else None}
+        return job
+
     def submit(self, kind, payload=None, request_key=None):
         if kind not in {"sync", "preview", "connect", "refresh_users", "batch_users", "quota_reset", *SELECTORS}:
             raise SyncError("未知任务类型")
@@ -392,6 +427,7 @@ class Service:
                 self.pending_kinds.discard(self._slot(kind, payload))
                 self.busy.discard(job_id)
                 self.store.set_job(job_id, status, result=result, error=job_error)
+            self.live.pop(job_id, None)
             self.context.job_id = None
             self.context.settings = None
             self.context.secrets = []
@@ -440,6 +476,7 @@ class Service:
             for key, rule in self._stable_entries(values).items():
                 created = state.data.get(key) or (rule["platform"] == "openai" and state.data.get(rule["strategy"]))
                 if not preview and (rule["enabled"] or created):
+                    self.progress(f"检测优选分组「{rule_label(rule)}」")
                     fallback = CADENCE[rule["strategy"]][-1][0]  # the lightest check when nothing is due
                     stable[key] = self._reconcile_stable(key, engine, values, snapshot, self._due_stable_mode(key) or fallback)
             report = engine.cycle(snapshot=snapshot)
@@ -542,6 +579,7 @@ class Service:
 
     def _refresh_users(self):
         config, client = self._target()
+        self.progress("读取成员列表")
         with state_lock(config.state_file):
             users = client.list_all("/admin/users")
         clean = [{key: user.get(key) for key in ("id", "email", "username", "role", "balance",
@@ -581,9 +619,11 @@ class Service:
         config, client = self._target()
         created, skipped, failed, credentials = [], [], [], []
         with state_lock(config.state_file):
+            self.progress("读取已有成员")
             existing = {user["email"].lower() for user in client.list_all("/admin/users")}
-            for row in payload["users"]:
+            for index, row in enumerate(payload["users"], 1):
                 email = row["email"]
+                self.progress(f"创建成员 {email}", index, len(payload["users"]))
                 if email in existing:
                     skipped.append(email)
                     continue
@@ -653,10 +693,12 @@ class Service:
         succeeded, skipped, failures = [], [], []
         retryable = False
         with state_lock(config.state_file):
+            self.progress("读取成员列表")
             users = client.list_all("/admin/users")
             selected = quota_targets(rule, users)
-            for user in selected:
+            for index, user in enumerate(selected, 1):
                 user_id = user["id"]
+                self.progress(f"重置成员余额 {user.get('email') or user_id}", index, len(selected))
                 if not self.store.claim_receipt(period, user_id, job_id):
                     skipped.append(user_id)
                     continue

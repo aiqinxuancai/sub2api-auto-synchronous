@@ -20,7 +20,7 @@ from relaydesk.low_cost import LowCostSelector
 from relaydesk.rules import new_rule
 from relaydesk.scoring import DEFAULT_WEIGHTS
 from relaydesk.web import create_app
-from sync_sub2api import SyncError
+from sync_sub2api import SyncError, progress, progress_request
 from test_sync import FakeSites
 
 
@@ -163,6 +163,37 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(page("limit=100000")), len(page("limit=200")))
         self.assertEqual(self.client.get(f"/api/jobs/{ids[0]}").json()["id"], ids[0])
         self.assertEqual(self.client.get("/api/jobs/missing").status_code, 404)
+
+    def test_running_job_shows_its_step_and_pending_request(self):
+        store = self.service.store
+        job_id, _ = store.create_job("sync", {})
+        store.set_job(job_id, "running")
+        self.service.context.job_id = job_id  # as on the worker thread
+        try:
+            progress("同步分组 「Alpha」#7", 2, 5)
+            progress_request("target", "PUT", "/admin/groups/3?page=1")
+        finally:
+            self.service.context.job_id = None
+        shown = self.client.get(f"/api/jobs/{job_id}").json()["progress"]
+        self.assertEqual({key: shown[key] for key in ("step", "done", "total", "request")},
+                         {"step": "同步分组 「Alpha」#7", "done": 2, "total": 5, "request": "本地 PUT /admin/groups/3"})
+        listed = next(item for item in self.client.get("/api/jobs").json()["items"] if item["id"] == job_id)
+        self.assertEqual(listed["progress"]["step"], shown["step"])
+        self.assertEqual(store.logs(job_id=job_id), [])  # progress is not written to the log
+        store.set_job(job_id, "success")
+        self.assertNotIn("progress", self.client.get(f"/api/jobs/{job_id}").json())
+
+    def test_job_logs_list_only_that_jobs_lines(self):
+        other = self.job("/jobs/refresh-users")
+        sync = self.job("/jobs/sync")
+        lines = self.client.get(f"/api/jobs/{sync['id']}/logs").json()["items"]
+        self.assertEqual(lines[0]["message"], "开始同步可用分组")
+        self.assertIn(lines[-1]["message"], {"任务完成", "任务部分完成，请查看明细"})
+        self.assertEqual({line["job_id"] for line in lines}, {sync["id"]})
+        newer = self.client.get(f"/api/jobs/{sync['id']}/logs?after={lines[-2]['id']}").json()["items"]
+        self.assertEqual(newer, lines[-1:])
+        self.assertTrue(self.client.get(f"/api/jobs/{other['id']}/logs").json()["items"])
+        self.assertEqual(self.client.get("/api/jobs/missing/logs").status_code, 404)
 
     def test_authentication_csrf_origin_and_logout(self):
         with TestClient(create_app(service=self.service)) as other:

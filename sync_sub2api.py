@@ -29,11 +29,27 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from provider_ranking import PLATFORMS, rank_metadata, ranked_items, visible
+from provider_ranking import PLATFORMS, finite, rank_metadata, ranked_items, visible
 
 LOG = logging.getLogger("sub2api-sync")
+# What the running job is doing right now. Never printed or stored as log lines;
+# the Web worker shows it as live job status, the CLI ignores it.
+PROGRESS = logging.getLogger("sub2api-sync.progress")
+PROGRESS.propagate = False
 USER_AGENT = "sub2api-sync/0.1"
 MAX_BODY_BYTES = 32 * 1024 * 1024
+ROLE_LABELS = {"upstream": "上游", "target": "本地"}
+
+
+def progress(step: str, done: int | None = None, total: int | None = None) -> None:
+    """Report the current step; `done`/`total` count items such as groups or members."""
+    PROGRESS.info("%s", step, extra={"progress": {"step": step, "done": done, "total": total}})
+
+
+def progress_request(role: str = "", method: str = "", path: str = "") -> None:
+    """Report the HTTP request being waited on; no arguments means it finished."""
+    request = f"{ROLE_LABELS.get(role, role)} {method} {path.split('?')[0]}" if method else None
+    PROGRESS.info("%s", request or "", extra={"request": request})
 
 
 class SyncError(Exception):
@@ -320,6 +336,7 @@ class Client:
         if delay > 0:
             time.sleep(min(delay, 60))
         self.last_request_at = time.monotonic()
+        progress_request(self.role, method, path)
         try:
             with self.opener.open(request, timeout=self.config.timeout) as response:
                 raw = response.read(MAX_BODY_BYTES + 1)
@@ -351,6 +368,8 @@ class Client:
             raise APIError(error.code, method, path, code, retry_after) from None
         except (OSError, urllib.error.URLError):
             raise SyncError(f"{self.role}: {method} {path.split('?')[0]} 连接失败或超时") from None
+        finally:
+            progress_request()
         try:
             data = json.loads(raw)
         except (ValueError, UnicodeError):
@@ -470,6 +489,49 @@ class SelectedGroup:
     sync_order: int = 0
     provider_score: float = 0
     prices: dict[str, Any] = field(default_factory=dict)  # model -> hall price (USD per 1M tokens)
+    stats: dict[str, float | None] = field(default_factory=dict)  # hall_stats()
+
+
+STATS_PREFIX = "供应商大厅 1h："
+
+
+def hall_stats(item: dict[str, Any]) -> dict[str, float | None]:
+    """Latency, cache hit rate, TPS and success rate as the provider hall shows them; None when not measured."""
+    def measured(value: Any, low: float = 0, high: float = math.inf) -> float | None:
+        return float(value) if finite(value) and low <= value <= high else None
+
+    cache = item.get("range_cache" if item.get("summary_range") else "runtime_cache_1h") or {}
+    latency = measured(item.get("user_latency_ms"))
+    return {"latency_ms": latency or None,  # 0 ms means "no requests", not instant
+            "cache_hit_rate": measured(cache.get("cache_hit_rate"), 0, 1)
+            if cache.get("ready") is True and not cache.get("stale") else None,
+            "tps": measured(item.get("summary_tps")),
+            "success_rate": measured((item.get("success_rates") or {}).get("1h"), 0, 1)}
+
+
+def stats_text(stats: dict[str, float | None]) -> str:
+    """`延迟 3.2s · 缓存 81% · TPS 38 · 成功率 99%`; empty when the hall measured nothing."""
+    if not any(value is not None for value in stats.values()):
+        return ""
+
+    def show(key: str, render) -> str:
+        return "—" if stats.get(key) is None else render(stats[key])
+
+    percent = lambda value: f"{value * 100:.0f}%"
+    return " · ".join((f"延迟 {show('latency_ms', lambda value: f'{value / 1000:.1f}s')}",
+                       f"缓存 {show('cache_hit_rate', percent)}", f"TPS {show('tps', lambda value: f'{value:.0f}')}",
+                       f"成功率 {show('success_rate', percent)}"))
+
+
+def with_stats(description: str, stats: dict[str, float | None]) -> str:
+    """Append the hall measurements as the description's last line."""
+    text = stats_text(stats)
+    return f"{description}\n{STATS_PREFIX}{text}" if text else description
+
+
+def without_stats(description: Any) -> str:
+    lines = str(description or "").split("\n")
+    return "\n".join(lines[:-1] if lines[-1].startswith(STATS_PREFIX) else lines)
 
 
 def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
@@ -550,7 +612,7 @@ def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
                   if isinstance(entry, dict) and isinstance(entry.get("model"), str)}
         selected.append(SelectedGroup(group, sorted(models), float(source_rate),
                                       scaled_rate(source_rate, config.rate_factor), **ranks.get(group_id, {}),
-                                      prices=prices))
+                                      prices=prices, stats=hall_stats(item)))
     selected.sort(key=lambda group: group.sync_order)
     return selected, excluded
 
@@ -560,7 +622,8 @@ def group_label(group_id: int, name: Any = None) -> str:
     return f"「{name}」#{group_id}" if name else f"#{group_id}"
 
 
-GROUP_RESULTS = {"created": "已新建", "updated": "已更新", "unchanged": "无变化", "enabled": "已启用"}
+GROUP_RESULTS = {"created": "已新建", "updated": "已更新", "unchanged": "无变化", "enabled": "已启用",
+                 "refreshed": "指标已刷新"}
 ACCOUNT_RESULTS = {"created": "已新建", "updated": "已更新", "unchanged": "无变化", "rebound": "已重新绑定",
                    "disabled": "未同步"}
 
@@ -647,6 +710,12 @@ def changed_fields(current: dict[str, Any], desired: dict[str, Any]) -> dict[str
     return {key: value for key, value in desired.items() if not same(key, value)}
 
 
+def stats_only(current: dict[str, Any], patch: dict[str, Any]) -> bool:
+    """The patch only refreshes the hall measurements at the end of the description."""
+    return (set(patch) == {"description"}
+            and without_stats(current.get("description")) == without_stats(patch["description"]))
+
+
 class Synchronizer:
     def __init__(self, config: Config, state: State):
         self.config, self.state = config, state
@@ -676,7 +745,7 @@ class Synchronizer:
         if group.get("description"):
             description += "\n" + str(group["description"])
         desired = {
-            "name": self.name(group), "description": description,
+            "name": self.name(group), "description": with_stats(description, selected.stats),
             "platform": group["platform"], "rate_multiplier": selected.local_rate,
             "status": "active", "model_allowlist": {"enabled": True, "models": selected.models},
         }
@@ -854,11 +923,13 @@ class Synchronizer:
         return account["id"], action
 
     def load_snapshot(self):
+        progress("读取上游分组与专属倍率")
         groups = self.upstream.request("GET", "/groups/available")
         rates = self.upstream.request("GET", "/groups/rates")
         if not isinstance(groups, list) or (rates is not None and not isinstance(rates, dict)):
             raise SyncError("上游分组或专属倍率接口结构无效，本轮停止")
         separator = "&" if "?" in self.config.providers_path else "?"
+        progress("读取供应商大厅数据")
         providers = self.upstream.request(
             "GET", self.config.providers_path + separator + "range=1h&include_media=false",
             site_path=True)
@@ -893,6 +964,7 @@ class Synchronizer:
                                      "models": group.models,
                                      "provider_rank": group.provider_rank, "sync_order": group.sync_order,
                                      "provider_score": group.provider_score,
+                                     "stats": stats_text(group.stats),
                                      "marker": self.marker(group.source["id"])})
         source_by_id = {group["id"]: group for group in groups}
         for excluded_group in report["excluded"]:
@@ -906,6 +978,7 @@ class Synchronizer:
             return report
         if not self.config.has_target_auth():
             raise SyncError("请先在 Web 连接配置中保存管理员访问密钥，或本地管理员邮箱和密码")
+        progress("读取本地分组与账号")
         local_groups = self.target.list_all("/admin/groups")
         local_accounts = self.target.list_all("/admin/accounts") if self.config.sync_accounts else []
         managed_groups = self._discover(local_groups, "description", "local_group_id")
@@ -938,6 +1011,7 @@ class Synchronizer:
                 report["actions"].append(action)
                 if self.config.dry_run:
                     continue
+                progress(f"停用不再可用的分组 {group_label(group_id, (group or account or {}).get('name'))}")
                 try:
                     # Mark the group inactive first: stops all user keys in the group.
                     if group and group.get("status") != "inactive":
@@ -971,6 +1045,7 @@ class Synchronizer:
             report["actions"].append(action)
             if self.config.dry_run:
                 continue
+            progress(f"同步分组 {group_label(group_id, selected_group.source.get('name'))}", index + 1, len(selected))
             try:
                 key = self._get_key(group_id) if self.config.sync_accounts else None
                 if self.config.sync_accounts and key is None:
@@ -992,7 +1067,8 @@ class Synchronizer:
                     group_patch.pop("status", None)
                     if group_patch:
                         self.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
-                    action["group_result"] = "updated" if group_patch else "unchanged"
+                    action["group_result"] = ("refreshed" if stats_only(group, group_patch)
+                                              else "updated" if group_patch else "unchanged")
                 if repriced:
                     self.pricing_updated += 1
                     action["pricing_result"] = "updated"
@@ -1048,12 +1124,14 @@ class Synchronizer:
                 if current is not None and current.get("sort_order") != rank:
                     updates.append({"id": local_id, "sort_order": rank})
             if updates:
+                progress(f"更新 {len(updates)} 个分组的排序")
                 try:
                     self.target.request("PUT", "/admin/groups/sort-order", {"updates": updates})
                     report["sort_updated"] = len(updates)
                 except SyncError as error:
                     report["errors"].append({"error": f"分组排序更新失败：{error}"})
         if not self.config.dry_run and self.config.sync_accounts:
+            progress("检查账号并发与分组绑定")
             try:
                 local_groups = self.target.list_all("/admin/groups")
                 accounts = self.target.list_all("/admin/accounts")

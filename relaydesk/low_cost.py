@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 
 from provider_ranking import detector_passed, ranked_items
 from sync_sub2api import (APIError, SyncError, bound_group_ids, changed_fields, ensure_account_binding, group_label,
-                          select_usable)
+                          progress, select_usable, with_stats)
 
 from .rules import rule_key, rule_label
 from .scoring import score_candidates
@@ -112,6 +112,7 @@ class StableGroupSelector:
         engine, config = self.engine, self.engine.config
         groups, rates, providers = snapshot
         now = engine.upstream.server_time
+        progress(f"{self.label}：评估候选渠道")
         # Validate freshness/completeness even when the selector is being disabled.
         candidate_config = replace(config, sync_limits={self.platform: 0})
         usable, excluded = select_usable(groups, rates, providers, candidate_config, now)
@@ -121,6 +122,7 @@ class StableGroupSelector:
         plan = self.plan(context, mode, current_id)
         result = {"checked_at": now.isoformat(), "mode": mode, "candidates": plan.candidates, "errors": [], "pending": 0,
                   "top_n": plan.top_n, **plan.extras}
+        progress(f"{self.label}：读取本地分组与账号")
         local_groups = engine.target.list_all("/admin/groups")
         accounts = engine.target.list_all("/admin/accounts")
         group = self._discover(local_groups, "description", "local_group_id")
@@ -144,6 +146,8 @@ class StableGroupSelector:
         if not keep and group:
             self._disable(group, account, switch_reason or "updating")
         group_id = selected.source["id"]
+        progress(f"{self.label}：{'保持' if keep else '选用' if current_id is None else '切换到'} "
+                 f"{group_label(group_id, selected.source.get('name'))}")
         try:
             key = engine._get_key(group_id)
         except APIError as error:
@@ -179,7 +183,8 @@ class StableGroupSelector:
         self.state.save()
         name = display_name(self.rule["name"], selected.source.get("name"))
         desired = engine.group_payload(selected, self.mapping.get("model_pricing_synced", False))
-        desired.update(name=name, description=self.marker + f"\n上游分组 #{group_id} · {selected.source['name']}")
+        desired.update(name=name, description=with_stats(self.marker + f"\n上游分组 #{group_id} · {selected.source['name']}",
+                                                         selected.stats))
         desired.pop("status")
         credentials = {"base_url": config.upstream_base, "api_key": key["key"],
                        "model_mapping": {model: model for model in selected.models}}

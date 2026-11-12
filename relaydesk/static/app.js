@@ -16,7 +16,7 @@ const state = { csrf: '', setup: false, ready: false, page: 'overview', overview
   watched: new Map(), knownJobs: new Map(), batchMode: 'paste', currentGroup: null,
   currentJob: null, batchKey: null, resetRule: null, polling: false, offline: false,
   jobHistory: new Map(), jobsExhausted: false, loadingJobs: false, openCandidates: new Set(),
-  openRules: new Set(), stableNameEdited: false };
+  openRules: new Set(), stableNameEdited: false, jobLog: { id: null, items: [] } };
 const JOB_PAGE = 100;
 const pages = { overview: '同步概览', settings: '连接配置', members: '成员与额度', logs: '运行日志' };
 const kinds = { sync: '同步可用分组', preview: '同步预览', connect: '连接测试', refresh_users: '刷新成员',
@@ -332,7 +332,9 @@ function renderRunning() {
   const active = state.jobs.filter(job => ['queued', 'running'].includes(job.status));
   $('#active-job').hidden = !active.length;
   if (active.length) {
-    $('#active-job-label').textContent = `${jobTitle(active[0])}${active[0].status === 'queued' ? '已排队' : '正在执行'}${active.length > 1 ? ` · 另有 ${active.length - 1} 项任务` : ''}`;
+    const progress = active[0].progress;
+    const step = progress?.step ? ` · ${progress.step}${progress.total ? `（${progress.done}/${progress.total}）` : ''}` : '';
+    $('#active-job-label').textContent = `${jobTitle(active[0])}${active[0].status === 'queued' ? '已排队' : '正在执行'}${step}${active.length > 1 ? ` · 另有 ${active.length - 1} 项任务` : ''}`;
     $('#active-job-detail').onclick = () => openJob(active[0]);
   }
   const syncing = active.some(job => ['sync', 'preview'].includes(job.kind));
@@ -404,6 +406,7 @@ function openGroup(group) {
   const meta = $('#group-detail-meta'); meta.replaceChildren();
   addMeta(meta, '当前状态', badge(group.status)); addMeta(meta, '平台', (group.platform || '—').toUpperCase());
   if (group.provider_rank) addMeta(meta, '大厅默认排名', `#${group.provider_rank} · 综合评分 ${number(group.provider_score, 2)}`);
+  if (group.stats) addMeta(meta, '大厅近 1 小时指标', group.stats, true);
   addMeta(meta, '上游 / 本地分组', `#${group.upstream_id} / ${group.local_group_id ? '#' + group.local_group_id : '尚未创建'}`);
   addMeta(meta, '倍率（上游 → 本地）', `${number(group.source_rate)} → ${number(group.local_rate)}`);
   addMeta(meta, '上游 Key', group.key_id ? `#${group.key_id} · 保留并复用` : '尚未创建');
@@ -923,16 +926,85 @@ function renderJobs() {
   renderActivity(); renderBatchHistory(); renderRunning(); renderReceipts();
 }
 function openJob(job) {
+  if (state.jobLog.id !== job.id) state.jobLog = { id: job.id, items: [], loaded: false, final: false, truncated: false };
   state.currentJob = job.id; renderJobDetail(job);
   if (!$('#job-dialog').open) $('#job-dialog').showModal();
+  action(async () => { await loadJobLog(job); if ($('#job-dialog').open && state.currentJob === job.id) renderJobDetail(state.jobHistory.get(job.id) || job); });
+}
+const JOB_LOG_KEEP = 1000;
+// Fetches the job's new log lines; once a finished job's lines are read nothing more can arrive.
+async function loadJobLog(job) {
+  const log = state.jobLog;
+  if (log.id !== job.id || log.final || log.loading) return;
+  const finished = !['queued', 'running'].includes(job.status);
+  log.loading = true;
+  try {
+    const data = await api(`/jobs/${job.id}/logs?after=${log.items.at(-1)?.id || 0}`);
+    if (!log.loaded && data.items.length >= data.limit) log.truncated = true;
+    log.items.push(...data.items);
+    if (log.items.length > JOB_LOG_KEEP) { log.items.splice(0, log.items.length - JOB_LOG_KEEP); log.truncated = true; }
+    log.loaded = true; log.final = finished;
+  } finally { log.loading = false; }
+}
+function duration(seconds) {
+  seconds = Math.max(0, Math.floor(seconds));
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${String(seconds % 60).padStart(2, '0')} 秒`;
+  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor(seconds % 3600 / 60)} 分`;
+}
+function sinceLabel(start) { const node = el('span', '', duration(Date.now() / 1000 - start)); node.dataset.since = start; return node; }
+function renderJobProgress(job) {
+  const box = el('div', 'job-progress');
+  if (job.status === 'queued') {
+    const ahead = state.jobs.filter(other => other.id !== job.id && ['queued', 'running'].includes(other.status) && other.created < job.created).length;
+    box.append(el('p', 'job-progress-step', ahead ? `排队中，前面还有 ${ahead} 项任务` : '排队中，即将开始'));
+    return box;
+  }
+  const progress = job.progress || {};
+  const step = el('p', 'job-progress-step'); step.append(el('span', 'spinner'), el('span', '', progress.step || '正在执行'));
+  box.append(step);
+  if (progress.total) {
+    const bar = el('div', 'job-progress-bar'), fill = el('span');
+    fill.style.width = `${Math.min(100, progress.done / progress.total * 100)}%`; bar.append(fill);
+    const row = el('div', 'job-progress-count'); row.append(bar, el('span', '', `${progress.done} / ${progress.total}`)); box.append(row);
+  }
+  if (progress.request) box.append(el('p', 'job-progress-request', `等待响应 · ${progress.request}${progress.request_seconds >= 2 ? ` · 已等待 ${duration(progress.request_seconds)}` : ''}`));
+  return box;
+}
+function renderJobLog(job) {
+  const section = el('div', 'job-log-section'), log = state.jobLog;
+  const heading = el('div', 'job-log-heading');
+  heading.append(el('h3', '', '执行过程'), el('span', 'muted', log.truncated ? `仅显示最近 ${log.items.length} 条` : log.items.length ? `${log.items.length} 条` : ''));
+  section.append(heading);
+  const list = el('div', 'job-log');
+  if (log.id !== job.id || !log.loaded) list.append(el('p', 'empty-inline', '正在读取执行日志…'));
+  else {
+    list.dataset.loaded = '1';
+    if (!log.items.length) list.append(el('p', 'empty-inline', ['queued', 'running'].includes(job.status) ? '等待第一条日志…' : '没有执行日志，较早任务的日志可能已被清理'));
+  }
+  for (const line of log.id === job.id ? log.items : []) {
+    const row = el('div', 'log-line');
+    row.append(el('span', 'log-time', new Date(line.at * 1000).toLocaleTimeString('zh-CN', { hour12: false })), el('span', 'log-level ' + line.level, line.level), el('span', 'log-message', line.message));
+    list.append(row);
+  }
+  section.append(list); return section;
 }
 function renderJobDetail(job) {
   $('#job-detail-title').textContent = jobTitle(job);
-  const root = $('#job-detail-content'); root.replaceChildren();
+  const root = $('#job-detail-content');
+  // Keep the reader's place in the log; follow new lines only when already at the bottom.
+  const previous = $('.job-log', root), running = ['queued', 'running'].includes(job.status);
+  const follow = previous?.dataset.loaded ? previous.scrollHeight - previous.scrollTop - previous.clientHeight < 24 : running;
+  const scrollTop = previous?.scrollTop || 0;
+  root.replaceChildren();
   const meta = el('dl', 'detail-meta');
   addMeta(meta, '执行状态', badge(job.status)); addMeta(meta, '提交时间', date(job.created, null, true));
-  addMeta(meta, '开始时间', date(job.started)); addMeta(meta, '完成时间', date(job.finished)); root.append(meta);
-  const detail = el('div', 'job-detail-lines'); detail.append(el('p', '', summary(job)));
+  addMeta(meta, '开始时间', date(job.started));
+  if (job.status === 'running' && job.started) addMeta(meta, '已运行', sinceLabel(job.started));
+  else addMeta(meta, '完成时间', job.finished && job.started ? `${date(job.finished)} · 用时 ${duration(job.finished - job.started)}` : date(job.finished));
+  root.append(meta);
+  if (running) root.append(renderJobProgress(job));
+  const detail = el('div', 'job-detail-lines'); if (!running) detail.append(el('p', '', summary(job)));
   if (job.error) detail.append(el('p', 'notice error', job.error));
   const result = job.result;
   if (result) {
@@ -959,6 +1031,8 @@ function renderJobDetail(job) {
   }
   root.append(detail);
   if (job.export_available && !result?.export_available) detail.append(credentialLink(job));
+  root.append(renderJobLog(job));
+  const list = $('.job-log', root); list.scrollTop = follow ? list.scrollHeight : scrollTop;
 }
 function renderReceipts() {
   const root = $('#receipt-list'); root.replaceChildren();
@@ -1008,8 +1082,9 @@ async function refresh() {
         toast(`${jobTitle(job)}${job.status === 'success' ? '完成' : job.status === 'partial' ? '部分完成' : '失败'}：${summary(job)}`, job.status !== 'success');
         if (callback) callback(job);
       }
-      if ($('#job-dialog').open && state.currentJob === job.id) renderJobDetail(job);
     }
+    const shown = $('#job-dialog').open && state.jobHistory.get(state.currentJob);
+    if (shown) { await loadJobLog(shown); renderJobDetail(shown); }
     if (reloadGroups) { state.groups = (await api('/groups')).items; renderGroups(); }
     if (reloadUsers) { const data = await api('/users'); state.users = data.items; renderUsers(data.updated); }
     if (reloadQuota || state.page === 'logs') {
@@ -1029,7 +1104,10 @@ $$('dialog').forEach(dialog => dialog.addEventListener('click', event => {
 }));
 window.addEventListener('beforeunload', event => { if (state.ready && (state.settingsDirty || state.quotaDirty)) { event.preventDefault(); event.returnValue = ''; } });
 setInterval(() => { if (!document.hidden) refresh(); }, 4000);
-setInterval(renderCountdown, 1000);
+setInterval(() => {
+  renderCountdown();
+  for (const node of $$('[data-since]')) node.textContent = duration(Date.now() / 1000 - Number(node.dataset.since));
+}, 1000);
 (async () => {
   try {
     const auth = await api('/auth/status');

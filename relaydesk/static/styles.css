@@ -229,7 +229,8 @@ textarea { resize: vertical; line-height: 1.6; }
 .hint .icon { width: 16px; height: 16px; margin-top: 3px; color: var(--subtle); }
 
 .active-job { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; padding: 10px 14px; border: 1px solid color-mix(in srgb, var(--info) 25%, transparent); border-radius: var(--radius); background: var(--info-soft); color: var(--info); font-size: 13px; font-weight: 500; }
-.active-job .text-button { margin-left: auto; color: var(--info); }
+.active-job .text-button { margin-left: auto; color: var(--info); flex-shrink: 0; }
+#active-job-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid color-mix(in srgb, currentColor 30%, transparent); border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; flex-shrink: 0; }
 
 /* ---------- Overview ---------- */
@@ -562,6 +563,19 @@ tbody tr:hover { background: var(--surface-2); }
 .job-detail-lines ul { max-height: 230px; margin: 0; padding-left: 18px; overflow: auto; font-size: 13px; }
 .job-detail-lines li { margin: 4px 0; }
 .job-detail-lines .button { margin-top: 8px; }
+.job-progress { margin: 0 0 16px; padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--line)); border-radius: var(--radius); background: var(--accent-soft); }
+.job-progress-step { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 550; color: var(--accent-soft-ink); overflow-wrap: anywhere; }
+.job-progress-count { display: flex; align-items: center; gap: 12px; margin-top: 10px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.job-progress-bar { flex: 1; height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
+.job-progress-bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .3s ease; }
+.job-progress-request { margin-top: 8px; font: 12px/1.6 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.job-log-section { margin-top: 18px; }
+.job-log-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.job-log-heading .muted { font-size: 12px; }
+.job-log { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-2); }
+.job-log .log-line { grid-template-columns: 64px 58px minmax(0, 1fr); gap: 10px; padding: 4px 12px; font-size: 12px; }
+.job-log .log-line:last-child { border-bottom: 0; }
+.job-log .empty-inline { padding: 16px; }
 
 /* ---------- Toasts ---------- */
 .toasts { position: fixed; top: 16px; left: 50%; transform: translateX(-50%); width: max-content; z-index: 100; display: flex; flex-direction: column; gap: 8px; max-width: min(400px, calc(100vw - 32px)); pointer-events: none; }

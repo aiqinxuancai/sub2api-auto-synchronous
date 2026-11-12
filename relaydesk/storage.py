@@ -170,8 +170,12 @@ class Store:
                                (time.time(), level, message, job_id))
             connection.execute("DELETE FROM logs WHERE id < (SELECT MAX(id)-10000 FROM logs)")
 
-    def logs(self, after=0, level=None, search="", limit=300):
+    def logs(self, after=0, level=None, search="", limit=300, job_id=None):
+        """The newest `limit` matching lines after id `after`, oldest first."""
         query, params = "SELECT * FROM logs WHERE id>?", [after]
+        if job_id:
+            query += " AND job_id=?"
+            params.append(job_id)
         if level:
             query += " AND level=?"
             params.append(level)

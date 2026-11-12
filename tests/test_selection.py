@@ -522,6 +522,18 @@ class BestSourceTests(unittest.TestCase):
         self.check()
         self.assertFalse(group["model_pricing"])
 
+    def test_preferred_group_description_shows_hall_stats_without_stopping_routing(self):
+        first = self.check()
+        group = next(row for row in self.fake.local_groups if row["id"] == first["local_group_id"])
+        self.assertNotIn("供应商大厅", group["description"])  # nothing measured yet
+        self.fake.provider_overrides.setdefault(first["upstream_id"], {}).update(user_latency_ms=2500, summary_tps=41)
+        self.fake.requests.clear()
+        again = self.check()
+        self.assertEqual(again["decision"], "retained")
+        self.assertTrue(group["description"].endswith("\n供应商大厅 1h：延迟 2.5s · 缓存 — · TPS 41 · 成功率 —"))
+        self.assertFalse(any(body.get("status") == "inactive" or body.get("schedulable") is False
+                             for _, _, body in self.fake.mutations()))
+
     def test_disabled_selector_stops_routing(self):
         self.check()
         off = self.check(best_source_enabled=False)

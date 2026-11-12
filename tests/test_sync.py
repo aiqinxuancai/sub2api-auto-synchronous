@@ -2,6 +2,7 @@
 
 import copy
 import json
+import logging
 import tempfile
 import threading
 import unittest
@@ -12,8 +13,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
-from sync_sub2api import (APIError, Client, Config, State, SyncError, Synchronizer, changed_fields,
-                          hall_model_pricing, select_usable)
+from sync_sub2api import (PROGRESS, APIError, Client, Config, State, SyncError, Synchronizer, changed_fields,
+                          hall_model_pricing, hall_stats, select_usable, stats_text)
 
 
 def iso_after(seconds=300):
@@ -499,6 +500,63 @@ class SyncIntegrationTests(unittest.TestCase):
         FakeSites.store_pricing(stored, {"platform": "deepseek"})
         self.assertEqual(changed_fields(stored, {"model_pricing": cards}), {})
         self.assertEqual(changed_fields({"model_pricing": None}, {"model_pricing": []}), {})
+
+    def test_hall_stats_end_the_description_and_refresh_in_place(self):
+        hall = {"summary_range": "1h", "user_latency_ms": 3240.7, "summary_tps": 37.6,
+                "success_rates": {"1h": 0.9912}, "range_cache": {"ready": True, "stale": False, "cache_hit_rate": 0.8096}}
+        self.fake.groups[0]["description"] = "upstream note"
+        self.fake.provider_overrides[7] = hall
+        report = self.cycle()
+        group = self.synced_group()
+        marker = report["groups"][0]["marker"]
+        self.assertEqual(group["description"],
+                         f"{marker}\nupstream note\n供应商大厅 1h：延迟 3.2s · 缓存 81% · TPS 38 · 成功率 99%")
+        self.assertEqual(report["groups"][0]["stats"], "延迟 3.2s · 缓存 81% · TPS 38 · 成功率 99%")
+        self.fake.requests.clear()
+        self.cycle()
+        self.assertEqual(self.fake.mutations(), [])  # unchanged measurements are not rewritten
+        hall["user_latency_ms"] = 12100
+        hall["range_cache"]["stale"] = True
+        self.fake.requests.clear()
+        with self.assertLogs("sub2api-sync", "INFO") as logs:
+            report = self.cycle()
+        writes = [body for method, path, body in self.fake.mutations() if path.endswith(f"/admin/groups/{group['id']}")]
+        self.assertEqual(writes, [{"description": f"{marker}\nupstream note\n供应商大厅 1h：延迟 12.1s · 缓存 — · TPS 38 · 成功率 99%"}])
+        self.assertEqual(next(action for action in report["actions"] if action.get("upstream_id") == 7)["group_result"], "refreshed")
+        self.assertIn("分组指标已刷新", "\n".join(logs.output))
+        # A hall without measurements leaves only the marker and the upstream description.
+        self.fake.provider_overrides.clear()
+        self.cycle()
+        self.assertEqual(group["description"], f"{marker}\nupstream note")
+
+    def test_hall_stats_ignore_missing_and_invalid_measurements(self):
+        self.assertEqual(stats_text(hall_stats({})), "")
+        stats = hall_stats({"user_latency_ms": 0, "summary_tps": True, "success_rates": {"1h": 1.5},
+                            "runtime_cache_1h": {"ready": True, "cache_hit_rate": 0.5},
+                            "range_cache": {"ready": True, "cache_hit_rate": 0.9}})  # range data needs summary_range
+        self.assertEqual(stats, {"latency_ms": None, "cache_hit_rate": 0.5, "tps": None, "success_rate": None})
+        self.assertEqual(stats_text(stats), "延迟 — · 缓存 50% · TPS — · 成功率 —")
+        self.assertIsNone(hall_stats({"runtime_cache_1h": {"cache_hit_rate": 0.5}})["cache_hit_rate"])  # not ready
+
+    def test_progress_reports_each_group_and_the_pending_request(self):
+        events = []
+
+        class Recorder(logging.Handler):
+            def emit(self, record):
+                events.append(getattr(record, "progress", None) or {"request": record.request})
+
+        recorder = Recorder()
+        PROGRESS.addHandler(recorder)
+        PROGRESS.setLevel(logging.INFO)
+        self.addCleanup(PROGRESS.setLevel, logging.NOTSET)
+        self.addCleanup(PROGRESS.removeHandler, recorder)
+        self.cycle()
+        steps = [event for event in events if "step" in event]
+        self.assertEqual(steps[0]["step"], "读取上游分组与专属倍率")
+        self.assertIn({"step": "同步分组 「Alpha」#7", "done": 1, "total": 1}, steps)
+        requests = [event["request"] for event in events if "request" in event]
+        self.assertIn("本地 POST /admin/groups", requests)
+        self.assertIsNone(requests[-1])  # cleared once the response arrived
 
     def test_every_sync_fixes_concurrency_of_disabled_accounts_but_not_unrelated_ones(self):
         self.cycle()

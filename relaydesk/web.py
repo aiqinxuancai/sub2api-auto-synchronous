@@ -23,6 +23,7 @@ from .service import Service
 
 COOKIE = "flow_session"
 STATIC = Path(__file__).parent / "static"
+JOB_LOG_LIMIT = 500  # newest lines of one job shown in its detail dialog
 
 
 def password_hash(password: str, salt=None):
@@ -189,14 +190,21 @@ def create_app(directory=None, *, service=None, start_scheduler=True):
 
     @app.get("/api/jobs")
     def jobs(before: float | None = None, limit: int = 100, manager=Depends(current)):
-        return {"items": manager.store.jobs(max(1, min(limit, 200)), before)}
+        return {"items": manager.jobs(max(1, min(limit, 200)), before)}
 
     @app.get("/api/jobs/{job_id}")
     def job(job_id: str, manager=Depends(current)):
-        found = manager.store.job(job_id)
+        found = manager.job(job_id)
         if not found:
             raise HTTPException(404, "任务不存在")
         return found
+
+    @app.get("/api/jobs/{job_id}/logs")
+    def job_logs(job_id: str, after: int = 0, manager=Depends(current)):
+        if not manager.store.job(job_id):
+            raise HTTPException(404, "任务不存在")
+        return {"items": manager.store.logs(max(0, after), limit=JOB_LOG_LIMIT, job_id=job_id),
+                "limit": JOB_LOG_LIMIT}
 
     @app.post("/api/jobs/connect")
     async def connect(request: Request, manager=Depends(current)):

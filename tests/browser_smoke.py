@@ -62,9 +62,31 @@ def main():
                 page.click("#preview-sync")
                 expect(page.locator("#job-dialog")).to_be_visible(timeout=15000)
                 expect(page.locator("#job-detail-content")).to_contain_text("本次为预览")
+                expect(page.locator("#job-detail-content .job-log")).to_contain_text("开始同步预览")
                 page.locator("#job-dialog [data-close]").click()
                 assert not sites.fake.keys
+                # Hold the first group creation so the running job's live status can be inspected.
+                original_handle, held = sites.fake.handle, []
+
+                def slow_handle(method, path, headers, body):
+                    if method == "POST" and path.endswith("/admin/groups") and not held:
+                        held.append(path); time.sleep(6)
+                    return original_handle(method, path, headers, body)
+
+                sites.fake.handle = slow_handle
                 page.click("#sync-now")
+                page.click("#active-job-detail")
+                running = page.locator("#job-detail-content .job-progress")
+                expect(running).to_contain_text("等待响应 · 本地 POST /admin/groups", timeout=10000)
+                expect(running).to_contain_text("同步分组")
+                expect(running).to_contain_text("1 / 10")
+                expect(page.locator("#job-detail-content .job-log")).to_contain_text("开始同步可用分组")
+                expect(page.locator("#job-detail-content")).to_contain_text("已运行")
+                page.screenshot(path=str(artifacts / "job-running.png"))
+                expect(page.locator("#job-detail-content .job-log")).to_contain_text("任务完成", timeout=20000)
+                expect(page.locator("#job-detail-content .job-progress")).to_have_count(0)
+                page.locator("#job-dialog [data-close]").click()
+                sites.fake.handle = original_handle
                 expect(page.locator("#stat-active")).to_have_text("10", timeout=15000)
                 assert len(sites.fake.keys) == 10
                 page.click('[data-page="settings"]')
