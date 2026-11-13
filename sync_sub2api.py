@@ -929,10 +929,15 @@ class Synchronizer:
         if not isinstance(groups, list) or (rates is not None and not isinstance(rates, dict)):
             raise SyncError("上游分组或专属倍率接口结构无效，本轮停止")
         separator = "&" if "?" in self.config.providers_path else "?"
+        providers_path = self.config.providers_path + separator + "range=1h&include_media=false"
         progress("读取供应商大厅数据")
-        providers = self.upstream.request(
-            "GET", self.config.providers_path + separator + "range=1h&include_media=false",
-            site_path=True)
+        providers = self.upstream.request("GET", providers_path, site_path=True)
+        if isinstance(providers, dict) and providers.get("stale") is True:
+            LOG.warning("供应商大厅返回过期快照，2 秒后重试读取一次")
+            progress("供应商大厅快照过期，等待 2 秒后重试")
+            time.sleep(2)
+            progress("重新读取供应商大厅数据（重试 1/1）")
+            providers = self.upstream.request("GET", providers_path, site_path=True)
         # Validate the entire snapshot before any caller can change routing.
         select_usable(groups, rates or {}, providers, self.config, self.upstream.server_time)
         return groups, rates or {}, providers

@@ -345,8 +345,26 @@ class LowCostTests(unittest.TestCase):
         self.check()
         self.fake.requests.clear()
         self.fake.stale = True
-        with self.assertRaises(SyncError):
-            self.check("health")
+        with patch("sync_sub2api.time.sleep") as sleep:
+            with self.assertRaises(SyncError):
+                self.check("health")
+        requests = [path for _, path, _ in self.fake.requests if path == "/up/api/v2/public/providers"]
+        self.assertEqual(len(requests), 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_stale_snapshot_retry_recovers_low_cost_check(self):
+        current = self.check()
+        self.fake.requests.clear()
+        fresh = self.fake.providers()
+        with patch.object(self.fake, "providers", side_effect=[{**fresh, "stale": True}, fresh]) as fetch:
+            with patch("sync_sub2api.time.sleep") as sleep:
+                result = self.check("health")
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["upstream_id"], current["upstream_id"])
+        self.assertEqual(result["local_group_id"], current["local_group_id"])
         self.assertEqual(self.fake.mutations(), [])
 
     def test_lowest_group_key_is_reused_by_normal_sync(self):

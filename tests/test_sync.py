@@ -307,13 +307,52 @@ class SyncIntegrationTests(unittest.TestCase):
         self.assertEqual(self.fake.mutations(), [])
         self.assertEqual(report["actions"][0]["action"], "create")
 
+    def test_fresh_provider_snapshot_is_read_once_without_retry(self):
+        with patch("sync_sub2api.time.sleep") as sleep:
+            Synchronizer(self.config, State(self.config)).load_snapshot()
+        requests = [path for _, path, _ in self.fake.requests if path == "/up/api/v2/public/providers"]
+        self.assertEqual(len(requests), 1)
+        sleep.assert_not_called()
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_stale_provider_snapshot_retries_once_and_recovers(self):
+        fresh = self.fake.providers()
+        with patch.object(self.fake, "providers", side_effect=[{**fresh, "stale": True}, fresh]) as fetch:
+            with patch("sync_sub2api.time.sleep") as sleep:
+                report = self.cycle()
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["usable_groups"], 1)
+        self.assertEqual(len(self.fake.keys), 1)
+        self.assertEqual(len(self.fake.accounts), 1)
+        self.assertEqual(len(self.fake.local_groups), 2)
+
+    def test_retried_provider_snapshot_still_requires_complete_data(self):
+        fresh = self.fake.providers()
+        with patch.object(self.fake, "providers", side_effect=[
+                {**fresh, "stale": True}, {**fresh, "total": fresh["total"] + 1}]) as fetch:
+            with patch("sync_sub2api.time.sleep") as sleep:
+                with self.assertRaisesRegex(SyncError, "快照不完整"):
+                    self.cycle()
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(self.fake.mutations(), [])
+
     def test_stale_or_partial_provider_snapshot_never_disables_existing_resources(self):
         self.cycle()
         for field in ("stale", "incomplete"):
             self.fake.requests.clear()
             setattr(self.fake, field, True)
-            with self.assertRaises(SyncError):
-                self.cycle()
+            with patch("sync_sub2api.time.sleep") as sleep:
+                with self.assertRaises(SyncError):
+                    self.cycle()
+            requests = [path for _, path, _ in self.fake.requests if path == "/up/api/v2/public/providers"]
+            self.assertEqual(len(requests), 2 if field == "stale" else 1)
+            if field == "stale":
+                sleep.assert_called_once_with(2)
+            else:
+                sleep.assert_not_called()
             self.assertEqual(self.fake.mutations(), [])
             self.assertEqual(self.fake.local_groups[-1]["status"], "active")
             setattr(self.fake, field, False)
