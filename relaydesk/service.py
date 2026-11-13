@@ -23,7 +23,7 @@ from .storage import Store
 from .usage import member_usage, usage_window
 from .configuration import SECRET_FIELDS
 from .low_cost import BestSourceSelector, LowCostSelector
-from .rules import (CADENCE, DEFAULTS, LEGACY_SETTINGS, new_rule, normalize_rules, rule_key, rule_label,
+from .rules import (CADENCE, DEFAULTS, LEGACY_SETTINGS, normalize_rules, rule_key, rule_label,
                     stable_rules, without_live_fields)
 from .scoring import DEFAULT_WEIGHTS
 
@@ -160,6 +160,12 @@ class Service:
                     if key not in OBSOLETE_SETTINGS}
         if migrated != values:
             self.store.put("config", migrated)
+        # Older releases queued removed rules for disabling; retire that work without touching routes.
+        for key in self.store.get("stable_retired", []):
+            if key not in self._rules(migrated):
+                self.store.put(key, None)
+                self.store.put(key + "_schedule", None)
+        self.store.put("stable_retired", [])
         for strategy in DEFAULTS:
             # Status and schedule of the fixed OpenAI groups move under their rule key.
             for suffix in ("", "_schedule"):
@@ -269,20 +275,19 @@ class Service:
                     raise SyncError("任务执行中，请在完成后修改连接与同步参数")
             self.store.put("config", values)
             old_rules, new_rules = self._rules(previous), self._rules(values)
-            retired = [key for key in self.store.get("stable_retired", []) if key not in new_rules]
-            # A removed rule keeps its local group until a check has stopped it.
-            retired += [key for key in old_rules if key not in new_rules and key not in retired]
+            # Removing a rule only stops management. The state file retains its IDs and Keys.
+            for key in old_rules.keys() - new_rules.keys():
+                self.store.put(key, None)
+                self.store.put(key + "_schedule", None)
             if any(previous.get(key) != values[key] for key in ("upstream_base", "upstream_email", "target_base")):
                 self.store.put("report", {})
                 self.store.put("groups", [])
                 self.store.put("users", [])
                 self.store.put("connection_upstream", None)
                 self.store.put("connection_target", None)
-                for key in {*old_rules, *new_rules, *retired}:
+                for key in {*old_rules, *new_rules}:
                     self.store.put(key, {})
                     self.store.put(key + "_schedule", {})
-                retired = []
-            self.store.put("stable_retired", retired)
             if previous["target_base"] != values["target_base"]:
                 rule = self.store.get("quota_rule")
                 rule.update(enabled=False, user_ids=[], next_run_at=None)
@@ -294,9 +299,9 @@ class Service:
             if previous["interval_minutes"] != values["interval_minutes"] or (
                     not previous["sync_enabled"] and values["sync_enabled"]):
                 self.store.put("sync_schedule", {"next_run": time.time() + values["interval_minutes"] * 60})
-            # Re-check immediately when a group's own policy or its prerequisites change, or it was removed.
+            # Re-check immediately when a configured rule or its prerequisites change.
             prerequisites = previous.get("sync_accounts") != values["sync_accounts"]
-            for key, rule in {**old_rules, **new_rules}.items():
+            for key, rule in new_rules.items():
                 if prerequisites or old_rules.get(key) != new_rules.get(key):
                     self.store.put(key + "_schedule", {entry: time.time() for _, entry, _ in CADENCE[rule["strategy"]]})
             self.log("INFO", "连接与同步设置已保存")
@@ -310,14 +315,6 @@ class Service:
     def _rules(self, values=None):
         values = values or getattr(self.context, "settings", None) or self.store.get("config")
         return {rule_key(rule): rule for rule in stable_rules(values)}
-
-    def _stable_entries(self, values=None):
-        """Configured rules plus removed ones whose local group may still need stopping (as disabled rules)."""
-        entries = self._rules(values)
-        for key in self.store.get("stable_retired", []):
-            strategy, platform = key.split(":", 1)
-            entries.setdefault(key, new_rule(strategy, platform))
-        return entries
 
     def redact(self, message):
         values = self.store.get("config", {})
@@ -474,9 +471,8 @@ class Service:
             engine = Synchronizer(config, state)
             snapshot = engine.load_snapshot()
             stable = {}
-            for key, rule in self._stable_entries(values).items():
-                created = state.data.get(key) or (rule["platform"] == "openai" and state.data.get(rule["strategy"]))
-                if not preview and (rule["enabled"] or created):
+            for key, rule in self._rules(values).items():
+                if not preview and rule["enabled"] and config.sync_accounts:
                     self.progress(f"检测优选分组「{rule_label(rule)}」")
                     fallback = CADENCE[rule["strategy"]][-1][0]  # the lightest check when nothing is due
                     stable[key] = self._reconcile_stable(key, engine, values, snapshot, self._due_stable_mode(key) or fallback)
@@ -511,28 +507,22 @@ class Service:
             return self._reconcile_stable(key, engine, values, engine.load_snapshot(), mode)
 
     def _reconcile_stable(self, key, engine, values, snapshot, mode):
-        rule = self._stable_entries(values).get(key)
+        rule = self._rules(values).get(key)
         if rule is None:
             raise SyncError("该优选分组已删除")
         selector = SELECTORS[rule["strategy"]](engine, rule)
         try:
             result = selector.reconcile(snapshot, mode=mode)
         except SyncError:
-            # Keep the previous public report, but show a stopped group after a partial write.
+            # Keep the last route report and any IDs recovered during the failed check.
             previous = self.store.get(key) or {}
             previous.update({name: value for name, value in selector.mapping.items() if name not in {"keys", "key_digest"}})
             self.store.put(key, previous)
             raise
         self.store.put(key, result)
         with self.settings_lock:
-            if key not in self._rules(self.store.get("config")) and result.get("status") != "active":
-                # A removed group has been stopped; its Keys stay in the state file for reuse.
-                self.store.put("stable_retired", [item for item in self.store.get("stable_retired", []) if item != key])
-                self.store.put(key, None)
-                self.store.put(key + "_schedule", None)
-                return result
             # Intervals can change while work is running; schedule from the latest saved values.
-            latest = self._stable_entries(self.store.get("config")).get(key, rule)
+            latest = self._rules(self.store.get("config")).get(key, rule)
             schedule = self.store.get(key + "_schedule") or {}
             now = time.time()
             for check, entry, interval in CADENCE[rule["strategy"]]:
@@ -801,10 +791,9 @@ class Service:
             self.store.put("quota_rule", rule)
             self.log("INFO", f"本月余额重置已排入任务 · {period}", job_id)
         values = self.store.get("config")
-        for key, rule in self._stable_entries(values).items():
+        for key, rule in self._rules(values).items():
             should_check = rule["enabled"] and values["sync_accounts"]
-            needs_disable = (self.store.get(key) or {}).get("status") == "active" and not should_check
-            if not (should_check or needs_disable):
+            if not should_check:
                 continue
             mode = self._due_stable_mode(key, now.timestamp())
             if not mode:
@@ -838,7 +827,7 @@ class Service:
         groups = self.store.get("groups", [])
         states = {status: sum(group["status"] == status for group in groups) for status in ("active", "inactive", "pending")}
         rules = self._rules(self.store.get("config"))
-        stable = {key: self.store.get(key) or {} for key in self._stable_entries(self.store.get("config"))}
+        stable = {key: self.store.get(key) or {} for key in rules}
         key_ids = {group["key_id"] for group in groups if group.get("key_id")}
         stable_models = 0
         for status in stable.values():
@@ -854,7 +843,6 @@ class Service:
                 "report": {key: report.get(key) for key in ("at", "pending", "warnings", "errors", "usable_groups", "usable_models")},
                 "next_sync": self.store.get("sync_schedule", {}).get("next_run"),
                 "provider_options": self.store.get("report", {}).get("provider_options", list(PLATFORMS)),
-                # Removed groups still being stopped count in the stats above but get no card.
                 "stable_groups": [{"key": key, "label": rule_label(rule), "rule": rule, "status": stable[key],
                                    "schedule": self.store.get(key + "_schedule") or {}} for key, rule in rules.items()],
                 "stable_defaults": DEFAULTS, "low_cost_weight_defaults": dict(DEFAULT_WEIGHTS),

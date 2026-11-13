@@ -15,6 +15,13 @@ import test_sync
 from test_sync import iso_after
 
 
+def assert_no_route_disables(test, requests):
+    forbidden = [(method, path, body) for method, path, body in requests
+                 if method == "DELETE" or (isinstance(body, dict)
+                 and (body.get("status") == "inactive" or body.get("schedulable") is False))]
+    test.assertEqual(forbidden, [], "Preferred-group checks must never disable routes")
+
+
 class RankingTests(unittest.TestCase):
     def test_default_score_normalizes_missing_measurements_and_image_tps(self):
         now = datetime.now(timezone.utc)
@@ -155,7 +162,11 @@ class LowCostTests(unittest.TestCase):
         engine = Synchronizer(self.config, State(self.config))
         self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
         rule = legacy_rule("low_cost", {"low_cost_enabled": True, **settings})
-        return LowCostSelector(engine, rule).reconcile(engine.load_snapshot(), mode=mode)
+        start = len(self.fake.requests)
+        try:
+            return LowCostSelector(engine, rule).reconcile(engine.load_snapshot(), mode=mode)
+        finally:
+            assert_no_route_disables(self, self.fake.requests[start:])
 
     def test_lowest_applicable_rate_zero_override_and_stable_retention(self):
         self.fake.rates = {"7": 0, "8": .01}
@@ -176,13 +187,13 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(result["status"], "active")
         self.assertEqual(self.fake.accounts[0]["group_ids"], [result["local_group_id"]])
 
-    def test_sync_fixes_concurrency_of_selector_accounts_even_when_disabled(self):
+    def test_sync_fixes_concurrency_of_selector_accounts_with_management_paused(self):
         first = self.check()
         account = next(row for row in self.fake.accounts if row["id"] == first["local_account_id"])
         self.assertEqual(account["concurrency"], 100)
         self.config.concurrency = 9
         self.check(low_cost_enabled=False)
-        self.assertEqual(account["status"], "inactive")
+        self.assertEqual(account["status"], "active")
         Synchronizer(self.config, State(self.config)).cycle()
         self.assertEqual(account["concurrency"], 9)
 
@@ -205,7 +216,7 @@ class LowCostTests(unittest.TestCase):
         long_name = self.check("health", low_cost_name="x" * 99)
         self.assertEqual(long_name["name"], "x" * 99)
 
-    def test_health_failover_disable_recover_same_alias_and_reuse_renamed_key(self):
+    def test_health_failover_preserves_route_without_candidates_and_reuses_same_alias(self):
         first = self.check()
         self.assertEqual(first["upstream_id"], 7)
         self.healthy = {8, 9}
@@ -215,8 +226,8 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(len(self.fake.accounts), 1)
         self.healthy = set()
         off = self.check("health")
-        self.assertEqual(off["status"], "inactive")
-        self.assertFalse(self.fake.accounts[0]["schedulable"])
+        self.assertEqual((off["status"], off["pending"], off["upstream_id"]), ("active", 1, 8))
+        self.assertTrue(self.fake.accounts[0]["schedulable"])
         self.fake.keys[0]["name"] = "renamed"
         self.healthy = {7}
         recovered = self.check("health")
@@ -240,8 +251,9 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(replaced["upstream_id"], 20)
         self.assertEqual(replaced["local_group_id"], first["local_group_id"])
 
-    def test_outside_top_ten_is_disabled_while_replacement_waits_for_key(self):
-        self.check()
+    def test_outside_top_ten_keeps_route_while_replacement_waits_for_key(self):
+        first = self.check()
+        previous_groups, previous_accounts = copy.deepcopy(self.fake.local_groups), copy.deepcopy(self.fake.accounts)
         for group_id in range(20, 30):
             self.fake.groups.append({"id": group_id, "name": f"Rank {group_id}", "platform": "openai",
                                      "status": "active", "rate_multiplier": .1})
@@ -249,8 +261,11 @@ class LowCostTests(unittest.TestCase):
         self.healthy = {group["id"] for group in self.fake.groups}
         self.fake.hourly_key_limit = True
         result = self.check("ranking")
-        self.assertEqual(result["status"], "inactive")
+        self.assertEqual(result["status"], "active")
         self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["upstream_id"], first["upstream_id"])
+        self.assertEqual(self.fake.local_groups, previous_groups)
+        self.assertEqual(self.fake.accounts, previous_accounts)
         self.assertEqual(len(self.fake.keys), 1)
 
     def test_detection_gate_and_regular_top_n_independence(self):
@@ -277,12 +292,12 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(replaced["local_group_id"], first["local_group_id"])
         self.assertEqual(len(self.fake.accounts), 1)
 
-    def test_excluding_every_candidate_disables_group(self):
+    def test_excluding_every_candidate_preserves_group(self):
         self.check()
         off = self.check(low_cost_exclude_keywords=["a", "u"])
-        self.assertEqual(off["status"], "inactive")
+        self.assertEqual((off["status"], off["pending"]), ("active", 1))
         self.assertEqual(off["reason"], "no_healthy_candidates")
-        self.assertFalse(self.fake.accounts[0]["schedulable"])
+        self.assertTrue(self.fake.accounts[0]["schedulable"])
         self.assertFalse(any(method == "DELETE" for method, _, _ in self.fake.requests))
 
     def test_configurable_candidate_top_n(self):
@@ -374,26 +389,26 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(len(self.fake.accounts), 4)
         self.assertEqual(self.fake.local_groups[0]["name"], "Manual")
 
-    def test_key_limit_disables_failed_source_and_recovers_later(self):
+    def test_key_limit_keeps_previous_route_and_switches_later(self):
         self.check()
         self.healthy = {8}
         self.fake.hourly_key_limit = True
         result = self.check("health")
         self.assertEqual(result["pending"], 1)
-        self.assertEqual(result["status"], "inactive")
+        self.assertEqual((result["status"], result["upstream_id"]), ("active", 7))
         self.assertEqual(len(self.fake.keys), 1)
         self.fake.hourly_key_limit = False
         result = self.check("health")
         self.assertEqual(result["status"], "active")
         self.assertEqual(result["upstream_id"], 8)
 
-    def test_platform_list_does_not_affect_alias_but_account_sync_does(self):
+    def test_pausing_account_sync_preserves_alias_and_route(self):
         self.check()
         self.config.sync_limits = {"gemini": 0}
         self.assertEqual(self.check("health")["status"], "active")
         self.config.sync_accounts = False
         result = self.check("health")
-        self.assertEqual(result["status"], "inactive")
+        self.assertEqual((result["status"], result["decision"]), ("active", "paused"))
         self.assertEqual(self.fake.local_groups[0]["status"], "active")
         self.assertEqual(len(self.fake.keys), 1)
 
@@ -424,8 +439,9 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(result["status"], "active")
         self.assertEqual(len(self.fake.keys), 2)
 
-    def test_partial_update_stays_disabled_and_recovers_without_new_alias(self):
+    def test_failed_account_update_preserves_route_and_recovers_without_new_alias(self):
         first = self.check()
+        previous_groups, previous_accounts = copy.deepcopy(self.fake.local_groups), copy.deepcopy(self.fake.accounts)
         self.fake.rates["7"] = .3
         engine = Synchronizer(self.config, State(self.config))
         original = engine.target.request
@@ -439,11 +455,81 @@ class LowCostTests(unittest.TestCase):
             selector = LowCostSelector(engine, legacy_rule("low_cost", {"low_cost_enabled": True}))
             with self.assertRaises(SyncError):
                 selector.reconcile(engine.load_snapshot(), mode="health")
-        self.assertEqual(self.fake.local_groups[-1]["status"], "inactive")
+        self.assertEqual(self.fake.local_groups, previous_groups)
+        self.assertEqual(self.fake.accounts, previous_accounts)
+        assert_no_route_disables(self, self.fake.requests)
         recovered = self.check("health")
         self.assertEqual(recovered["status"], "active")
         self.assertEqual(recovered["local_group_id"], first["local_group_id"])
         self.assertEqual(len(self.fake.keys), 1)
+
+    def test_failed_key_read_during_failover_preserves_route(self):
+        first = self.check()
+        previous_groups, previous_accounts = copy.deepcopy(self.fake.local_groups), copy.deepcopy(self.fake.accounts)
+        self.fake.healthy_group_ids = {8}
+        self.fake.requests.clear()
+        engine = Synchronizer(self.config, State(self.config))
+        with patch.object(engine, "_get_key", side_effect=SyncError("Key read failed")):
+            selector = LowCostSelector(engine, legacy_rule("low_cost", {"low_cost_enabled": True}))
+            with self.assertRaisesRegex(SyncError, "Key read failed"):
+                selector.reconcile(engine.load_snapshot(), mode="health")
+        self.assertEqual(self.fake.mutations(), [])
+        self.assertEqual(self.fake.local_groups, previous_groups)
+        self.assertEqual(self.fake.accounts, previous_accounts)
+        self.assertEqual(State(self.config).data["low_cost:openai"]["upstream_id"], first["upstream_id"])
+
+    def test_initial_check_without_candidates_creates_no_empty_group(self):
+        self.healthy = set()
+        result = self.check()
+        self.assertEqual((result["status"], result["pending"]), ("pending", 1))
+        self.assertNotIn("local_group_id", result)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_failed_group_update_keeps_resources_active_and_recovers(self):
+        first = self.check()
+        self.fake.rates["7"] = .3
+        engine = Synchronizer(self.config, State(self.config))
+        original = engine.target.request
+
+        def reject_group_update(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/admin/groups/"):
+                raise SyncError("Group update failed")
+            return original(method, path, *args, **kwargs)
+
+        with patch.object(engine.target, "request", side_effect=reject_group_update):
+            selector = LowCostSelector(engine, legacy_rule("low_cost", {"low_cost_enabled": True}))
+            with self.assertRaisesRegex(SyncError, "Group update failed"):
+                selector.reconcile(engine.load_snapshot(), mode="health")
+        self.assertEqual(self.fake.local_groups[-1]["status"], "active")
+        self.assertEqual(self.fake.accounts[0]["status"], "active")
+        self.assertTrue(self.fake.accounts[0]["schedulable"])
+        assert_no_route_disables(self, self.fake.requests)
+        recovered = self.check("health")
+        self.assertEqual(recovered["local_group_id"], first["local_group_id"])
+        self.assertEqual((recovered["source_rate"], self.fake.local_groups[-1]["rate_multiplier"]), (.3, .3))
+
+    def test_failed_initial_binding_keeps_resources_and_repairs_on_retry(self):
+        self.fake.ignore_account_groups_on_create = True
+        engine = Synchronizer(self.config, State(self.config))
+        original = engine.target.request
+
+        def reject_binding(method, path, payload=None, **kwargs):
+            if method == "PUT" and path.startswith("/admin/accounts/") and "group_ids" in (payload or {}):
+                raise SyncError("Binding update failed")
+            return original(method, path, payload, **kwargs)
+
+        with patch.object(engine.target, "request", side_effect=reject_binding):
+            selector = LowCostSelector(engine, legacy_rule("low_cost", {"low_cost_enabled": True}))
+            with self.assertRaisesRegex(SyncError, "Binding update failed"):
+                selector.reconcile(engine.load_snapshot(), mode="ranking")
+        group_id = self.fake.local_groups[-1]["id"]
+        self.assertEqual(self.fake.local_groups[-1]["status"], "active")
+        self.assertEqual(self.fake.accounts[0]["status"], "active")
+        assert_no_route_disables(self, self.fake.requests)
+        recovered = self.check()
+        self.assertEqual(recovered["local_group_id"], group_id)
+        self.assertEqual(self.fake.accounts[0]["group_ids"], [group_id])
+        self.assertEqual(len(self.fake.accounts), 1)
 
 
 if __name__ == "__main__":
@@ -458,7 +544,11 @@ class BestSourceTests(unittest.TestCase):
         engine = Synchronizer(self.config, State(self.config))
         self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
         options = {"best_source_enabled": True, "low_cost_enabled": True, **settings}
-        return selector(engine, legacy_rule(selector.strategy, options)).reconcile(engine.load_snapshot(), mode="ranking")
+        start = len(self.fake.requests)
+        try:
+            return selector(engine, legacy_rule(selector.strategy, options)).reconcile(engine.load_snapshot(), mode="ranking")
+        finally:
+            assert_no_route_disables(self, self.fake.requests[start:])
 
     def test_selects_default_first_and_keeps_it_inside_top_k(self):
         first = self.check()
@@ -479,7 +569,8 @@ class BestSourceTests(unittest.TestCase):
         self.assertEqual((moved["upstream_id"], moved["switch_reason"]), (8, "source_unavailable"))
         self.healthy = set()
         off = self.check()
-        self.assertEqual((off["status"], off["reason"]), ("inactive", "no_healthy_candidates"))
+        self.assertEqual((off["status"], off["reason"], off["pending"]), ("active", "no_healthy_candidates", 1))
+        self.assertEqual(off["upstream_id"], moved["upstream_id"])
         self.assertFalse(any(method == "DELETE" for method, _, _ in self.fake.requests))
 
     def test_skips_unavailable_first_place_when_selecting(self):
@@ -552,11 +643,13 @@ class BestSourceTests(unittest.TestCase):
         self.assertFalse(any(body.get("status") == "inactive" or body.get("schedulable") is False
                              for _, _, body in self.fake.mutations()))
 
-    def test_disabled_selector_stops_routing(self):
+    def test_pausing_selector_preserves_routing(self):
         self.check()
+        self.fake.requests.clear()
         off = self.check(best_source_enabled=False)
-        self.assertEqual((off["status"], off["reason"]), ("inactive", "selector_disabled"))
-        self.assertFalse(self.fake.accounts[0]["schedulable"])
+        self.assertEqual((off["status"], off["reason"], off["decision"]), ("active", "selector_disabled", "paused"))
+        self.assertTrue(self.fake.accounts[0]["schedulable"])
+        self.assertEqual(self.fake.mutations(), [])
 
 
 class ScoringTests(unittest.TestCase):

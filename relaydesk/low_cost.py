@@ -3,7 +3,7 @@ without rebinding users.
 
 Each selector owns one local group and one forwarding account on the rule's platform,
 discovered by a source marker. Subclasses only decide *which* upstream channel to route
-to; creating, updating, disabling and Key reuse are shared.
+to; creating, updating and Key reuse are shared. Existing routes are never disabled.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field, replace
 
 from provider_ranking import detector_passed, ranked_items
-from sync_sub2api import (APIError, SyncError, bound_group_ids, changed_fields, ensure_account_binding, group_label,
+from sync_sub2api import (APIError, SyncError, changed_fields, ensure_account_binding, group_label,
                           progress, select_usable, with_stats)
 
 from .rules import rule_key, rule_label
@@ -21,8 +21,6 @@ from .scoring import score_candidates
 
 LOG = logging.getLogger("sub2api-sync")
 NAME_LIMIT = 100
-# Changing only these never needs the disable-update-enable cycle (prices only affect billing).
-COSMETIC_FIELDS = {"name", "description", "concurrency", "model_pricing"}
 
 
 def display_name(base, source_name):
@@ -94,26 +92,19 @@ class StableGroupSelector:
             self.mapping[mapping_key] = row["id"]
         return row
 
-    def _disable(self, group, account, reason):
-        if group and group.get("status") != "inactive":
-            self.engine.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
-            group["status"] = "inactive"
-        self.mapping["status"] = "inactive"
+    def _preserve(self, group, result, reason, decision):
+        """Record a deferred check without changing the group's route or account."""
+        self.mapping["status"] = group.get("status", "pending") if group else "pending"
         self.mapping["reason"] = reason
         self.state.save()
-        if account and account.get("status") != "inactive":
-            self.engine.target.request("PUT", f"/admin/accounts/{account['id']}", {"status": "inactive"})
-            account["status"] = "inactive"
-        if account and account.get("schedulable") is not False:
-            self.engine.target.request("POST", f"/admin/accounts/{account['id']}/schedulable", {"schedulable": False})
-            account["schedulable"] = False
+        return self._result(result, decision)
 
     def reconcile(self, snapshot, *, mode="ranking"):
         engine, config = self.engine, self.engine.config
         groups, rates, providers = snapshot
         now = engine.upstream.server_time
         progress(f"{self.label}：评估候选渠道")
-        # Validate freshness/completeness even when the selector is being disabled.
+        # Validate freshness/completeness before considering any route updates.
         candidate_config = replace(config, sync_limits={self.platform: 0})
         usable, excluded = select_usable(groups, rates, providers, candidate_config, now)
         context = Context(now, ranked_items(providers, now, {self.platform}), {row.source["id"]: row for row in usable}, excluded,
@@ -129,8 +120,7 @@ class StableGroupSelector:
         account = self._discover(accounts, "notes", "local_account_id")
         active = self.rule["enabled"] and config.sync_accounts
         if not active:
-            self._disable(group, account, "selector_disabled")
-            return self._result(result, "disabled")
+            return self._preserve(group, result, "selector_disabled", "paused")
         keep, switch_reason, pool = plan.keep, plan.switch_reason, plan.pool
         if keep:
             selected, decision = plan.current, "retained"
@@ -138,13 +128,11 @@ class StableGroupSelector:
             selected = pool[0] if pool else None
             decision = "selected" if current_id is None else "replaced"
         if selected is None:
-            self._disable(group, account, "no_healthy_candidates")
-            LOG.warning("%s：前 %d 名暂无符合检测条件的可用渠道，分组已停用", self.label, plan.top_n)
-            return self._result(result, "no_candidates")
+            result["pending"] = 1
+            LOG.warning("%s：前 %d 名暂无符合检测条件的可用渠道，保留现有路由，后续自动重试", self.label, plan.top_n)
+            return self._preserve(group, result, "no_healthy_candidates", "no_candidates")
         result["switch_reason"] = switch_reason or None
-        # Stop routing when the source no longer meets this check's selection policy.
-        if not keep and group:
-            self._disable(group, account, switch_reason or "updating")
+        # Prepare a usable Key before changing the existing route.
         group_id = selected.source["id"]
         progress(f"{self.label}：{'保持' if keep else '选用' if current_id is None else '切换到'} "
                  f"{group_label(group_id, selected.source.get('name'))}")
@@ -171,14 +159,10 @@ class StableGroupSelector:
                                 group_label(group_id, alternative.source.get("name")))
                     break
         if key is None:
-            if group_id == current_id:
-                self._disable(group, account, "pending_upstream_key")
             result["pending"] = 1
-            self.mapping["reason"] = "pending_upstream_key"
-            self.state.save()
-            LOG.warning("%s：候选 %s 等待上游 Key，保留已有 Key，后续自动重试", self.label,
+            LOG.warning("%s：候选 %s 等待上游 Key，保留现有路由和已有 Key，后续自动重试", self.label,
                         group_label(group_id, selected.source.get("name")))
-            return self._result(result, "pending")
+            return self._preserve(group, result, "pending_upstream_key", "pending")
         self.mapping.setdefault("keys", {})[str(group_id)] = key["id"]
         self.state.save()
         name = display_name(self.rule["name"], selected.source.get("name"))
@@ -192,6 +176,7 @@ class StableGroupSelector:
         account_desired = {"name": name, "notes": self.marker, "rate_multiplier": selected.source_rate,
                            "concurrency": config.concurrency, "status": "active"}
         group_patch = changed_fields(group or {}, desired)
+        pricing_changed = "model_pricing" in group_patch
         account_patch = changed_fields(account or {}, account_desired)
         old_credentials = (account or {}).get("credentials") or {}
         if (self.mapping.get("key_digest") != digest or self.mapping.get("upstream_id") != group_id
@@ -199,34 +184,29 @@ class StableGroupSelector:
                 or old_credentials.get("model_mapping") != credentials["model_mapping"]
                 or (account or {}).get("credentials_status", {}).get("has_api_key") is False):
             account_patch["credentials"] = credentials
-        unbound = account is not None and group is not None and bound_group_ids(account) != [group["id"]]
-        if unbound or set(group_patch) - COSMETIC_FIELDS or set(account_patch) - COSMETIC_FIELDS:
-            self._disable(group, account, "updating")
+        # Update in place; neither route switches nor partial failures disable resources.
         if group is None:
-            group = engine.target.request("POST", "/admin/groups", {**desired, "subscription_type": "standard", "is_exclusive": False})
+            group = engine.target.request("POST", "/admin/groups", {
+                **desired, "status": "active", "subscription_type": "standard", "is_exclusive": False})
             self.mapping["local_group_id"] = group["id"]
             self.state.save()
-            self._disable(group, None, "updating")
-        elif group_patch:
-            engine.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
-        engine.pricing_updated += "model_pricing" in group_patch
+            group_patch = {}
         if account is None:
             account = engine.target.request("POST", "/admin/accounts", {
-                **{key: value for key, value in account_desired.items() if key != "status"},
+                **account_desired,
                 "platform": self.platform, "type": "apikey", "credentials": credentials,
                 "group_ids": [group["id"]], "priority": config.priority, "upstream_billing_probe_enabled": False})
             self.mapping["local_account_id"] = account["id"]
             self.state.save()
-        else:
-            # _disable may have changed status after the patch was computed.
-            if account.get("status") != "active":
-                account_patch["status"] = "active"
-            if account_patch:
-                engine.target.request("PUT", f"/admin/accounts/{account['id']}", account_patch)
-                engine.concurrency_fixed += "concurrency" in account_patch
+        elif account_patch:
+            engine.target.request("PUT", f"/admin/accounts/{account['id']}", account_patch)
+            engine.concurrency_fixed += "concurrency" in account_patch
         ensure_account_binding(engine.target, account, group["id"], self.label)
         if account.get("schedulable") is not True:
             engine.target.request("POST", f"/admin/accounts/{account['id']}/schedulable", {"schedulable": True})
+        if group_patch:
+            engine.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
+        engine.pricing_updated += pricing_changed
         if group.get("status") != "active":
             engine.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "active"})
         self.mapping.pop("baseline_rate", None)

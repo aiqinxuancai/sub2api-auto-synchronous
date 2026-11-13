@@ -181,7 +181,10 @@ def main():
                 page.fill("#group-search", "")
                 sites.fake.health = "failed"
                 page.click("#sync-now")
-                expect(page.locator("#stat-inactive")).to_have_text("11", timeout=15000)
+                expect(page.locator("#stat-inactive")).to_have_text("10", timeout=15000)
+                expect(page.locator("#stat-active")).to_have_text("1")  # the preferred group stays enabled
+                expect(card).to_contain_text("运行中")
+                expect(card).to_contain_text("暂无可用渠道，保留现有路由并重试")
                 sites.fake.health = "healthy"
                 page.click("#sync-now")
                 expect(page.locator("#stat-active")).to_have_text("3", timeout=15000)
@@ -297,12 +300,24 @@ def main():
                 page.locator('#job-dialog [data-close]').click()
                 expect(card).to_contain_text('跌出前 5 名时更换')
                 expect(card).to_contain_text('GPT · 团队标准')  # fixture names do not follow platforms; group 11 is Gemini
-                # Removing a rule stops its local group on the next check.
+                # No candidates keeps the route active and reports the deferred check clearly.
+                existing_health = set(sites.fake.healthy_group_ids)
+                sites.fake.healthy_group_ids = set()
+                card.get_by_role("button", name="立即检测").click()
+                expect(page.locator('#job-dialog')).to_be_visible(timeout=15000)
+                expect(page.locator('#job-detail-content')).to_contain_text('暂无可用渠道，保留现有路由并重试')
+                page.locator('#job-dialog [data-close]').click()
+                expect(card).to_contain_text('运行中')
+                sites.fake.healthy_group_ids = existing_health
+                retained_group_id = service.store.get("best_source:gemini")["local_group_id"]
+                # Removing a rule stops management and leaves its local route active.
                 page.click('[data-page="settings"]')
                 best.get_by_role("button", name="删除").click()
                 page.locator('button[form="settings-form"]').click()
                 expect(page.locator('#settings-dirty')).to_have_text("已保存")
-                assert service.store.get("stable_retired") == ["best_source:gemini"]
+                assert service.store.get("stable_retired") == []
+                assert service.store.get("best_source:gemini_schedule") is None
+                assert next(group for group in sites.fake.local_groups if group["id"] == retained_group_id)["status"] == "active"
                 page.click('[data-page="overview"]')
                 expect(page.locator('[data-key="best_source:gemini"]')).to_have_count(0)
                 service.save_config({"sync_enabled": True})

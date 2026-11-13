@@ -23,15 +23,15 @@ const kinds = { sync: '同步可用分组', preview: '同步预览', connect: '�
   batch_users: '批量创建成员', quota_reset: '余额重置', low_cost: '最低价渠道检测', best_source: '最优源站检测' };
 const statuses = { active: '运行中', inactive: '已停用', pending: '待同步', excluded: '已排除',
   success: '已完成', failed: '失败', partial: '部分完成', running: '执行中', queued: '排队中',
-  interrupted: '已中断', uncertain: '待核对' };
+  interrupted: '已中断', uncertain: '待核对', paused: '管理已暂停' };
 const reasons = { no_healthy_models: '当前没有通过健康检测的模型', no_longer_accessible: '上游账号已无法访问此分组',
   upstream_inactive: '上游分组已停用', not_in_provider_hall: '分组未出现在上游监测大厅',
   platform_mismatch: '分组平台与监测数据不一致', monitoring_disabled_or_unknown: '上游检测已关闭或状态未确认',
   availability_unknown: '上游可用性尚未确认',
   platform_not_selected: '未选择同步此平台', outside_sync_top_n: '超出设定的前 N 个分组',
   group_not_selected: '不在限定的分组 ID 范围内', not_visible_in_hall: '未在供应商大厅展示',
-  model_detection_not_passed: '模型检测未通过', selector_disabled: '优选分组已关闭，或未开启同步转发账号',
-  no_healthy_candidates: '候选范围内暂无通过检测的可用渠道', pending_upstream_key: '等待上游 Key，稍后自动重试',
+  model_detection_not_passed: '模型检测未通过', selector_disabled: '自动管理已暂停，现有分组保持原状态',
+  no_healthy_candidates: '候选范围内暂无可用渠道，保留现有路由并重试', pending_upstream_key: '等待上游 Key，保留现有路由并重试',
   no_bound_account: '分组没有可用的绑定账号，已停用，下轮自动修复',
   rank_dropped: '当前渠道综合评分排名下降超过允许范围',
   source_unavailable: '当前渠道已不可用', updating: '正在切换渠道',
@@ -245,13 +245,13 @@ function stableCard({ key, rule, status: data = {}, schedule = {} }) {
   panel.dataset.key = key;
   const heading = el('div', 'panel-heading'), copy = el('div'), title = el('h2');
   title.append(icon(lowCost ? 'tag' : 'shield'), el('span', '', rule.name), el('span', 'platform-tag', `${strategyNames[rule.strategy]} · ${platformNames[rule.platform] || rule.platform}`),
-    badge(enabled ? (data.status || 'pending') : 'inactive'));
+    badge(enabled ? (data.status || 'pending') : 'paused'));
   title.firstChild.classList.add('accent');
   const check = el('button', 'button'); check.type = 'button'; check.append(icon('refresh'), document.createTextNode('立即检测'));
   check.disabled = state.jobs.some(job => ['queued', 'running'].includes(job.status) && job.kind === rule.strategy);
   check.onclick = () => action(() => runJob(stableJobs[rule.strategy], { mode: 'ranking', platform: rule.platform }, job => openJob(job)));
   const summary = el('div', 'low-cost-summary'), rate = data.source_rate == null ? '—' : `${number(data.source_rate)} → ${number(data.local_rate)}`;
-  const enableHint = '在连接配置中启用该分组，并开启同步转发账号';
+  const enableHint = data.local_group_id ? '自动管理已暂停，现有分组保持原状态' : '在连接配置中启用自动管理，并开启同步转发账号';
   const details = el('details', 'candidate-details'), list = el('div');
   details.open = state.openCandidates.has(key);
   details.ontoggle = () => details.open ? state.openCandidates.add(key) : state.openCandidates.delete(key);
@@ -278,6 +278,7 @@ function stableCard({ key, rule, status: data = {}, schedule = {} }) {
     label = `查看默认排序前 ${keepTop} 名`;
     renderRankedCandidates(list, data);
   }
+  if (!enabled) note = enableHint;
   copy.append(title, el('p', '', note)); heading.append(copy, check);
   const toggle = el('summary'); toggle.append(el('span', '', label), icon('chevron')); details.append(toggle, list);
   panel.append(heading, summary, details);
@@ -513,7 +514,7 @@ function ruleCard(rule, open = state.openRules.has(ruleKey(rule))) {
   toggle.onclick = () => setRuleOpen(card, !card.classList.contains('open'));
   const switchLabel = el('label', 'switch-label'), enabled = el('input');
   enabled.type = 'checkbox'; enabled.setAttribute('role', 'switch'); enabled.dataset.field = 'enabled'; enabled.checked = rule.enabled;
-  switchLabel.append(el('span', '', '启用'), enabled, el('span', 'switch-track'));
+  switchLabel.append(el('span', '', '自动管理'), enabled, el('span', 'switch-track'));
   const remove = el('button', 'icon-button stable-rule-remove'); remove.type = 'button'; remove.title = '删除';
   remove.setAttribute('aria-label', `删除 ${rule.name}`); remove.append(icon('close'));
   remove.onclick = () => {
@@ -894,6 +895,9 @@ function renderBatchHistory() {
 function summary(job) {
   const result = job.result;
   if (!result) return job.error || statuses[job.status] || job.status;
+  if (['low_cost', 'best_source'].includes(job.kind) && (result.pending || result.decision === 'paused')) {
+    return reasons[result.reason] || '保留现有分组，等待后续检测';
+  }
   if (job.kind === 'connect') return result.message;
   if (job.kind === 'best_source') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · 默认排序 #${result.provider_rank} · ${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
   if (job.kind === 'low_cost') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · ${result.score != null ? `${number(result.score, 1)} 分 · ` : ''}${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : result.switch_reason === 'rank_dropped' ? '评分排名下降，已更换渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
@@ -1019,7 +1023,9 @@ function renderJobDetail(job) {
       if (result.switch_reason && reasons[result.switch_reason]) detail.append(el('p', 'notice', `更换原因：${reasons[result.switch_reason]}`));
     }
     if (result.preview) detail.append(el('p', 'notice', '本次为预览，未创建或修改站点资源。'));
-    if (result.pending) detail.append(el('p', 'notice', '上游 Key 额度有限，待同步分组会在后续周期继续处理。'));
+    if (result.pending) detail.append(el('p', 'notice', ['low_cost', 'best_source'].includes(job.kind)
+      ? reasons[result.reason] || '保留现有分组，等待后续检测。'
+      : '上游 Key 额度有限，待同步分组会在后续周期继续处理。'));
     for (const warning of result.warnings || []) detail.append(el('p', 'notice', warningText(warning)));
     if (result.period) detail.append(el('p', '', `执行周期：${result.period.startsWith('manual-') ? '手动重置' : result.period} · 跳过 ${result.skipped?.length || 0} 位已有执行记录的成员`));
     const failures = result.failures || result.errors || [];

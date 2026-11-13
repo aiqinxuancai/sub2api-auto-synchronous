@@ -602,28 +602,84 @@ class WebTests(unittest.TestCase):
         sync = self.job("/jobs/sync")
         self.assertEqual(set(sync["result"]["stable"]), {"best_source:openai", "best_source:deepseek"})
 
-    def test_removed_rule_stops_its_group_then_is_forgotten(self):
+    def test_removed_rule_keeps_its_group_and_stops_scheduling(self):
         self.rules(new_rule("best_source", "openai", enabled=True))
         first = self.job("/jobs/best-source")
+        self.sites.fake.requests.clear()
         self.rules()
-        self.assertEqual(self.service.store.get("stable_retired"), ["best_source:openai"])
-        self.assertLessEqual(self.service.store.get("best_source:openai_schedule")["next_rank"], time.time())
+        self.assertEqual(self.service.store.get("stable_retired"), [])
+        self.assertIsNone(self.service.store.get("best_source:openai_schedule"))
         self.assertEqual(self.client.get("/api/overview").json()["stable_groups"], [])
         self.assertEqual(self.post("/jobs/best-source").status_code, 400)
         with patch.object(self.service, "submit", return_value="mock-job") as submit:
             self.service.tick(datetime.now(timezone.utc))
-            submit.assert_any_call("best_source", {"mode": "ranking", "platform": "openai"})
-        stopped = await_job(self.service, self.service.submit("best_source", {"mode": "ranking", "platform": "openai"}))
-        self.assertEqual((stopped["status"], stopped["result"]["status"]), ("success", "inactive"))
+            submit.assert_not_called()
         group = next(row for row in self.sites.fake.local_groups if row["id"] == first["result"]["local_group_id"])
-        self.assertEqual(group["status"], "inactive")
-        self.assertEqual(self.service.store.get("stable_retired"), [])
+        self.assertEqual(group["status"], "active")
+        self.assertEqual(self.sites.fake.accounts[0]["status"], "active")
+        self.assertTrue(self.sites.fake.accounts[0]["schedulable"])
+        self.assertEqual(self.sites.fake.mutations(), [])
         self.assertIsNone(self.service.store.get("best_source:openai"))
         # Re-adding the rule reuses the same local group and upstream Key.
         self.rules(new_rule("best_source", "openai", enabled=True))
         again = self.job("/jobs/best-source")
         self.assertEqual(again["result"]["local_group_id"], first["result"]["local_group_id"])
         self.assertEqual(len(self.sites.fake.keys), 1)
+
+    def test_paused_rule_and_account_sync_do_not_schedule_or_stop_routes(self):
+        rule = new_rule("best_source", "openai", enabled=True)
+        self.rules(rule)
+        first = self.job("/jobs/best-source")
+        group_id, account_id = first["result"]["local_group_id"], first["result"]["local_account_id"]
+        for settings in ({"stable_groups": [{**rule, "enabled": False}]},
+                         {"stable_groups": [rule], "sync_accounts": False}):
+            with self.subTest(settings=settings):
+                self.service.save_config(settings)
+                with patch.object(self.service, "submit") as submit:
+                    self.service.tick(datetime.now(timezone.utc))
+                    submit.assert_not_called()
+                paused = self.job("/jobs/best-source")
+                self.assertEqual((paused["result"]["status"], paused["result"]["decision"]), ("active", "paused"))
+                sync = self.job("/jobs/sync")
+                self.assertEqual(sync["result"]["stable"], {})
+                group = next(row for row in self.sites.fake.local_groups if row["id"] == group_id)
+                account = next(row for row in self.sites.fake.accounts if row["id"] == account_id)
+                self.assertEqual((group["status"], account["status"], account["schedulable"]), ("active", "active", True))
+
+    def test_no_candidates_keeps_preferred_routes_and_uses_retry_interval(self):
+        for strategy, endpoint in (("low_cost", "/jobs/low-cost"), ("best_source", "/jobs/best-source")):
+            with self.subTest(strategy=strategy):
+                self.sites.fake.healthy_group_ids = {7}
+                self.rules(new_rule(strategy, "openai", enabled=True, retry_minutes=2))
+                first = self.job(endpoint)
+                self.sites.fake.healthy_group_ids = set()
+                self.sites.fake.requests.clear()
+                deferred = self.job(endpoint)
+                self.assertEqual((deferred["result"]["status"], deferred["result"]["pending"]), ("active", 1))
+                self.assertEqual(deferred["result"]["reason"], "no_healthy_candidates")
+                self.assertEqual(deferred["result"]["local_group_id"], first["result"]["local_group_id"])
+                self.assertEqual(self.sites.fake.mutations(), [])
+                schedule = self.service.store.get(f"{strategy}:openai_schedule")
+                self.assertAlmostEqual(schedule["next_rank"] - time.time(), 120, delta=3)
+
+    def test_legacy_retirement_queue_is_cleared_without_stopping_routes(self):
+        self.rules(new_rule("best_source", "openai", enabled=True))
+        first = self.job("/jobs/best-source")
+        self.service.store.put("config", {**self.service.store.get("config"), "stable_groups": []})
+        self.service.store.put("stable_retired", ["best_source:openai"])
+        self.sites.fake.requests.clear()
+        restored = Service(self.service.directory, start_scheduler=False)
+        try:
+            self.assertEqual(restored.store.get("stable_retired"), [])
+            self.assertIsNone(restored.store.get("best_source:openai_schedule"))
+            with patch.object(restored, "submit") as submit:
+                restored.tick(datetime.now(timezone.utc))
+                submit.assert_not_called()
+            group = next(row for row in self.sites.fake.local_groups if row["id"] == first["result"]["local_group_id"])
+            self.assertEqual(group["status"], "active")
+            self.assertEqual(self.sites.fake.mutations(), [])
+        finally:
+            restored.close()
 
     def test_legacy_settings_migrate_to_platform_limits_and_rules(self):
         config = self.service.store.get("config")

@@ -648,7 +648,7 @@ def ensure_account_binding(client: "Client", account: dict[str, Any], local_grou
     client.request("PUT", f"/admin/accounts/{account['id']}", {"group_ids": [local_group_id]})
     confirmed = client.request("GET", f"/admin/accounts/{account['id']}")
     if not isinstance(confirmed, dict) or bound_group_ids(confirmed) != [local_group_id]:
-        raise SyncError(f"{label}: 账号 {account['id']} 未能绑定到本地分组 {local_group_id}，分组保持停用")
+        raise SyncError(f"{label}: 账号 {account['id']} 未能绑定到本地分组 {local_group_id}，本轮更新停止")
     account["group_ids"] = [local_group_id]
 
 
