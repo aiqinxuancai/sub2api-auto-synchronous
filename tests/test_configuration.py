@@ -13,7 +13,7 @@ from unittest.mock import patch
 from relaydesk.rules import new_rule
 from relaydesk.service import Service, default_settings
 from relaydesk.storage import Store
-from sync_sub2api import Config, SyncError
+from sync_sub2api import Config, SyncError, write_private_json
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -119,6 +119,37 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(SyncError):
                 store.put("config", {**default_settings(), "prefix": "failed-"})
         self.assertEqual((self.root / "config.json").read_bytes(), before)
+
+    def test_atomic_save_retries_transient_permission_error(self):
+        path = self.root / "state.json"
+        write_private_json(path, {"version": 1})
+        original = os.replace
+        attempts = []
+
+        def briefly_busy(source, target):
+            attempts.append(target)
+            if len(attempts) < 3:
+                self.assertEqual(json.loads(path.read_text()), {"version": 1})
+                raise PermissionError("File temporarily busy")
+            original(source, target)
+
+        with patch("sync_sub2api.os.replace", side_effect=briefly_busy), patch("sync_sub2api.time.sleep") as sleep:
+            write_private_json(path, {"version": 2})
+        self.assertEqual(json.loads(path.read_text()), {"version": 2})
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [.05, .1])
+        self.assertEqual(list(self.root.iterdir()), [path])
+
+    def test_persistent_permission_error_is_bounded_and_preserves_old_state(self):
+        path = self.root / "state.json"
+        write_private_json(path, {"version": 1})
+        with patch("sync_sub2api.os.replace", side_effect=PermissionError("Read only")) as replace:
+            with patch("sync_sub2api.time.sleep") as sleep:
+                with self.assertRaises(PermissionError):
+                    write_private_json(path, {"version": 2})
+        self.assertEqual(replace.call_count, 5)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertEqual(json.loads(path.read_text()), {"version": 1})
+        self.assertEqual(list(self.root.iterdir()), [path])
 
     def test_invalid_file_is_not_overwritten_by_migration_or_defaults(self):
         store = Store(self.root)

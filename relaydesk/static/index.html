@@ -108,8 +108,8 @@
         <div class="overview-grid">
           <div class="metrics">
             <div class="metric"><span>运行中分组</span><strong id="stat-active">—</strong><small id="stat-visible">等待首次同步</small></div>
-            <div class="metric"><span>健康模型绑定</span><strong id="stat-models">—</strong><small>按分组统计可用模型</small></div>
-            <div class="metric"><span>已停用分组</span><strong id="stat-inactive">—</strong><small>恢复可用后自动启用</small></div>
+            <div class="metric"><span>已同步模型绑定</span><strong id="stat-models">—</strong><small>包含保留路由的模型记录</small></div>
+            <div class="metric"><span>已停用分组</span><strong id="stat-inactive">—</strong><small>目标站点状态，同步不主动停用</small></div>
             <div class="metric"><span>保留的上游 Key</span><strong id="stat-keys">—</strong><small>持续复用，不随停用删除</small></div>
           </div>
           <div class="schedule-card">
@@ -126,7 +126,7 @@
         <div class="overview-body">
           <div class="panel groups-panel">
             <div class="panel-heading">
-              <div><h2>分组与模型 <span id="group-total" class="count-badge">0</span></h2><p>仅让健康模型参与路由，保留每个分组的来源标记。</p></div>
+              <div><h2>分组与模型 <span id="group-total" class="count-badge">0</span></h2><p>按上游分组声明的模型同步，异常时保留已同步路由。</p></div>
               <label class="search-field"><svg class="icon"><use href="#i-search"/></svg><input id="group-search" aria-label="搜索分组或模型" placeholder="搜索分组或模型…"></label>
             </div>
             <div class="filter-row" id="group-filters" role="group" aria-label="分组状态">
@@ -196,7 +196,7 @@
 
           <div class="panel automation-panel" id="settings-rules">
             <div class="panel-heading">
-              <div><h2>同步规则</h2><p>可用分组、倍率和健康模型，一次配置，持续同步。</p></div>
+              <div><h2>同步规则</h2><p>可用分组、倍率和模型，一次配置，持续同步。</p></div>
               <label class="switch-label"><span>自动同步</span><input name="sync_enabled" type="checkbox" role="switch"><span class="switch-track"></span></label>
             </div>
             <div class="panel-body">
@@ -211,7 +211,7 @@
                 <h3>同步哪些平台</h3>
                 <p class="field-help">勾选要同步的平台，并为每个平台单独设置同步大厅默认排序的前 N 个分组，0 表示不限制。</p>
                 <div class="platform-limits" id="platform-limits"></div>
-                <p class="hint"><svg class="icon"><use href="#i-info"/></svg>先按大厅默认排序截取前 N 个，再排除不可用分组。调整平台或数量后，范围外的已管理分组会在下次同步时停用，Key 持续保留。</p>
+                <p class="hint"><svg class="icon"><use href="#i-info"/></svg>前 N 名限定本轮新建和更新的范围。排名或平台范围变化时，已有分组、账号和 Key 保留原状态，不会因同步而停用。</p>
               </div>
 
               <div class="sub-section">
@@ -224,10 +224,10 @@
               <div class="sub-section">
                 <h3>自动化行为</h3>
                 <div class="rule-toggles">
-                  <label><input name="disable_unavailable" type="checkbox"><span><strong>自动停用与恢复</strong><small>不可用时停用，恢复后启用同一分组</small></span></label>
                   <label><input name="sync_accounts" type="checkbox"><span><strong>同步转发账号</strong><small>绑定对应上游 Key 与模型白名单</small></span></label>
                   <label><input name="auto_create_keys" type="checkbox"><span><strong>自动创建上游 Key</strong><small>已创建的 Key 长期保留并复用</small></span></label>
                 </div>
+                <p class="hint"><svg class="icon"><use href="#i-info"/></svg>同步始终保留已有路由：异常或等待 Key 时不主动停用；修复账号绑定时只补充缺少的分组，不移除已有绑定。</p>
               </div>
             </div>
             <details class="advanced">
@@ -347,10 +347,10 @@
   <div class="modal-heading"><div><span class="eyebrow">分组详情</span><h2 id="group-detail-name">分组详情</h2></div><button class="icon-button" data-close aria-label="关闭" type="button"><svg class="icon"><use href="#i-close"/></svg></button></div>
   <dl id="group-detail-meta" class="detail-meta"></dl>
   <p id="group-detail-reason" class="notice" hidden></p>
-  <div class="model-heading"><h3>健康模型白名单 <span id="model-count" class="count-badge"></span></h3></div>
+  <div class="model-heading"><h3>模型白名单 <span id="model-count" class="count-badge"></span></h3></div>
   <label class="search-field full"><svg class="icon"><use href="#i-search"/></svg><input id="model-search" placeholder="搜索模型…" aria-label="搜索分组模型"></label>
   <div id="model-list" class="model-list"></div>
-  <p class="field-help">停用分组保留上次同步的模型记录，恢复时重新读取健康状态。</p>
+  <p class="field-help">显示已同步的模型记录；暂未符合更新条件的分组保留现有路由，等待后续同步。</p>
 </dialog>
 
 <dialog id="job-dialog" class="modal wide-modal">

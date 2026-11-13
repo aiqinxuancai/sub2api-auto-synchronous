@@ -20,8 +20,8 @@ from relaydesk.low_cost import LowCostSelector
 from relaydesk.rules import new_rule
 from relaydesk.scoring import DEFAULT_WEIGHTS
 from relaydesk.web import create_app
-from sync_sub2api import SyncError, progress, progress_request
-from test_sync import FakeSites
+from sync_sub2api import SyncError, Synchronizer, progress, progress_request
+from test_sync import DECLARED, FakeSites
 
 
 class WebSites(FakeSites):
@@ -109,6 +109,8 @@ class LocalSites:
                 envelope = {"code": 0 if status == 200 else status, "message": "result", "data": data}
                 if status == 429 and fake.hourly_key_limit:
                     envelope["reason"] = "API_KEY_CREATE_RATE_LIMITED"
+                if status == 403 and fake.key_count_limit and urlsplit(self.path).path == "/up/api/v1/keys":
+                    envelope["reason"] = "API_KEY_COUNT_EXCEEDED"
                 raw = json.dumps(envelope).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -267,12 +269,71 @@ class WebTests(unittest.TestCase):
         self.assertEqual(synced["status"], "success")
         groups = self.client.get("/api/groups").json()["items"]
         active = next(group for group in groups if group["status"] == "active")
-        self.assertEqual(active["models"], ["model-a"])
+        self.assertEqual(active["models"], DECLARED)
         self.assertEqual(active["local_rate"], 0.25)
         self.assertIn("[sub2api-sync:", active["marker"])
         self.assertEqual(len([group for group in groups if group["status"] == "excluded"]), 2)
         self.job("/jobs/sync")
         self.assertEqual(len(self.sites.fake.keys), 1)
+
+    def test_legacy_disable_setting_is_ignored_on_save_and_startup(self):
+        self.service.save_config({"disable_unavailable": True})
+        self.assertFalse(self.service.public_config()["disable_unavailable"])
+        config = self.service.store.get("config")
+        config["disable_unavailable"] = True
+        self.service.store.put("config", config)
+        self.service.close()
+        self.service = Service(self.root / "data", start_scheduler=False)
+        self.assertFalse(self.service.public_config()["disable_unavailable"])
+        saved = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))["config"]
+        self.assertFalse(saved["disable_unavailable"])
+
+    def test_key_count_limit_is_pending_and_does_not_block_existing_group_updates(self):
+        self.sites.fake.healthy_group_ids = {8}
+        self.job("/jobs/sync")
+        self.sites.fake.healthy_group_ids = {7, 8, 9}
+        self.sites.fake.model_health["model-d"] = "failed"  # newly declared by the upstream group
+        self.sites.fake.key_count_limit = True
+        job = self.job("/jobs/sync")
+        self.assertEqual(job["status"], "success")
+        self.assertEqual(job["result"]["errors"], [])
+        self.assertEqual(job["result"]["pending"], 2)
+        self.assertIn("API_KEY_COUNT_EXCEEDED", job["result"]["warnings"][0]["warning"])
+        row = next(row for row in self.service.store.get("groups") if row["upstream_id"] == 8)
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["models"], DECLARED + ["model-d"])
+
+    def test_scope_and_health_changes_keep_active_group_metadata(self):
+        self.job("/jobs/sync")
+        before = next(row for row in self.service.store.get("groups") if row["upstream_id"] == 7)
+        routes = copy.deepcopy((self.sites.fake.local_groups, self.sites.fake.accounts))
+        for limits, health in (({}, "healthy"), ({"openai": 0}, "failed")):
+            with self.subTest(limits=limits, health=health):
+                self.service.save_config({"sync_platform_limits": limits})
+                self.sites.fake.health = health
+                self.assertEqual(self.job("/jobs/sync")["status"], "success")
+                row = next(row for row in self.client.get("/api/groups").json()["items"] if row["upstream_id"] == 7)
+                for field in ("status", "models", "local_rate", "local_group_id", "key_id"):
+                    self.assertEqual(row[field], before[field], field)
+                self.assertEqual((self.sites.fake.local_groups, self.sites.fake.accounts), routes)
+
+    def test_failed_and_deferred_updates_show_installed_group_configuration(self):
+        self.job("/jobs/sync")
+        before = next(row for row in self.service.store.get("groups") if row["upstream_id"] == 7)
+        self.sites.fake.rates["7"] = .5
+        self.sites.fake.model_health["model-d"] = "failed"  # newly declared by the upstream group
+        self.sites.fake.groups[0]["name"] = "Renamed"
+        for failure in (None, SyncError("Key read failed")):
+            with self.subTest(failure=bool(failure)):
+                options = {"side_effect": failure} if failure else {"return_value": None}
+                with patch.object(Synchronizer, "_get_key", **options):
+                    self.job("/jobs/sync")
+                row = next(row for row in self.client.get("/api/groups").json()["items"] if row["upstream_id"] == 7)
+                for field in ("name", "status", "models", "local_group_id", "key_id"):
+                    self.assertEqual(row[field], before[field], field)
+                # The pending round refreshed the kept route's billing, so the installed rate is the new one.
+                self.assertEqual((row["local_rate"], row["source_rate"]), (.5, .5))
+                self.assertEqual(row["reason"], "sync_update_failed" if failure else "pending_upstream_key")
 
     def test_batch_creation_skips_existing_and_exports_only_encrypted_credentials(self):
         payload = {"users": [{"email": "alice@example.com"},

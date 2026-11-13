@@ -32,7 +32,8 @@ const reasons = { no_healthy_models: '当前没有通过健康检测的模型', 
   group_not_selected: '不在限定的分组 ID 范围内', not_visible_in_hall: '未在供应商大厅展示',
   model_detection_not_passed: '模型检测未通过', selector_disabled: '自动管理已暂停，现有分组保持原状态',
   no_healthy_candidates: '候选范围内暂无可用渠道，保留现有路由并重试', pending_upstream_key: '等待上游 Key，保留现有路由并重试',
-  no_bound_account: '分组没有可用的绑定账号，已停用，下轮自动修复',
+  no_bound_account: '未发现可用的绑定账号，保留分组状态并等待修复',
+  sync_update_failed: '本轮更新失败，保留现有状态并等待后续重试',
   rank_dropped: '当前渠道综合评分排名下降超过允许范围',
   source_unavailable: '当前渠道已不可用', updating: '正在切换渠道',
   outside_top_ten: '当前渠道已离开设定的候选排名范围', keyword_excluded: '名称命中排除关键字',
@@ -73,6 +74,7 @@ function host(value) { try { return new URL(value).host; } catch { return '尚�
 function warningText(value) {
   if (typeof value === 'string') return value;
   const text = value?.warning || value?.error || '请查看运行日志';
+  if (text.includes('API_KEY_COUNT_EXCEEDED')) return '上游 Key 数量已达上限；已有 Key 和路由保留，需要新 Key 的分组等待上游额度调整后再同步。';
   if (text.includes('API_KEY_CREATE_RATE_LIMITED')) return '上游暂时限制新增 Key，待同步分组将在后续周期继续处理。';
   const label = subject(value); return (label ? label + '：' : '') + text;
 }
@@ -184,9 +186,10 @@ function renderOverview() {
   $('#schedule-status').textContent = config.sync_enabled ? '自动运行' : '已暂停';
   const messages = [];
   const keyLimited = (report.warnings || []).some(warning => String(warning?.warning || warning).includes('API_KEY_CREATE_RATE_LIMITED'));
-  if (report.pending) messages.push(`${report.pending} 个可用分组等待上游 Key${keyLimited ? '，受上游创建频率限制' : ''}，后续周期会自动继续同步。`);
+  const keyCountLimited = (report.warnings || []).some(warning => String(warning?.warning || warning).includes('API_KEY_COUNT_EXCEEDED'));
+  if (report.pending) messages.push(keyCountLimited ? `${report.pending} 个可用分组等待上游 Key，Key 数量已达上限；已有 Key 和路由保留，额度调整后自动继续同步。` : `${report.pending} 个可用分组等待上游 Key${keyLimited ? '，受上游创建频率限制' : ''}，后续周期会自动继续同步。`);
   if (report.errors?.length) messages.push(`${report.errors.length} 项同步异常，请查看任务详情与日志。`);
-  if (report.warnings?.length) messages.push(...report.warnings.filter(warning => !report.pending || !String(warning?.warning || warning).includes('API_KEY_CREATE_RATE_LIMITED')).map(warningText));
+  if (report.warnings?.length) messages.push(...report.warnings.filter(warning => !report.pending || !/API_KEY_(CREATE_RATE_LIMITED|COUNT_EXCEEDED)/.test(String(warning?.warning || warning))).map(warningText));
   $('#sync-notice').hidden = messages.length === 0;
   $('#sync-notice').textContent = [...new Set(messages)].join(' ');
   renderStable(); renderRunning(); renderActivity(); renderCountdown();
@@ -422,7 +425,7 @@ function renderModels() {
   const root = $('#model-list'); root.replaceChildren();
   const filtered = models.filter(model => model.toLowerCase().includes(search));
   for (const model of filtered) root.append(el('span', 'model-tag', model));
-  if (!filtered.length) root.append(el('p', 'empty-inline', models.length ? '没有匹配模型' : '暂无健康模型记录'));
+  if (!filtered.length) root.append(el('p', 'empty-inline', models.length ? '没有匹配模型' : '暂无模型记录'));
 }
 $('#model-search').oninput = renderModels;
 
@@ -901,7 +904,7 @@ function summary(job) {
   if (job.kind === 'connect') return result.message;
   if (job.kind === 'best_source') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · 默认排序 #${result.provider_rank} · ${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
   if (job.kind === 'low_cost') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · ${result.score != null ? `${number(result.score, 1)} 分 · ` : ''}${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : result.switch_reason === 'rank_dropped' ? '评分排名下降，已更换渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';
-  if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}${result.concurrency_fixed ? ` · 修正 ${result.concurrency_fixed} 个账号并发` : ''}${result.pricing_updated ? ` · 更新 ${result.pricing_updated} 个分组价格` : ''}`;
+  if (['sync', 'preview'].includes(job.kind)) return `${result.usable_groups} 个可用分组 · ${result.usable_models} 个模型绑定${result.pending ? ` · ${result.pending} 组待同步` : ''}${result.concurrency_fixed ? ` · 修正 ${result.concurrency_fixed} 个账号并发` : ''}${result.pricing_updated ? ` · 更新 ${result.pricing_updated} 个分组价格` : ''}${result.billing_refreshed ? ` · ${result.billing_refreshed} 个保留分组的计费已按上游刷新` : ''}`;
   if (job.kind === 'refresh_users') return `已读取 ${result.count} 位成员`;
   if (job.kind === 'batch_users') return `创建 ${result.created.length} 位 · 跳过 ${result.skipped.length} 位${result.failed ? ` · 失败 ${result.failed} 位` : ''}`;
   if (job.kind === 'quota_reset') return `已重置 ${result.succeeded.length} 位 · $${number(result.amount)}${result.failed ? ` · ${result.failed} 位待处理` : ''}${result.usage && result.usage.missing < result.usage.users ? ` · 本期消费 ${money(result.usage.cost)}` : ''}`;

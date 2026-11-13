@@ -13,8 +13,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
-from sync_sub2api import (PROGRESS, APIError, Client, Config, State, SyncError, Synchronizer, changed_fields,
+from sync_sub2api import (PROGRESS, APIError, Client, Config, State, SyncError, Synchronizer, changed_fields, ensure_account_binding,
                           hall_model_pricing, hall_stats, select_usable, stats_text)
+
+
+DECLARED = ["model-a", "model-b", "model-c"]  # FakeSites' group models; only model-a is healthy by default
 
 
 def iso_after(seconds=300):
@@ -40,6 +43,7 @@ class FakeSites:
         self.fail_rates = False
         self.key_limit = False
         self.hourly_key_limit = False
+        self.key_count_limit = False
         self.healthy_group_ids = {7}
         self.transient_key_limits = 0
         self.deny_groups = False
@@ -134,6 +138,8 @@ class FakeSites:
                     return 429, None
                 if path.endswith("keys") and (self.key_limit or self.hourly_key_limit):
                     return 429, None
+                if path.endswith("keys") and self.key_count_limit:
+                    return 403, None
                 if path.endswith("groups") and self.deny_groups:
                     return 403, None
                 if path.endswith("accounts") and self.deny_accounts:
@@ -203,6 +209,8 @@ class SyncIntegrationTests(unittest.TestCase):
                             "message": "success" if status == 200 else "rejected", "data": data}
                 if status == 429 and fake.hourly_key_limit:
                     envelope["reason"] = "API_KEY_CREATE_RATE_LIMITED"
+                if status == 403 and fake.key_count_limit and urlsplit(self.path).path == "/up/api/v1/keys":
+                    envelope["reason"] = "API_KEY_COUNT_EXCEEDED"
                 raw = json.dumps(envelope).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -227,10 +235,14 @@ class SyncIntegrationTests(unittest.TestCase):
             report_file=Path(self.temp.name) / "report.json")
 
     def tearDown(self):
+        forbidden = [(method, path) for method, path, body in self.fake.mutations()
+                     if method == "DELETE" or (isinstance(body, dict) and
+                         (body.get("status") == "inactive" or body.get("schedulable") is False))]
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
         self.temp.cleanup()
+        self.assertEqual(forbidden, [], "Synchronization must never delete or disable routes")
 
     def cycle(self):
         return Synchronizer(self.config, State(self.config)).cycle()
@@ -238,31 +250,33 @@ class SyncIntegrationTests(unittest.TestCase):
     def test_create_healthy_group_and_model_then_repeat_without_duplicates_or_writes(self):
         report = self.cycle()
         self.assertEqual(report["usable_groups"], 1)
-        self.assertEqual(report["groups"][0]["models"], ["model-a"])
+        # Only model-a is healthy, which qualifies the group; every declared model is routed.
+        self.assertEqual(report["groups"][0]["models"], DECLARED)
         self.assertEqual(report["groups"][0]["local_rate"], 0.25)
         self.assertEqual(len(self.fake.keys), 1)
         self.assertEqual(len(self.fake.accounts), 1)
         self.assertEqual(len(self.fake.local_groups), 2)
         group = self.fake.local_groups[-1]
         self.assertIn("[sub2api-sync:", group["description"])
-        self.assertEqual(group["model_allowlist"], {"enabled": True, "models": ["model-a"]})
-        self.assertEqual(self.fake.accounts[0]["credentials"]["model_mapping"], {"model-a": "model-a"})
+        self.assertEqual(group["model_allowlist"], {"enabled": True, "models": DECLARED})
+        self.assertEqual(self.fake.accounts[0]["credentials"]["model_mapping"], {model: model for model in DECLARED})
         self.fake.requests.clear()
         report = self.cycle()
         self.assertEqual(report["errors"], [])
         self.assertEqual(self.fake.mutations(), [])
         self.assertEqual(self.fake.logins, 1)
 
-    def test_unavailable_disables_then_healthy_reenables_same_marked_resources(self):
+    def test_unavailable_preserves_routes_even_with_legacy_disable_flag(self):
         self.cycle()
         group_id = self.fake.local_groups[-1]["id"]
         account_id = self.fake.accounts[0]["id"]
+        before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.config.disable_unavailable = True
+        self.fake.requests.clear()
         self.fake.health = "failed"
         self.cycle()
-        self.assertEqual(self.fake.local_groups[-1]["status"], "inactive")
-        self.assertEqual(self.fake.accounts[0]["status"], "inactive")
-        self.assertFalse(self.fake.accounts[0]["schedulable"])
-        self.assertEqual(self.fake.local_groups[0]["status"], "active")
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+        self.assertEqual(self.fake.mutations(), [])
         self.fake.health = "healthy"
         self.cycle()
         self.assertEqual(self.fake.local_groups[-1]["id"], group_id)
@@ -365,19 +379,31 @@ class SyncIntegrationTests(unittest.TestCase):
             self.cycle()
         self.assertEqual(self.fake.mutations(), [])
 
-    def test_expired_health_excludes_models_and_disables_group(self):
+    def test_expired_health_excludes_models_and_preserves_group(self):
         self.cycle()
+        self.fake.requests.clear()
         self.fake.expired = True
         report = self.cycle()
         self.assertEqual(report["usable_groups"], 0)
-        self.assertEqual(self.fake.local_groups[-1]["status"], "inactive")
+        self.assertEqual(self.fake.local_groups[-1]["status"], "active")
+        self.assertEqual(self.fake.mutations(), [])
 
-    def test_model_changes_update_allowlist_and_mapping_without_new_key(self):
+    def test_health_flaps_keep_models_and_declared_changes_update_them_without_new_key(self):
         self.cycle()
+        group, account = self.synced_group(), self.fake.accounts[0]
+        # A model failing its probe stays routable while another declared model keeps the group healthy.
         self.fake.model_health.update({"model-a": "failed", "model-b": "healthy"})
+        self.fake.requests.clear()
         self.cycle()
-        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], ["model-b"])
-        self.assertEqual(self.fake.accounts[0]["credentials"]["model_mapping"], {"model-b": "model-b"})
+        self.assertEqual(self.fake.mutations(), [])
+        self.assertEqual(group["model_allowlist"]["models"], DECLARED)
+        # The upstream group's own model list decides the allowlist and the account mapping.
+        del self.fake.model_health["model-c"]
+        self.fake.model_health["model-d"] = "failed"
+        self.cycle()
+        models = ["model-a", "model-b", "model-d"]
+        self.assertEqual(group["model_allowlist"]["models"], models)
+        self.assertEqual(account["credentials"]["model_mapping"], {model: model for model in models})
         self.assertEqual(len(self.fake.keys), 1)
 
     def test_state_loss_recovers_mapping_from_markers_and_reuses_key(self):
@@ -397,20 +423,23 @@ class SyncIntegrationTests(unittest.TestCase):
             self.cycle()
         self.assertEqual(self.fake.mutations(), [])
 
-    def test_removed_upstream_access_disables_only_previously_marked_groups(self):
+    def test_removed_upstream_access_preserves_existing_groups(self):
         self.cycle()
+        before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.fake.requests.clear()
         self.fake.groups = [group for group in self.fake.groups if group["id"] != 7]
         self.cycle()
-        self.assertEqual(self.fake.local_groups[-1]["status"], "inactive")
-        self.assertEqual(self.fake.local_groups[0]["status"], "active")
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+        self.assertEqual(self.fake.mutations(), [])
 
-    def test_group_stays_inactive_until_its_account_is_bound(self):
+    def test_failed_account_creation_preserves_group_and_repairs_on_retry(self):
         self.fake.deny_accounts = True
         report = Synchronizer(self.config, State(self.config)).cycle()
-        self.assertEqual(len(report["errors"]), 1)
+        self.assertTrue(report["errors"])
         created = self.fake.local_groups[-1]
         self.assertIn("[7]", created["name"])
-        self.assertEqual(created["status"], "inactive")
+        self.assertEqual(created["status"], "active")
+        self.assertIn("no_bound_account", [row.get("reason") for row in report["actions"]])
         self.assertEqual(self.fake.accounts, [])
         self.fake.deny_accounts = False
         report = Synchronizer(self.config, State(self.config)).cycle()
@@ -431,7 +460,7 @@ class SyncIntegrationTests(unittest.TestCase):
         self.assertEqual(report["errors"], [])
         self.assertEqual(self.fake.accounts[0]["group_ids"], [group["id"]])
 
-    def test_group_without_account_is_held_while_key_is_pending(self):
+    def test_group_without_account_keeps_status_while_key_is_pending(self):
         Synchronizer(self.config, State(self.config)).cycle()
         group = self.fake.local_groups[-1]
         self.fake.accounts.clear()      # account deleted on the server
@@ -439,25 +468,293 @@ class SyncIntegrationTests(unittest.TestCase):
         self.config.auto_create_keys = False
         report = Synchronizer(self.config, State(self.config)).cycle()
         self.assertEqual(report["pending"], 1)
-        self.assertEqual(group["status"], "inactive")
+        self.assertEqual(group["status"], "active")
+        self.assertTrue(report["errors"])
         self.config.auto_create_keys = True
         Synchronizer(self.config, State(self.config)).cycle()
         self.assertEqual(group["status"], "active")
         self.assertEqual(self.fake.accounts[0]["group_ids"], [group["id"]])
 
-    def test_final_audit_disables_group_whose_account_cannot_be_scheduled(self):
+    def test_final_audit_reports_unschedulable_account_without_disabling_group(self):
         Synchronizer(self.config, State(self.config)).cycle()
         group = self.fake.local_groups[-1]
         self.fake.accounts[0]["schedulable"] = False
         self.fake.ignore_schedulable = True
         report = Synchronizer(self.config, State(self.config)).cycle()
-        self.assertEqual(group["status"], "inactive")
+        self.assertEqual(group["status"], "active")
         self.assertIn("no_bound_account", [row.get("reason") for row in report["actions"]])
         self.assertEqual(State(self.config).data["groups"]["7"]["last_reason"], "no_bound_account")
         self.fake.ignore_schedulable = False
         report = Synchronizer(self.config, State(self.config)).cycle()
         self.assertEqual(report["errors"], [])
         self.assertEqual(group["status"], "active")
+
+    def test_active_account_bound_to_multiple_groups_needs_no_writes(self):
+        self.cycle()
+        self.fake.accounts[0]["group_ids"].append(1)
+        before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.fake.requests.clear()
+        report = self.cycle()
+        self.assertEqual(report["errors"], [])
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_excluded_group_metadata_is_saved_as_one_batch(self):
+        self.fake.healthy_group_ids = {7, 8, 9}
+        self.cycle()
+        self.config.sync_limits = {}
+        self.fake.requests.clear()
+        state = State(self.config)
+        with patch.object(state, "save", wraps=state.save) as save:
+            report = Synchronizer(self.config, state).cycle()
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(save.call_count, 1)
+        self.assertEqual(self.fake.mutations(), [])
+        stored = State(self.config).data["groups"]
+        self.assertEqual(len(stored), 3)
+        self.assertTrue(all(row["last_status"] == "active" and row["last_reason"] == "platform_not_selected"
+                            for row in stored.values()))
+
+    def test_binding_repair_keeps_snapshot_and_newly_added_bindings(self):
+        self.cycle()
+        account = self.fake.accounts[0]
+        group_id = self.fake.local_groups[-1]["id"]
+        account["group_ids"] = [1]
+        stale = copy.deepcopy(account)
+        account["group_ids"].append(99)  # Another group was bound after the list response.
+        self.fake.requests.clear()
+        client = Client(self.config, State(self.config), "target")
+        ensure_account_binding(client, stale, group_id, "test")
+        self.assertEqual(account["group_ids"], sorted([1, 99, group_id]))
+        self.assertEqual(stale["group_ids"], account["group_ids"])
+        self.assertEqual(self.fake.mutations(), [
+            ("PUT", f"/down/api/v1/admin/accounts/{account['id']}", {"group_ids": account["group_ids"]})])
+
+    def test_binding_repair_skips_write_when_fresh_read_already_has_target(self):
+        self.cycle()
+        account = self.fake.accounts[0]
+        group_id = self.fake.local_groups[-1]["id"]
+        account["group_ids"].append(1)
+        stale = {**account, "group_ids": [1]}
+        self.fake.requests.clear()
+        ensure_account_binding(Client(self.config, State(self.config), "target"), stale, group_id, "test")
+        self.assertEqual(set(stale["group_ids"]), {1, group_id})
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_pending_or_failed_key_read_preserves_existing_route(self):
+        self.cycle()
+        before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.fake.rates["7"] = .5
+        self.fake.model_health["model-d"] = "failed"  # newly declared by the upstream group
+        # A failed read is retried in full next round; nothing is written meanwhile.
+        self.fake.requests.clear()
+        engine = Synchronizer(self.config, State(self.config))
+        with patch.object(engine, "_get_key", side_effect=SyncError("Key read failed")):
+            report = engine.cycle()
+        self.assertTrue(report["errors"])
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+        self.assertEqual(self.fake.mutations(), [])
+        self.assertEqual(State(self.config).data["groups"]["7"]["last_status"], "active")
+        # A pending Key can last for days: the route stays as it is, only its billing follows the upstream.
+        self.fake.requests.clear()
+        engine = Synchronizer(self.config, State(self.config))
+        with patch.object(engine, "_get_key", return_value=None):
+            report = engine.cycle()
+        self.assertEqual((report["pending"], report["billing_refreshed"]), (1, 1))
+        group, account = self.synced_group(), self.fake.accounts[0]
+        self.assertEqual(self.fake.mutations(), [
+            ("PUT", f"/down/api/v1/admin/groups/{group['id']}", {"rate_multiplier": .5}),
+            ("PUT", f"/down/api/v1/admin/accounts/{account['id']}", {"rate_multiplier": .5})])
+        self.assertEqual(group["model_allowlist"], before[0][-1]["model_allowlist"])
+        self.assertEqual(account["credentials"], before[1][0]["credentials"])
+        self.assertEqual(self.fake.keys, before[2])
+        stored = State(self.config).data["groups"]["7"]
+        self.assertEqual((stored["last_status"], stored["last_rate"], stored["source_rate"]), ("active", .5, .5))
+        self.assertEqual(self.cycle()["errors"], [])
+        self.assertEqual(group["model_allowlist"]["models"], DECLARED + ["model-d"])
+        self.assertEqual(len(self.fake.keys), 1)
+
+    def test_failed_account_update_leaves_group_unmodified_and_retry_reuses_resources(self):
+        self.cycle()
+        before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.fake.rates["7"] = .5
+        self.fake.model_health["model-d"] = "failed"  # newly declared by the upstream group
+        engine = Synchronizer(self.config, State(self.config))
+        original = engine.target.request
+
+        def reject_account_update(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/admin/accounts/"):
+                raise SyncError("Account update failed")
+            return original(method, path, *args, **kwargs)
+
+        self.fake.requests.clear()
+        with patch.object(engine.target, "request", side_effect=reject_account_update):
+            report = engine.cycle()
+        self.assertTrue(report["errors"])
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+        self.assertEqual(self.fake.mutations(), [])
+        self.assertEqual(self.cycle()["errors"], [])
+        self.assertEqual(self.fake.local_groups[-1]["id"], before[0][-1]["id"])
+        self.assertEqual(self.fake.accounts[0]["id"], before[1][0]["id"])
+        self.assertEqual(len(self.fake.keys), 1)
+        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], DECLARED + ["model-d"])
+        mutations = self.fake.mutations()
+        account_write = next(i for i, (_, path, _) in enumerate(mutations) if "/accounts/" in path)
+        group_write = next(i for i, (_, path, _) in enumerate(mutations) if "/groups/" in path)
+        self.assertLess(account_write, group_write)
+
+    def test_failed_group_update_keeps_routes_active_and_retries_in_place(self):
+        self.cycle()
+        before = copy.deepcopy(self.fake.local_groups)
+        account_id, key_id = self.fake.accounts[0]["id"], self.fake.keys[0]["id"]
+        self.fake.rates["7"] = .5
+        engine = Synchronizer(self.config, State(self.config))
+        original = engine.target.request
+
+        def reject_group_update(method, path, *args, **kwargs):
+            if method == "PUT" and path.startswith("/admin/groups/"):
+                raise SyncError("Group update failed")
+            return original(method, path, *args, **kwargs)
+
+        with patch.object(engine.target, "request", side_effect=reject_group_update):
+            report = engine.cycle()
+        self.assertTrue(report["errors"])
+        self.assertEqual(self.fake.local_groups, before)
+        self.assertEqual(self.fake.accounts[0]["status"], "active")
+        self.assertTrue(self.fake.accounts[0]["schedulable"])
+        self.assertEqual(self.cycle()["errors"], [])
+        self.assertEqual(self.fake.local_groups[-1]["id"], before[-1]["id"])
+        self.assertEqual(self.fake.local_groups[-1]["rate_multiplier"], .5)
+        self.assertEqual(self.fake.accounts[0]["id"], account_id)
+        self.assertEqual(self.fake.keys[0]["id"], key_id)
+
+    def synced_account(self, upstream_id=7):
+        local_id = State(self.config).data["groups"][str(upstream_id)]["local_account_id"]
+        return next(row for row in self.fake.accounts if row["id"] == local_id)
+
+    def routes(self, group, account):
+        """Everything that decides whether and where a request is routed."""
+        return copy.deepcopy((group["model_allowlist"], group["status"], account["credentials"],
+                              account["group_ids"], account["status"], account["schedulable"]))
+
+    def test_unhealthy_group_keeps_its_route_but_bills_at_current_upstream_prices(self):
+        self.config.price_sync_platforms = {"openai"}
+        self.fake.model_prices = {"model-a": {"input_per_million": 1, "output_per_million": 4}}
+        self.cycle()
+        group, account = self.synced_group(), self.fake.accounts[0]
+        routes = self.routes(group, account)
+        self.fake.health = "failed"  # no healthy model left: the route is kept as it is
+        self.fake.rates["7"] = .5
+        self.fake.model_prices["model-a"]["input_per_million"] = 2
+        self.fake.requests.clear()
+        with self.assertLogs("sub2api-sync", "INFO") as logs:
+            report = self.cycle()
+        self.assertEqual(report["usable_groups"], 0)
+        self.assertEqual((report["billing_refreshed"], report["pricing_updated"]), (1, 1))
+        self.assertIn({"upstream_id": 7, "action": "refresh_billing", "group_fields": ["model_pricing", "rate_multiplier"],
+                       "account_fields": ["rate_multiplier"]}, report["actions"])
+        self.assertIn("「Alpha」#7：保留现有路由，计费已按上游更新（倍率 0.25 → 0.5、模型价格、账号成本倍率 → 0.5）",
+                      "\n".join(logs.output))
+        self.assertEqual([(path, sorted(body)) for _, path, body in self.fake.mutations()], [
+            (f"/down/api/v1/admin/groups/{group['id']}", ["model_pricing", "rate_multiplier"]),
+            (f"/down/api/v1/admin/accounts/{account['id']}", ["rate_multiplier"])])
+        self.assertEqual((group["rate_multiplier"], account["rate_multiplier"]), (.5, .5))
+        self.assertEqual(group["model_pricing"][0]["input_price"], 2e-6)
+        self.assertEqual(self.routes(group, account), routes)
+        stored = State(self.config).data["groups"]["7"]
+        self.assertEqual((stored["last_rate"], stored["source_rate"], stored["last_reason"]), (.5, .5, "no_healthy_models"))
+        self.fake.requests.clear()
+        self.assertEqual(self.cycle()["billing_refreshed"], 0)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_groups_outside_the_sync_scope_keep_billing_current(self):
+        self.fake.healthy_group_ids = {7, 8, 9}
+        self.cycle()
+        before = {upstream_id: self.routes(self.synced_group(upstream_id), self.synced_account(upstream_id))
+                  for upstream_id in (7, 8, 9)}
+        # Ranking scope: the kept group gets a full update, the other two only their new rate.
+        self.config.sync_limits = {"openai": 1}
+        self.fake.rates = {"7": .5, "8": .5, "9": .5}
+        report = self.cycle()
+        kept, = [row["upstream_id"] for row in report["groups"]]
+        self.assertEqual(report["billing_refreshed"], 2)
+        for upstream_id in (7, 8, 9):
+            self.assertEqual(self.synced_group(upstream_id)["rate_multiplier"], .5)
+            self.assertEqual(State(self.config).data["groups"][str(upstream_id)]["last_reason"],
+                             "healthy_models" if upstream_id == kept else "outside_sync_top_n")
+        # Platform scope: every route is kept and billed at the current rate.
+        self.config.sync_limits = {"gemini": 0}
+        self.fake.rates = {"7": .75, "8": .75, "9": .75}
+        report = self.cycle()
+        self.assertEqual((report["usable_groups"], report["billing_refreshed"]), (0, 3))
+        for upstream_id in (7, 8, 9):
+            group, account = self.synced_group(upstream_id), self.synced_account(upstream_id)
+            self.assertEqual((group["rate_multiplier"], account["rate_multiplier"]), (.75, .75))
+            if upstream_id != kept:
+                self.assertEqual(self.routes(group, account), before[upstream_id])
+        # An explicit ID list is an operational scope: groups outside it are not touched at all.
+        self.config.sync_limits = {"openai": 0}
+        self.config.group_ids = {kept}
+        self.fake.rates = {"7": 1.25, "8": 1.25, "9": 1.25}
+        self.cycle()
+        self.assertEqual({upstream_id: self.synced_group(upstream_id)["rate_multiplier"] for upstream_id in (7, 8, 9)},
+                         {upstream_id: 1.25 if upstream_id == kept else .75 for upstream_id in (7, 8, 9)})
+
+    def test_billing_refresh_is_planned_in_preview_and_deferred_when_the_round_halts(self):
+        self.cycle()
+        group = self.synced_group()
+        self.fake.healthy_group_ids = {8}  # 7 is kept as it is; 8 is new
+        self.fake.rates["7"] = .5
+        self.config.dry_run = True
+        self.fake.requests.clear()
+        report = self.cycle()
+        self.assertIn({"upstream_id": 7, "action": "refresh_billing", "group_fields": ["rate_multiplier"],
+                       "account_fields": ["rate_multiplier"]}, report["actions"])
+        self.assertEqual(self.fake.mutations(), [])
+        self.config.dry_run = False
+        self.fake.deny_groups = True  # creating 8 is rejected with 403, which halts the round
+        report = self.cycle()
+        self.assertTrue(report["errors"])
+        self.assertEqual((report["billing_refreshed"], group["rate_multiplier"]), (0, .25))
+        self.fake.deny_groups = False
+        self.assertEqual(self.cycle()["billing_refreshed"], 1)
+        self.assertEqual(group["rate_multiplier"], .5)
+
+    def test_kept_route_without_hall_prices_keeps_its_price_cards(self):
+        self.config.price_sync_platforms = {"openai"}
+        self.fake.model_prices = {"model-a": {"input_per_million": 1, "output_per_million": 4}}
+        self.cycle()
+        group = self.synced_group()
+        cards = copy.deepcopy(group["model_pricing"])
+        providers = self.fake.providers
+
+        def without_alpha():
+            snapshot = providers()
+            snapshot["items"] = [item for item in snapshot["items"] if item["group_id"] != 7]
+            snapshot["total"] = len(snapshot["items"])
+            return snapshot
+
+        self.fake.providers = without_alpha
+        self.fake.rates["7"] = .5
+        self.fake.requests.clear()
+        self.cycle()
+        self.assertEqual(State(self.config).data["groups"]["7"]["last_reason"], "not_in_provider_hall")
+        self.assertEqual([body for _, path, body in self.fake.mutations() if "/groups/" in path],
+                         [{"rate_multiplier": .5}])
+        self.assertEqual(group["model_pricing"], cards)
+
+    def test_invalid_rate_on_a_kept_route_is_reported_without_writes(self):
+        self.cycle()
+        self.fake.healthy_group_ids = set()
+        for value in ("NaN", -1, "bad"):
+            with self.subTest(value=value):
+                self.fake.rates = {"7": value}
+                self.fake.requests.clear()
+                report = self.cycle()
+                self.assertEqual([row["upstream_id"] for row in report["errors"]], [7])
+                self.assertIn("计费刷新失败", report["errors"][0]["error"])
+                self.assertEqual(self.fake.mutations(), [])
+                self.assertEqual(self.synced_group()["rate_multiplier"], .25)
 
     def test_account_concurrency_follows_setting(self):
         Synchronizer(self.config, State(self.config)).cycle()
@@ -474,7 +771,7 @@ class SyncIntegrationTests(unittest.TestCase):
     def test_logs_name_the_upstream_group(self):
         with self.assertLogs("sub2api-sync", "INFO") as logs:
             self.cycle()
-        self.assertIn("「Alpha」#7：分组已启用，账号已新建，模型 1", "\n".join(logs.output))
+        self.assertIn("「Alpha」#7：分组已新建，账号已新建，模型 3", "\n".join(logs.output))
         self.assertNotIn("group=", "\n".join(logs.output))
 
     def synced_group(self, upstream_id=7):
@@ -600,6 +897,7 @@ class SyncIntegrationTests(unittest.TestCase):
     def test_every_sync_fixes_concurrency_of_disabled_accounts_but_not_unrelated_ones(self):
         self.cycle()
         owned = self.fake.accounts[0]
+        owned["status"] = "inactive"  # Manually disabled on the target site.
         self.fake.health = "failed"
         self.cycle()
         self.assertEqual(owned["status"], "inactive")
@@ -646,7 +944,7 @@ class SyncIntegrationTests(unittest.TestCase):
         self.fake.groups.append({"id": 7, "name": "New", "platform": "openai",
                                  "status": "active", "rate_multiplier": 0.2})
         self.fake.healthy_group_ids = {7, 8}
-        self.fake.model_health.update({"model-a": "failed", "model-b": "healthy"})
+        self.fake.model_health["model-d"] = "failed"  # newly declared by the upstream group
         self.fake.hourly_key_limit = True
         self.config.rate_limit_retries = 2
         with patch("sync_sub2api.time.sleep") as sleep:
@@ -654,9 +952,33 @@ class SyncIntegrationTests(unittest.TestCase):
         self.assertEqual(report["errors"], [])
         self.assertEqual(report["pending"], 1)
         self.assertEqual(len(report["warnings"]), 1)
-        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], ["model-b"])
+        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], DECLARED + ["model-d"])
         self.assertEqual(len(self.fake.keys), 1)
         sleep.assert_not_called()
+
+    def test_key_count_limit_defers_new_routes_and_continues_updating_existing_ones(self):
+        self.fake.healthy_group_ids = {8}
+        self.cycle()
+        group_id, account_id, key_id = (self.fake.local_groups[-1]["id"],
+                                       self.fake.accounts[0]["id"], self.fake.keys[0]["id"])
+        self.fake.healthy_group_ids = {7, 8, 9}
+        self.fake.model_health["model-d"] = "failed"  # newly declared by the upstream group
+        self.fake.key_count_limit = True
+        self.fake.requests.clear()
+        report = self.cycle()
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["pending"], 2)
+        self.assertEqual(len(report["warnings"]), 1)
+        self.assertIn("API_KEY_COUNT_EXCEEDED", report["warnings"][0]["warning"])
+        self.assertNotIn("权限", report["warnings"][0]["warning"])
+        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], DECLARED + ["model-d"])
+        self.assertEqual((len(self.fake.local_groups), len(self.fake.accounts), len(self.fake.keys)), (2, 1, 1))
+        self.assertEqual((self.fake.local_groups[-1]["id"], self.fake.accounts[0]["id"], self.fake.keys[0]["id"]),
+                         (group_id, account_id, key_id))
+        attempts = [path for method, path, _ in self.fake.requests if method == "POST" and path.endswith("/keys")]
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(State(self.config).data["groups"]["7"]["last_reason"], "pending_upstream_key")
+        self.assertFalse(APIError(403, "PUT", "/admin/groups/1", "API_KEY_COUNT_EXCEEDED").key_creation_limited)
 
     def test_expired_session_refreshes_and_persists_rotated_token(self):
         state = State(self.config)

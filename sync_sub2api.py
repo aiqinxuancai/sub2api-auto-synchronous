@@ -62,8 +62,12 @@ class APIError(SyncError):
         self.status = status
         self.retry_after = retry_after
         self.code = re.sub(r"[^A-Za-z0-9_-]", "", str(code))[:80]
+        self.key_creation_limited = (method == "POST" and path.split("?")[0] == "/keys" and self.code in {
+            "API_KEY_CREATE_RATE_LIMITED", "API_KEY_COUNT_EXCEEDED"})
         hint = ""
-        if status == 403:
+        if self.key_creation_limited and self.code == "API_KEY_COUNT_EXCEEDED":
+            hint = "；上游 Key 数量已达上限，保留已有 Key，继续同步可复用 Key 的分组"
+        elif status == 403:
             hint = "；请检查管理密钥的分组、账号权限，自动创建分组可能需要全权访问"
         elif status == 429:
             hint = "；接口已限流，后续周期会继续处理剩余分组"
@@ -170,7 +174,7 @@ class Config:
     report_file: Path = Path("data/last-report.json")
     providers_path: str = "/api/v2/public/providers"
     max_new_keys: int = 50
-    disable_unavailable: bool = True
+    disable_unavailable: bool = False  # Legacy setting, ignored: synchronization never disables routes.
     request_interval: float = 1.1
     rate_limit_retries: int = 2
     upstream_api: str = field(init=False)
@@ -239,7 +243,16 @@ def write_private_json(path: Path, value: Any) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        # Windows readers or file scanners can briefly deny an atomic replacement.
+        # Retry only the local replacement, never a remote API mutation.
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * 2 ** attempt)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -492,6 +505,29 @@ class SelectedGroup:
     stats: dict[str, float | None] = field(default_factory=dict)  # hall_stats()
 
 
+@dataclass
+class BillingRefresh:
+    """Billing fields to write for a route kept as it is."""
+    source_rate: float
+    local_rate: float
+    model_pricing: list[dict[str, Any]] | None  # None: price cards left as they are
+    group_fields: dict[str, Any]
+    account_fields: dict[str, Any]
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.group_fields or self.account_fields)
+
+
+# Upstream group fields copied to the local group: capabilities, then billing.
+CAPABILITY_FIELDS = ("allow_image_generation", "allow_batch_image_generation", "allow_messages_dispatch", "allow_live")
+BILLING_FIELDS = ("long_context_pricing_enabled", "image_count_billing", "image_rate_independent",
+                  "video_rate_independent", "batch_image_discount_multiplier", "batch_image_hold_multiplier",
+                  "image_price_1k", "image_price_2k", "image_price_4k",
+                  "video_price_480p", "video_price_720p", "video_price_1080p")
+SCALED_RATE_FIELDS = ("image_rate_multiplier", "video_rate_multiplier")  # multiplied by the resale factor
+
+
 STATS_PREFIX = "供应商大厅 1h："
 
 
@@ -534,10 +570,32 @@ def without_stats(description: Any) -> str:
     return "\n".join(lines[:-1] if lines[-1].startswith(STATS_PREFIX) else lines)
 
 
+def applicable_rate(group: dict[str, Any], rates: dict[str, Any]) -> Decimal:
+    """The user's exclusive rate (0 included) when present, otherwise the group rate."""
+    return multiplier(rates[str(group["id"])] if str(group["id"]) in rates else group.get("rate_multiplier"))
+
+
+def hall_prices(item: dict[str, Any]) -> dict[str, Any]:
+    """Model -> hall price (USD per 1M tokens) declared by a provider item."""
+    return {entry["model"]: entry.get("price") for entry in item.get("group_models", [])
+            if isinstance(entry, dict) and isinstance(entry.get("model"), str)}
+
+
+def healthy_card(card: Any, declared: set[str], item: dict[str, Any], now: datetime) -> bool:
+    """A current healthy probe of a declared model, with the same model-card health as /providers."""
+    if not isinstance(card, dict):
+        return False
+    expires = parse_time(card.get("health_expires_at"))
+    return (card.get("model") in declared and card.get("health") == "healthy"
+            and card.get("probe_state", item.get("probe_state")) == "enabled"
+            and expires is not None and expires > now)
+
+
 def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
                   providers: dict[str, Any], config: Config,
                   now: datetime) -> tuple[list[SelectedGroup], dict[int, str]]:
-    """Use the same model-card health as /providers; unknown is not healthy."""
+    """A group qualifies when at least one declared model is healthy (unknown is not healthy);
+    it then routes all of its declared models."""
     if not isinstance(providers, dict) or not isinstance(providers.get("items"), list):
         raise SyncError("供应商大厅接口结构无效，取消同步")
     if providers.get("stale") is True:
@@ -595,24 +653,16 @@ def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
             continue
         declared = {m["model"] for m in item.get("group_models", [])
                     if isinstance(m, dict) and isinstance(m.get("model"), str)}
-        models = []
-        for card in item.get("model_cards", []):
-            expires = parse_time(card.get("health_expires_at"))
-            model = card.get("model")
-            if (model in declared and model not in models and card.get("health") == "healthy"
-                    and card.get("probe_state", item.get("probe_state")) == "enabled"
-                    and expires is not None and expires > now):
-                models.append(model)
-        if not models:
+        if not any(healthy_card(card, declared, item, now) for card in item.get("model_cards", [])):
             excluded[group_id] = "no_healthy_models"
             continue
-        source_rate = multiplier(rates[str(group_id)] if str(group_id) in rates
-                                 else group.get("rate_multiplier"))
-        prices = {entry["model"]: entry.get("price") for entry in item.get("group_models", [])
-                  if isinstance(entry, dict) and isinstance(entry.get("model"), str)}
+        # Health only gates the group. Every declared model is routed, because groups apply their
+        # own model rules and a single failed probe must not cut users off from a model.
+        models = declared
+        source_rate = applicable_rate(group, rates)
         selected.append(SelectedGroup(group, sorted(models), float(source_rate),
                                       scaled_rate(source_rate, config.rate_factor), **ranks.get(group_id, {}),
-                                      prices=prices, stats=hall_stats(item)))
+                                      prices=hall_prices(item), stats=hall_stats(item)))
     selected.sort(key=lambda group: group.sync_order)
     return selected, excluded
 
@@ -638,18 +688,26 @@ def bound_group_ids(account: dict[str, Any]) -> list[int]:
 
 def ensure_account_binding(client: "Client", account: dict[str, Any], local_group_id: int,
                            label: str) -> None:
-    """Bind the account to exactly this group and confirm it on the server.
+    """Add the required binding without removing routes used by other groups.
 
     Some Sub2API versions ignore `group_ids` when creating an account, so an
     account can exist and be enabled while its group still has no account.
     """
-    if bound_group_ids(account) == [local_group_id]:
+    if local_group_id in bound_group_ids(account):
         return
-    client.request("PUT", f"/admin/accounts/{account['id']}", {"group_ids": [local_group_id]})
+    # Read the latest bindings before adding one, so an old list response cannot discard newer bindings.
+    current = client.request("GET", f"/admin/accounts/{account['id']}")
+    if not isinstance(current, dict):
+        raise SyncError(f"{label}: 无法读取账号 {account['id']} 的当前绑定，本轮更新停止")
+    wanted = sorted(set(bound_group_ids(account)) | set(bound_group_ids(current)) | {local_group_id})
+    if set(wanted) <= set(bound_group_ids(current)):
+        account["group_ids"] = bound_group_ids(current)
+        return
+    client.request("PUT", f"/admin/accounts/{account['id']}", {"group_ids": wanted})
     confirmed = client.request("GET", f"/admin/accounts/{account['id']}")
-    if not isinstance(confirmed, dict) or bound_group_ids(confirmed) != [local_group_id]:
-        raise SyncError(f"{label}: 账号 {account['id']} 未能绑定到本地分组 {local_group_id}，本轮更新停止")
-    account["group_ids"] = [local_group_id]
+    if not isinstance(confirmed, dict) or not set(wanted) <= set(bound_group_ids(confirmed)):
+        raise SyncError(f"{label}: 账号 {account['id']} 未能保留现有绑定并绑定到本地分组 {local_group_id}，本轮更新停止")
+    account["group_ids"] = bound_group_ids(confirmed)
 
 
 # Sub2API group price card field -> upstream hall price field (USD per 1M tokens).
@@ -727,6 +785,7 @@ class Synchronizer:
         self.new_keys = 0
         self.concurrency_fixed = 0
         self.pricing_updated = 0
+        self.billing_refreshed = 0  # preserved routes whose rate or prices followed the upstream
         self.key_creation_blocked = False
         self.keys: list[dict[str, Any]] | None = None
 
@@ -746,29 +805,59 @@ class Synchronizer:
             description += "\n" + str(group["description"])
         desired = {
             "name": self.name(group), "description": with_stats(description, selected.stats),
-            "platform": group["platform"], "rate_multiplier": selected.local_rate,
+            "platform": group["platform"],
             "status": "active", "model_allowlist": {"enabled": True, "models": selected.models},
         }
-        # Preserve the upstream's image/video price definitions. Apply the resale
-        # factor to independent media multipliers, not to both prices and multipliers.
-        for key in (
-            "long_context_pricing_enabled", "allow_image_generation",
-            "allow_batch_image_generation", "image_count_billing", "image_rate_independent",
-            "video_rate_independent", "batch_image_discount_multiplier",
-            "batch_image_hold_multiplier", "image_price_1k", "image_price_2k", "image_price_4k",
-            "video_price_480p", "video_price_720p", "video_price_1080p", "allow_messages_dispatch",
-            "allow_live",
-        ):
+        for key in CAPABILITY_FIELDS:
             if key in group:
                 desired[key] = group[key]
-        for key in ("image_rate_multiplier", "video_rate_multiplier"):
-            if key in group:
-                desired[key] = scaled_rate(group[key], self.config.rate_factor)
-        if group["platform"] in self.config.price_sync_platforms:
-            desired["model_pricing"] = hall_model_pricing(group["platform"], selected.models, selected.prices)
+        desired.update(self.billing_payload(group, selected.local_rate, selected.models, selected.prices, priced))
+        return desired
+
+    def billing_payload(self, source: dict[str, Any], local_rate: float, models: list[str],
+                        prices: dict[str, Any] | None, priced: bool) -> dict[str, Any]:
+        """Group fields that decide what users pay; `prices=None` leaves the price cards as they are."""
+        desired: dict[str, Any] = {"rate_multiplier": local_rate}
+        # Preserve the upstream's image/video price definitions. Apply the resale
+        # factor to independent media multipliers, not to both prices and multipliers.
+        for key in BILLING_FIELDS:
+            if key in source:
+                desired[key] = source[key]
+        for key in SCALED_RATE_FIELDS:
+            if key in source:
+                desired[key] = scaled_rate(source[key], self.config.rate_factor)
+        if source["platform"] in self.config.price_sync_platforms:
+            if prices is not None:
+                desired["model_pricing"] = hall_model_pricing(source["platform"], models, prices)
         elif priced:
             desired["model_pricing"] = []  # price sync turned off: back to the target's built-in prices
         return desired
+
+    def billing_refresh(self, source: dict[str, Any], rates: dict[str, Any], item: dict[str, Any] | None,
+                        group: dict[str, Any], account: dict[str, Any] | None, priced: bool) -> BillingRefresh:
+        """Billing changes for a route kept as it is: models, status, credentials and bindings stay untouched.
+
+        Price cards follow the group's current allowlist, i.e. the models users can actually call.
+        Without a hall entry there are no prices to compare, so existing cards are kept.
+        """
+        source_rate = applicable_rate(source, rates)
+        local_rate = scaled_rate(source_rate, self.config.rate_factor)
+        models = (group.get("model_allowlist") or {}).get("models") or []
+        prices = hall_prices(item) if item is not None and models else None
+        desired = self.billing_payload(source, local_rate, models, prices, priced)
+        account_fields = {} if account is None else changed_fields(account, {"rate_multiplier": float(source_rate)})
+        return BillingRefresh(float(source_rate), local_rate, desired.get("model_pricing"),
+                              changed_fields(group, desired), account_fields)
+
+    def apply_billing(self, group: dict[str, Any], account: dict[str, Any] | None, refresh: BillingRefresh) -> None:
+        if refresh.group_fields:
+            self.target.request("PUT", f"/admin/groups/{group['id']}", refresh.group_fields)
+            group.update(refresh.group_fields)
+        if account is not None and refresh.account_fields:
+            self.target.request("PUT", f"/admin/accounts/{account['id']}", refresh.account_fields)
+            account.update(refresh.account_fields)
+        self.pricing_updated += "model_pricing" in refresh.group_fields
+        self.billing_refreshed += refresh.changed
 
     def _discover(self, local: list[dict[str, Any]], field_name: str,
                   mapping_name: str) -> dict[int, dict[str, Any]]:
@@ -822,15 +911,6 @@ class Synchronizer:
             raise SyncError(f"上游分组 {group_id}: 无法取得完整 API Key")
         return key
 
-    def _hold_without_account(self, group: dict[str, Any] | None,
-                              account: dict[str, Any] | None) -> None:
-        """Keep a group out of routing while no account has selected it."""
-        if (group and self.config.sync_accounts and group.get("status") != "inactive"
-                and (account is None or bound_group_ids(account) != [group["id"]])):
-            # Sub2API creates groups active; a group without accounts only returns 503.
-            self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
-            group["status"] = "inactive"
-
     def _enforce_concurrency(self, accounts: list[dict[str, Any]], report: dict[str, Any]) -> None:
         """Final pass: every account this tool owns, disabled ones included, uses the configured concurrency."""
         owned = re.compile(r"\[sub2api-(?:sync|lowcost|bestsource):" + re.escape(self.source_id) + r":")
@@ -853,25 +933,73 @@ class Synchronizer:
 
     def _audit_bindings(self, local_groups: list[dict[str, Any]], accounts: list[dict[str, Any]],
                         report: dict[str, Any]) -> None:
-        """Final pass: every active managed group must have an active account that selected it."""
+        """Report missing usable bindings without changing any group's routing status."""
         covered = {group_id for account in accounts
                    if account.get("status") == "active" and account.get("schedulable") is not False
                    for group_id in bound_group_ids(account)}
+        changed = False
         for upstream_id, group in sorted(self._discover(local_groups, "description", "local_group_id").items()):
             if group.get("status") != "active" or group["id"] in covered:
                 continue
-            try:
-                self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
-            except SyncError as error:
-                report["errors"].append({"upstream_id": upstream_id, "name": group.get("name"), "error": str(error)})
-                continue
             mapping = self.state.data["groups"].setdefault(str(upstream_id), {})
-            mapping.update({"last_status": "inactive", "last_reason": "no_bound_account"})
-            self.state.save()
-            report["actions"].append({"upstream_id": upstream_id, "action": "disable", "reason": "no_bound_account"})
-            message = f"本地分组 {group_label(group['id'], group.get('name'))} 没有可用的绑定账号，已停用，下轮自动修复"
+            mapping.update({"last_status": group["status"], "last_reason": "no_bound_account"})
+            changed = True
+            report["actions"].append({"upstream_id": upstream_id, "action": "preserve", "reason": "no_bound_account"})
+            message = f"本地分组 {group_label(group['id'], group.get('name'))} 未发现可用的绑定账号，保留现有状态，等待后续修复"
             report["errors"].append({"upstream_id": upstream_id, "name": group.get("name"), "error": message})
             LOG.warning("%s", message)
+        if changed:
+            self.state.save()
+
+    def _refresh_preserved(self, group_ids: list[int], managed_groups: dict[int, dict[str, Any]],
+                           managed_accounts: dict[int, dict[str, Any]], groups: list[dict[str, Any]],
+                           rates: dict[str, Any], providers: dict[str, Any], report: dict[str, Any]) -> None:
+        """Routes kept outside this round's update still bill at the upstream's current rate and prices."""
+        sources = {group["id"]: group for group in groups}
+        items = {as_int(str(item.get("group_id", "")), "provider group_id"): item for item in providers["items"]}
+        targets = [group_id for group_id in group_ids if group_id in managed_groups and group_id in sources]
+        if targets:
+            progress(f"检查 {len(targets)} 个保留分组的倍率与价格")
+        for group_id in targets:
+            group, source = managed_groups[group_id], sources[group_id]
+            account = managed_accounts.get(group_id)
+            label = group_label(group_id, source.get("name"))
+            priced = self.state.data["groups"].get(str(group_id), {}).get("model_pricing_synced", False)
+            try:
+                if source.get("platform") != group.get("platform"):
+                    raise SyncError(f"上游分组 {group_id}: 平台发生变化，请人工确认映射")
+                refresh = self.billing_refresh(source, rates, items.get(group_id), group, account, priced)
+                if not refresh.changed:
+                    continue
+                report["actions"].append({"upstream_id": group_id, "action": "refresh_billing",
+                                          "group_fields": sorted(refresh.group_fields),
+                                          "account_fields": sorted(refresh.account_fields)})
+                if self.config.dry_run:
+                    continue
+                previous_rate = group.get("rate_multiplier")
+                self.apply_billing(group, account, refresh)
+            except SyncError as error:
+                report["errors"].append({"upstream_id": group_id, "name": source.get("name"),
+                                         "error": f"保留分组的计费刷新失败：{error}"})
+                LOG.error("%s：保留分组的计费刷新失败：%s", label, error)
+                if isinstance(error, APIError) and error.status in {401, 403, 429}:
+                    break
+                continue
+            mapping = self.state.data["groups"].setdefault(str(group_id), {})
+            mapping.update({"last_rate": refresh.local_rate, "source_rate": refresh.source_rate})
+            if refresh.model_pricing is not None:
+                mapping["model_pricing_synced"] = bool(refresh.model_pricing)
+            self.state.save()
+            changes = []
+            if "rate_multiplier" in refresh.group_fields:
+                changes.append(f"倍率 {previous_rate} → {refresh.local_rate:g}")
+            if "model_pricing" in refresh.group_fields:
+                changes.append("模型价格")
+            if set(refresh.group_fields) - {"rate_multiplier", "model_pricing"}:
+                changes.append("媒体计费")
+            if refresh.account_fields:
+                changes.append(f"账号成本倍率 → {refresh.source_rate:g}")
+            LOG.info("%s：保留现有路由，计费已按上游更新（%s）", label, "、".join(changes))
 
     def _sync_account(self, selected: SelectedGroup, local_group_id: int,
                       account: dict[str, Any] | None, key: dict[str, Any]) -> tuple[int, str]:
@@ -910,7 +1038,7 @@ class Synchronizer:
                 self.concurrency_fixed += "concurrency" in patch
                 action = "updated"
             else:
-                action = "unchanged" if bound_group_ids(account) == [local_group_id] else "rebound"
+                action = "unchanged" if local_group_id in bound_group_ids(account) else "rebound"
         ensure_account_binding(self.target, account, local_group_id, f"上游分组 {group_id}")
         if account.get("schedulable") is not True:
             self.target.request("POST", f"/admin/accounts/{account['id']}/schedulable",
@@ -993,47 +1121,33 @@ class Synchronizer:
         if not self.config.dry_run:
             for group_id, local_group in managed_groups.items():
                 mapping = self.state.data["groups"].setdefault(str(group_id), {})
-                mapping["local_group_id"] = local_group["id"]
+                mapping.update({"local_group_id": local_group["id"],
+                                "last_status": local_group.get("status", "pending"),
+                                "name": local_group.get("name"), "platform": local_group.get("platform"),
+                                "last_rate": local_group.get("rate_multiplier"),
+                                "models": (local_group.get("model_allowlist") or {}).get("models", [])})
                 if group_id in managed_accounts:
                     mapping["local_account_id"] = managed_accounts[group_id]["id"]
-            self.state.save()
         selected_ids = {group.source["id"] for group in selected}
-        # Disable before creating new resources, so a key-creation rate limit
-        # cannot delay removing unhealthy resources from local routing.
-        if self.config.disable_unavailable or excluded:
-            for group_id in sorted(set(managed_groups) | set(managed_accounts)):
-                if group_id in selected_ids:
-                    continue
-                reason = excluded.get(group_id, "no_longer_accessible")
-                if reason == "group_not_selected":
-                    continue  # The explicit ID list is an operational scope, as in the CLI.
-                if not self.config.disable_unavailable and reason not in {
-                        "platform_not_selected", "outside_sync_top_n", "group_not_selected"}:
-                    continue
-                group = managed_groups.get(group_id)
-                account = managed_accounts.get(group_id)
-                action = {"upstream_id": group_id, "action": "disable", "reason": reason}
-                report["actions"].append(action)
-                if self.config.dry_run:
-                    continue
-                progress(f"停用不再可用的分组 {group_label(group_id, (group or account or {}).get('name'))}")
-                try:
-                    # Mark the group inactive first: stops all user keys in the group.
-                    if group and group.get("status") != "inactive":
-                        self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "inactive"})
-                    if account and account.get("status") != "inactive":
-                        self.target.request("PUT", f"/admin/accounts/{account['id']}",
-                                            {"status": "inactive"})
-                    if account and account.get("schedulable") is not False:
-                        self.target.request("POST", f"/admin/accounts/{account['id']}/schedulable",
-                                            {"schedulable": False})
-                    mapping = self.state.data["groups"].setdefault(str(group_id), {})
-                    mapping.update({"last_status": "inactive", "last_reason": reason})
-                    self.state.save()
-                except SyncError as error:
-                    report["errors"].append({"upstream_id": group_id, "name": (group or account or {}).get("name"),
-                                             "error": str(error)})
+        preserved: list[int] = []  # routes kept as they are; their billing is refreshed after the updates
+        # Selection limits this round's updates, never the lifetime of an existing route.
+        for group_id in sorted(set(managed_groups) | set(managed_accounts)):
+            if group_id in selected_ids:
+                continue
+            reason = excluded.get(group_id, "no_longer_accessible")
+            if reason == "group_not_selected":
+                continue  # The explicit ID list is an operational scope, as in the CLI.
+            preserved.append(group_id)
+            report["actions"].append({"upstream_id": group_id, "action": "preserve", "reason": reason})
+            if not self.config.dry_run:
+                mapping = self.state.data["groups"].setdefault(str(group_id), {})
+                mapping["last_reason"] = reason
+                LOG.info("%s：本轮未选中（%s），保留现有分组与账号", group_label(group_id), reason)
+        if not self.config.dry_run:
+            # Discovery and exclusion only change local metadata; persist the batch once.
+            self.state.save()
         sorted_groups = {}
+        halted = False
         for index, selected_group in enumerate(selected):
             group_id = selected_group.source["id"]
             group = managed_groups.get(group_id)
@@ -1056,7 +1170,11 @@ class Synchronizer:
                 if self.config.sync_accounts and key is None:
                     action["result"] = "pending_upstream_key"
                     report["pending"] += 1
-                    self._hold_without_account(group, account)
+                    mapping = self.state.data["groups"].setdefault(str(group_id), {})
+                    mapping["last_reason"] = "pending_upstream_key"
+                    self.state.save()
+                    if group is not None:
+                        preserved.append(group_id)
                     continue
                 if group is None:
                     create_payload = {key: value for key, value in payload.items() if key != "status"}
@@ -1065,23 +1183,23 @@ class Synchronizer:
                     self.state.data["groups"].setdefault(str(group_id), {})["local_group_id"] = group["id"]
                     self.state.save()
                     action["group_result"] = "created"
+                    group_patch = {}
                 else:
                     if group.get("platform") != selected_group.source["platform"]:
                         raise SyncError(f"上游分组 {group_id}: 平台发生变化，请人工确认映射")
-                    # Restore model restrictions and account credentials before enabling.
+                    # Prepare the account before publishing group changes such as new allowed models.
                     group_patch.pop("status", None)
-                    if group_patch:
-                        self.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
                     action["group_result"] = ("refreshed" if stats_only(group, group_patch)
                                               else "updated" if group_patch else "unchanged")
-                if repriced:
-                    self.pricing_updated += 1
-                    action["pricing_result"] = "updated"
-                self._hold_without_account(group, account)
                 if self.config.sync_accounts:
                     account_id, account_result = self._sync_account(
                         selected_group, group["id"], account, key)
                     action.update({"account_id": account_id, "account_result": account_result})
+                if group_patch:
+                    self.target.request("PUT", f"/admin/groups/{group['id']}", group_patch)
+                if repriced:
+                    self.pricing_updated += 1
+                    action["pricing_result"] = "updated"
                 if group.get("status") != "active":
                     self.target.request("PUT", f"/admin/groups/{group['id']}", {"status": "active"})
                     action["group_result"] = "enabled"
@@ -1102,24 +1220,33 @@ class Synchronizer:
                          ACCOUNT_RESULTS.get(account_result, account_result), len(selected_group.models),
                          "，模型价格已更新" if repriced else "")
             except SyncError as error:
-                try:
-                    self._hold_without_account(group, account)
-                except SyncError as hold_error:
-                    report["errors"].append({"upstream_id": group_id, "name": selected_group.source.get("name"),
-                                             "error": str(hold_error)})
-                if isinstance(error, APIError) and error.code == "API_KEY_CREATE_RATE_LIMITED":
+                mapping = self.state.data["groups"].setdefault(str(group_id), {})
+                mapping.update({"last_status": group.get("status", "pending") if group else "pending",
+                                "last_reason": "sync_update_failed"})
+                self.state.save()
+                if isinstance(error, APIError) and error.key_creation_limited:
                     self.key_creation_blocked = True
+                    action["result"] = "pending_upstream_key"
+                    mapping["last_reason"] = "pending_upstream_key"
+                    self.state.save()
                     report["pending"] += 1
                     report["warnings"].append({"upstream_id": group_id, "name": selected_group.source.get("name"),
                                                "warning": str(error)})
-                    LOG.warning("上游 Key 创建额度用尽，剩余新增留待后续周期；继续更新已有分组")
+                    LOG.warning("上游 Key 新增受限（%s），需要新 Key 的分组等待后续处理；继续更新已有分组", error.code)
+                    if group is not None:
+                        preserved.append(group_id)
                     continue
                 report["errors"].append({"upstream_id": group_id, "name": selected_group.source.get("name"),
                                          "error": str(error)})
                 LOG.error("%s：%s", group_label(group_id, selected_group.source.get("name")), error)
                 if isinstance(error, APIError) and error.status in {401, 403, 429}:
                     report["pending"] += len(selected) - index
+                    halted = True
                     break
+        if halted:
+            LOG.warning("本轮同步已中止，保留分组的计费刷新留待下一轮")
+        else:
+            self._refresh_preserved(preserved, managed_groups, managed_accounts, groups, rates, providers, report)
         if not self.config.dry_run:
             updates = []
             for rank, selected_group in enumerate(selected, 1):
@@ -1147,6 +1274,7 @@ class Synchronizer:
         report["new_upstream_keys"] = self.new_keys
         report["concurrency_fixed"] = self.concurrency_fixed
         report["pricing_updated"] = self.pricing_updated
+        report["billing_refreshed"] = self.billing_refreshed
         write_private_json(self.config.report_file, report)
         LOG.info("%s完成；错误=%d 待后续同步=%d；报告：%s",
                  "预览" if self.config.dry_run else "同步", len(report["errors"]),
@@ -1162,7 +1290,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--daemon", action="store_true", help="按配置的间隔持续运行")
     mode.add_argument("--inspect-upstream", action="store_true", help="只读取上游，不访问本地管理接口")
     writes = parser.add_mutually_exclusive_group()
-    writes.add_argument("--apply", action="store_true", help="实际创建、更新、停用及恢复资源")
+    writes.add_argument("--apply", action="store_true", help="实际创建、更新及恢复资源，保留已有路由")
     writes.add_argument("--dry-run", action="store_true", help="只预览，禁止同步资源写入")
     parser.add_argument("--group-id", type=int, action="append", help="只处理指定上游 ID，可重复")
     parser.add_argument("--report", type=Path, help="覆盖报告文件路径")

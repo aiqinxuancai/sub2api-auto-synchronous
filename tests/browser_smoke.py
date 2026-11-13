@@ -14,7 +14,7 @@ from playwright.sync_api import sync_playwright, expect
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from relaydesk.service import Service
 from relaydesk.web import create_app
-from test_web import LocalSites
+from test_web import LocalSites, await_job
 
 
 def main():
@@ -149,8 +149,10 @@ def main():
                 assert saved["price_sync_platforms"] == ["deepseek", "zhipu"], saved["price_sync_platforms"]
                 page.screenshot(path=str(artifacts / "settings-selection.png"), full_page=True)
                 page.click('[data-page="overview"]')
-                page.click('#sync-now')
-                expect(page.locator('#stat-active')).to_have_text('3', timeout=15000)
+                with page.expect_response(lambda response: response.url.endswith('/api/jobs/sync') and response.request.method == 'POST') as sync_response:
+                    page.click('#sync-now')
+                assert await_job(service, sync_response.value.json()['job_id'])["status"] == "success"
+                expect(page.locator('#stat-active')).to_have_text('11', timeout=15000)
                 card = page.locator('[data-key="low_cost:openai"]')
                 expect(card).to_contain_text('Claude · 稳定专线')
                 expect(card).to_contain_text('查看前 8 名候选评分')
@@ -171,6 +173,11 @@ def main():
                 service.store.put("report", report)
                 expect(page.locator("#sync-notice")).to_contain_text("上游暂时限制新增 Key", timeout=10000)
                 assert "[object Object]" not in page.locator("#sync-notice").inner_text()
+                report["warnings"] = [{"upstream_id": 99, "warning": "HTTP 403 API_KEY_COUNT_EXCEEDED"}]
+                report["pending"] = 2
+                service.store.put("report", report)
+                expect(page.locator("#sync-notice")).to_contain_text("Key 数量已达上限", timeout=10000)
+                expect(page.locator("#sync-notice")).to_contain_text("已有 Key 和路由保留")
                 page.locator(".model-button").first.click()
                 expect(page.locator("#model-list")).to_contain_text("model-a")
                 page.fill("#model-search", "nonexistent")
@@ -180,14 +187,18 @@ def main():
                 expect(page.locator("#group-rows tr")).to_have_count(1)
                 page.fill("#group-search", "")
                 sites.fake.health = "failed"
-                page.click("#sync-now")
-                expect(page.locator("#stat-inactive")).to_have_text("10", timeout=15000)
-                expect(page.locator("#stat-active")).to_have_text("1")  # the preferred group stays enabled
+                with page.expect_response(lambda response: response.url.endswith('/api/jobs/sync') and response.request.method == 'POST') as sync_response:
+                    page.click("#sync-now")
+                assert await_job(service, sync_response.value.json()['job_id'])["status"] == "success"
+                expect(page.locator("#stat-inactive")).to_have_text("0", timeout=15000)
+                expect(page.locator("#stat-active")).to_have_text("11")
                 expect(card).to_contain_text("运行中")
                 expect(card).to_contain_text("暂无可用渠道，保留现有路由并重试")
                 sites.fake.health = "healthy"
-                page.click("#sync-now")
-                expect(page.locator("#stat-active")).to_have_text("3", timeout=15000)
+                with page.expect_response(lambda response: response.url.endswith('/api/jobs/sync') and response.request.method == 'POST') as sync_response:
+                    page.click("#sync-now")
+                assert await_job(service, sync_response.value.json()['job_id'])["status"] == "success"
+                expect(page.locator("#stat-active")).to_have_text("11", timeout=15000)
                 assert len(sites.fake.keys) == 10
                 page.click('[data-page="members"]')
                 page.click("#refresh-users")

@@ -91,13 +91,17 @@ class SelectionIntegrationTests(unittest.TestCase):
         self.all_healthy()
         self.cycle()
         previous = copy.deepcopy(State(self.config).data["groups"])
+        routes = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.fake.requests.clear()
         self.config.sync_limits = {"openai": 1}
-        self.config.disable_unavailable = False
+        self.config.disable_unavailable = True  # Legacy settings cannot re-enable cleanup.
         report = self.cycle()
         self.assertEqual([row["upstream_id"] for row in report["groups"]], [8])
         self.assertEqual(len(self.fake.keys), 3)
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), routes)
+        self.assertEqual(self.fake.mutations(), [])
         for source_id in (7, 9):
-            self.assertEqual(State(self.config).data["groups"][str(source_id)]["last_status"], "inactive")
+            self.assertEqual(State(self.config).data["groups"][str(source_id)]["last_status"], "active")
         self.config.sync_limits = {"openai": 0}
         self.cycle()
         for source_id in (7, 8, 9):
@@ -114,11 +118,11 @@ class SelectionIntegrationTests(unittest.TestCase):
         self.config.sync_limits = {"gemini": 0}
         self.config.disable_unavailable = False
         self.cycle()
-        self.assertEqual(State(self.config).data["groups"]["7"]["last_status"], "inactive")
+        self.assertEqual(State(self.config).data["groups"]["7"]["last_status"], "active")
         self.assertEqual(State(self.config).data["groups"]["8"]["last_status"], "active")
         self.config.sync_limits = {}
         self.cycle()
-        self.assertTrue(all(row.get("last_status") == "inactive" for row in State(self.config).data["groups"].values()))
+        self.assertTrue(all(row.get("last_status") == "active" for row in State(self.config).data["groups"].values()))
         self.assertEqual(len(self.fake.keys), 3)
 
     def test_each_platform_has_its_own_top_n(self):
@@ -274,7 +278,7 @@ class LowCostTests(unittest.TestCase):
         selected = self.check()
         self.assertEqual(selected["upstream_id"], 8)
         self.assertNotIn("7", State(self.config).data["groups"])
-        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], ["model-a"])
+        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], test_sync.DECLARED)
 
     def test_exclude_keywords_skip_matching_names_case_insensitively(self):
         selected = self.check(low_cost_exclude_keywords=["ALP"])
@@ -462,6 +466,65 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(recovered["status"], "active")
         self.assertEqual(recovered["local_group_id"], first["local_group_id"])
         self.assertEqual(len(self.fake.keys), 1)
+
+    def test_key_count_limit_can_fail_over_to_an_existing_key(self):
+        self.healthy = {9}
+        self.check()
+        self.healthy = {8}
+        first = self.check("health")
+        self.healthy = {7, 9}
+        self.fake.key_count_limit = True
+        result = self.check("health")
+        self.assertEqual(result["upstream_id"], 9)
+        self.assertEqual(result["decision"], "fallback_existing_key")
+        self.assertEqual(result["local_group_id"], first["local_group_id"])
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(len(self.fake.keys), 2)
+
+    def test_key_count_limit_without_fallback_preserves_current_route(self):
+        self.healthy = {8}
+        first = self.check()
+        previous = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.healthy = {7}
+        self.fake.key_count_limit = True
+        result = self.check("health")
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["local_group_id"], first["local_group_id"])
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), previous)
+
+    def test_kept_route_without_candidates_bills_at_the_current_upstream_rate(self):
+        first = self.check()
+        self.assertEqual((first["upstream_id"], first["local_rate"]), (7, .25))
+        group = next(row for row in self.fake.local_groups if row["id"] == first["local_group_id"])
+        account = next(row for row in self.fake.accounts if row["id"] == first["local_account_id"])
+        routes = copy.deepcopy((group["model_allowlist"], group["status"], account["credentials"], account["group_ids"]))
+        self.healthy = set()
+        self.fake.rates["7"] = .5
+        self.fake.requests.clear()
+        result = self.check("health")
+        self.assertEqual((result["reason"], result["upstream_id"]), ("no_healthy_candidates", 7))
+        self.assertEqual((result["local_rate"], result["source_rate"]), (.5, .5))
+        self.assertEqual((group["rate_multiplier"], account["rate_multiplier"]), (.5, .5))
+        self.assertEqual((group["model_allowlist"], group["status"], account["credentials"], account["group_ids"]), routes)
+        self.assertEqual([sorted(body) for _, _, body in self.fake.mutations()], [["rate_multiplier"], ["rate_multiplier"]])
+        # Paused management keeps its hands off entirely.
+        self.fake.rates["7"] = .75
+        self.fake.requests.clear()
+        self.check("health", low_cost_enabled=False)
+        self.assertEqual(group["rate_multiplier"], .5)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_route_waiting_for_a_key_still_follows_upstream_billing(self):
+        self.healthy = {8}
+        first = self.check()
+        group = next(row for row in self.fake.local_groups if row["id"] == first["local_group_id"])
+        self.healthy = {7}
+        self.fake.key_count_limit = True
+        self.fake.rates["8"] = 3
+        result = self.check("health")
+        self.assertEqual((result["reason"], result["upstream_id"], result["local_rate"]), ("pending_upstream_key", 8, 3))
+        self.assertEqual(group["rate_multiplier"], 3)
 
     def test_failed_key_read_during_failover_preserves_route(self):
         first = self.check()

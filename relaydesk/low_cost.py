@@ -99,6 +99,31 @@ class StableGroupSelector:
         self.state.save()
         return self._result(result, decision)
 
+    def _refresh_billing(self, context, rates, group, account, result):
+        """A kept route still bills at its current channel's upstream rate and prices."""
+        current_id = self.mapping.get("upstream_id")
+        source = context.source_groups.get(current_id)
+        if group is None or source is None:
+            return  # nothing routed yet, or the upstream no longer lists the channel
+        label = group_label(current_id, source.get("name"))
+        try:
+            if source.get("platform") != self.platform:
+                raise SyncError(f"上游分组 {current_id}: 平台发生变化，请人工确认")
+            refresh = self.engine.billing_refresh(source, rates, context.source_items.get(current_id), group, account,
+                                                  self.mapping.get("model_pricing_synced", False))
+            if not refresh.changed:
+                return
+            self.engine.apply_billing(group, account, refresh)
+        except SyncError as error:
+            result["errors"].append({"upstream_id": current_id, "name": source.get("name"),
+                                     "error": f"保留路由的计费刷新失败：{error}"})
+            LOG.error("%s：保留路由 %s 的计费刷新失败：%s", self.label, label, error)
+            return
+        self.mapping.update(source_rate=refresh.source_rate, local_rate=refresh.local_rate)
+        if refresh.model_pricing is not None:
+            self.mapping["model_pricing_synced"] = bool(refresh.model_pricing)
+        LOG.info("%s：保留路由 %s，计费已按上游更新（倍率 %g）", self.label, label, refresh.local_rate)
+
     def reconcile(self, snapshot, *, mode="ranking"):
         engine, config = self.engine, self.engine.config
         groups, rates, providers = snapshot
@@ -130,6 +155,7 @@ class StableGroupSelector:
         if selected is None:
             result["pending"] = 1
             LOG.warning("%s：前 %d 名暂无符合检测条件的可用渠道，保留现有路由，后续自动重试", self.label, plan.top_n)
+            self._refresh_billing(context, rates, group, account, result)
             return self._preserve(group, result, "no_healthy_candidates", "no_candidates")
         result["switch_reason"] = switch_reason or None
         # Prepare a usable Key before changing the existing route.
@@ -139,7 +165,7 @@ class StableGroupSelector:
         try:
             key = engine._get_key(group_id)
         except APIError as error:
-            if error.status != 429:
+            if error.status != 429 and not error.key_creation_limited:
                 raise
             engine.key_creation_blocked = True
             key = None
@@ -162,6 +188,7 @@ class StableGroupSelector:
             result["pending"] = 1
             LOG.warning("%s：候选 %s 等待上游 Key，保留现有路由和已有 Key，后续自动重试", self.label,
                         group_label(group_id, selected.source.get("name")))
+            self._refresh_billing(context, rates, group, account, result)
             return self._preserve(group, result, "pending_upstream_key", "pending")
         self.mapping.setdefault("keys", {})[str(group_id)] = key["id"]
         self.state.save()

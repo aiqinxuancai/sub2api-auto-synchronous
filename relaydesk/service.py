@@ -53,7 +53,7 @@ def default_settings():
         "sync_accounts": True, "auto_create_keys": True, "account_concurrency": DEFAULT_ACCOUNT_CONCURRENCY,
         "priority": 50,
         "timeout": 30, "providers_path": "/api/v2/public/providers", "max_new_keys": 50,
-        "disable_unavailable": True, "request_interval": 1.1, "sync_enabled": False,
+        "disable_unavailable": False, "request_interval": 1.1, "sync_enabled": False,
     }
 
 
@@ -154,6 +154,7 @@ class Service:
             self._initialize_config()
         values = self.store.get("config")
         migrated = {key: value for key, value in {**copy.deepcopy(SELECTION_DEFAULTS), **values,
+                                                   "disable_unavailable": False,
                                                    "account_concurrency": account_concurrency(values),
                                                    "sync_platform_limits": platform_limits(values),
                                                    "stable_groups": stable_rules(values)}.items()
@@ -249,6 +250,7 @@ class Service:
         for key in ("sync_enabled", "sync_accounts", "auto_create_keys", "disable_unavailable"):
             if type(values[key]) is not bool:
                 raise SyncError(f"{key} 必须为开关值")
+        values["disable_unavailable"] = False  # Legacy clients cannot re-enable destructive cleanup.
         for key in SECRETS | {"upstream_base", "target_base", "upstream_email", "target_email",
                               "prefix", "providers_path"}:
             if not isinstance(values[key], str):
@@ -488,7 +490,8 @@ class Service:
                 "warnings": report.get("warnings", []), "preview": preview, "stable": stable,
                 "new_keys": report.get("new_upstream_keys", 0),
                 "concurrency_fixed": report.get("concurrency_fixed", 0),
-                "pricing_updated": report.get("pricing_updated", 0)}
+                "pricing_updated": report.get("pricing_updated", 0),
+                "billing_refreshed": report.get("billing_refreshed", 0)}
 
     def _due_stable_mode(self, key, now=None):
         """First due check in cadence order; "ranking" comes first because it covers availability too."""
@@ -542,9 +545,17 @@ class Service:
         for group in report.get("groups", []):
             group_id = group["upstream_id"]
             mapping = state.data["groups"].get(str(group_id), {})
-            rows[group_id] = {**group, "status": "active" if mapping.get("last_status") == "active" else "pending",
+            reason = mapping.get("last_reason", "")
+            rows[group_id] = {**group, "status": mapping.get("last_status", "pending"),
                               "local_group_id": mapping.get("local_group_id"),
-                              "key_id": mapping.get("upstream_key_id"), "reason": ""}
+                              "key_id": mapping.get("upstream_key_id"),
+                              "reason": "" if reason == "healthy_models" else reason}
+            if reason != "healthy_models" and mapping.get("local_group_id"):
+                # A deferred update must not advertise planned models/rates as already installed.
+                for target, source in (("name", "name"), ("models", "models"),
+                                       ("local_rate", "last_rate"), ("source_rate", "source_rate")):
+                    if mapping.get(source) is not None:
+                        rows[group_id][target] = mapping[source]
         exclusions = {group["upstream_id"]: group for group in report.get("excluded", [])}
         for group_id, mapping in state.data["groups"].items():
             group_id = int(group_id)
