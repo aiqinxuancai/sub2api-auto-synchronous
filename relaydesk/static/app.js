@@ -37,6 +37,7 @@ const reasons = { no_healthy_models: '当前没有通过健康检测的模型', 
   rank_dropped: '当前渠道综合评分排名下降超过允许范围',
   source_unavailable: '当前渠道已不可用', updating: '正在切换渠道',
   outside_top_ten: '当前渠道已离开设定的候选排名范围', keyword_excluded: '名称命中排除关键字',
+  required_models_missing: '渠道缺少必需模型',
   group_inactive: '上游分组已停用', probe_disabled: '上游未启用有效检测', unsupported_platform: '暂不支持此平台',
   no_provider: '没有匹配的监测数据', no_provider_data: '没有匹配的监测数据',
   no_enabled_probe: '当前没有启用中的有效探测', probe_expired: '上游探测结果已过期' };
@@ -287,6 +288,10 @@ function stableCard({ key, rule, status: data = {}, schedule = {} }) {
   panel.append(heading, summary, details);
   return panel;
 }
+function candidateReason(candidate) {
+  const text = reasons[candidate.reason] || '不可用';
+  return candidate.missing_models?.length ? `${text}：${candidate.missing_models.join('、')}` : text;
+}
 function renderScoredCandidates(root, data) {
   if ((data.candidates || []).some(row => row.parts)) {
     const legend = el('div', 'score-legend');
@@ -302,7 +307,7 @@ function renderScoredCandidates(root, data) {
     if (candidate.eligible && candidate.parts) name.append(scoreBar(candidate, data.weights));
     const value = el('strong', 'candidate-score');
     if (candidate.eligible && candidate.score != null) value.append(document.createTextNode(`${number(candidate.score, 1)} 分`), el('small', '', `${number(candidate.source_rate)} 倍`));
-    else value.textContent = candidate.eligible ? `${number(candidate.source_rate)} 倍` : reasons[candidate.reason] || '不可用';
+    else value.textContent = candidate.eligible ? `${number(candidate.source_rate)} 倍` : candidateReason(candidate);
     row.append(el('span', 'candidate-rank', candidate.score_rank ? `#${candidate.score_rank}` : '—'), name, value);
     if (candidate.upstream_id === data.upstream_id) row.classList.add('current');
     root.append(row);
@@ -313,7 +318,7 @@ function renderRankedCandidates(root, data) {
   for (const candidate of data.candidates || []) {
     const row = el('div', 'candidate-row' + (candidate.eligible ? '' : ' ineligible'));
     row.append(el('span', 'candidate-rank', `#${candidate.provider_rank}`), el('span', '', candidate.name || `分组 #${candidate.upstream_id}`),
-      el('strong', 'candidate-score', candidate.eligible ? `${number(candidate.source_rate)} 倍` : reasons[candidate.reason] || '不可用'));
+      el('strong', 'candidate-score', candidate.eligible ? `${number(candidate.source_rate)} 倍` : candidateReason(candidate)));
     if (candidate.upstream_id === data.upstream_id) row.classList.add('current');
     root.append(row);
   }
@@ -430,6 +435,11 @@ function renderModels() {
 $('#model-search').oninput = renderModels;
 
 const numericSettings = new Set(['interval_minutes', 'rate_factor', 'account_concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval']);
+// Comma-separated keyword lists of a preferred-group rule; both may be left empty.
+const keywordFields = new Set(['exclude_keywords', 'require_models']);
+const splitKeywords = text => text.split(/[,，、;；\n]+/).map(item => item.trim()).filter(Boolean);
+const requireModelsField = ['require_models', '必需模型', '渠道的模型中须包含每一个关键字（部分匹配，不区分大小写）才可入选，缺少时顺延到下一名；当前渠道缺少时立即更换。多个关键字用逗号分隔，最多 50 个。',
+  { type: 'text', maxlength: 2600, placeholder: '留空不限制，如 gpt-5, codex', wide: true }];
 // Editable fields of a preferred-group rule: [field, label, help, options].
 const ruleFields = {
   low_cost: [
@@ -441,12 +451,14 @@ const ruleFields = {
     ['retry_minutes', '失败重试间隔', '连接失败或等待上游 Key 时重试', { min: 1, max: 1440, unit: '分钟' }],
     ['exclude_keywords', '排除关键字', '上游分组名称包含任一关键字（不区分大小写）的渠道不参与评分；多个关键字用逗号分隔，最多 50 个。',
       { type: 'text', maxlength: 2600, placeholder: '留空不排除，如 测试, 公益, Azure', wide: true }],
+    requireModelsField,
   ],
   best_source: [
     ['name', '本地分组名称', '实际名称会自动追加当前上游', { type: 'text', maxlength: 100 }],
     ['check_minutes', '检测间隔', '每次检测同时检查排名与可用性', { min: 1, max: 1440, unit: '分钟' }],
     ['keep_top', '保持范围', '当前渠道跌出前 N 名才更换，1–100', { min: 1, max: 100, prefix: '前', unit: '名' }],
     ['retry_minutes', '失败重试间隔', '连接失败或等待上游 Key 时重试', { min: 1, max: 1440, unit: '分钟' }],
+    requireModelsField,
   ],
 };
 const weightFields = [['price', '价格倍率', '适用倍率越低越好，以候选中最便宜者为满分'], ['rating', '用户评分', '大厅星级，5 星为满分'],
@@ -500,7 +512,7 @@ const ruleKey = rule => `${rule.strategy}:${rule.platform}`;
 const ruleCards = () => $$('.stable-rule', $('#stable-rules'));
 function ruleInput(field, value, options) {
   const input = el('input'); input.dataset.field = field;
-  input.type = options.type || 'number'; input.required = field !== 'exclude_keywords';
+  input.type = options.type || 'number'; input.required = !keywordFields.has(field);
   for (const key of ['min', 'max', 'maxlength', 'placeholder']) if (options[key] !== undefined) input.setAttribute(key, options[key]);
   input.value = Array.isArray(value) ? value.join(', ') : value ?? '';
   return input;
@@ -575,9 +587,11 @@ function ruleSummary(card) {
   const parts = [`${strategyNames[card.dataset.strategy]} · ${platformNames[card.dataset.platform] || card.dataset.platform}`];
   if (card.dataset.strategy === 'low_cost') {
     parts.push(`前 ${value('top_n')} 名评分`, `允许下降 ${value('rank_tolerance')} 名`, `评分每 ${value('score_minutes')} 分钟`, `可用性每 ${value('health_minutes')} 分钟`);
-    const keywords = value('exclude_keywords').split(/[,，、;；\n]+/).filter(item => item.trim()).length;
+    const keywords = splitKeywords(value('exclude_keywords')).length;
     if (keywords) parts.push(`排除 ${keywords} 个关键字`);
   } else parts.push(`保持前 ${value('keep_top')} 名`, `每 ${value('check_minutes')} 分钟检测`);
+  const required = splitKeywords(value('require_models'));
+  if (required.length) parts.push(required.length <= 3 ? `必需模型 ${required.join('、')}` : `必需 ${required.length} 个模型关键字`);
   return parts.join(' · ');
 }
 function rulesDraft() {
@@ -586,7 +600,7 @@ function rulesDraft() {
     for (const input of $$('[data-field]', card)) {
       const field = input.dataset.field;
       if (input.type === 'checkbox') rule[field] = input.checked;
-      else if (field === 'exclude_keywords') rule[field] = input.value.split(/[,，、;；\n]+/).map(item => item.trim()).filter(Boolean);
+      else if (keywordFields.has(field)) rule[field] = splitKeywords(input.value);
       else rule[field] = input.type === 'number' ? Number(input.value) : input.value;
     }
     if (rule.strategy === 'low_cost') rule.weights = Object.fromEntries($$('[data-weight]', card).map(input => [input.dataset.weight, Number(input.value)]));

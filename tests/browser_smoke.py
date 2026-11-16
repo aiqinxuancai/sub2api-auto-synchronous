@@ -121,6 +121,7 @@ def main():
                 rule.locator('[data-field="health_minutes"]').fill("3")
                 rule.locator('[data-field="retry_minutes"]').fill("2")
                 rule.locator('[data-field="exclude_keywords"]').fill("Alpha，测试, 公益")
+                rule.locator('[data-field="require_models"]').fill(" MODEL-B ")
                 rule.locator('[data-field="top_n"]').fill("8")
                 rule.locator('[data-field="rank_tolerance"]').fill("1")
                 rule.locator('[data-weight="price"]').fill("60")
@@ -128,7 +129,7 @@ def main():
                 rule.get_by_role("button", name="恢复默认").click()
                 expect(rule.locator('[data-weight="price"]')).to_have_value("40")
                 rule.locator('[data-weight="latency"]').fill("0")
-                expect(rule.locator('.stable-rule-meta')).to_contain_text("前 8 名评分 · 允许下降 1 名 · 评分每 20 分钟 · 可用性每 3 分钟 · 排除 3 个关键字")
+                expect(rule.locator('.stable-rule-meta')).to_contain_text("前 8 名评分 · 允许下降 1 名 · 评分每 20 分钟 · 可用性每 3 分钟 · 排除 3 个关键字 · 必需模型 MODEL-B")
                 # A collapsed rule with an invalid field opens itself instead of silently blocking the save.
                 rule.locator('[data-field="top_n"]').fill("")
                 rule.locator(".stable-rule-toggle").click()
@@ -144,10 +145,12 @@ def main():
                 assert (low["enabled"], low["top_n"], low["score_minutes"], low["rank_tolerance"], low["retry_minutes"],
                         low["weights"]["price"], low["weights"]["latency"]) == (True, 8, 20, 1, 2, 40, 0), low
                 assert low["exclude_keywords"] == ["Alpha", "测试", "公益"]
+                assert low["require_models"] == ["MODEL-B"], low
                 expect(rule.locator('[data-field="exclude_keywords"]')).to_have_value("Alpha, 测试, 公益")
                 assert saved["sync_platform_limits"] == {"openai": 2}, saved["sync_platform_limits"]
                 assert saved["price_sync_platforms"] == ["deepseek", "zhipu"], saved["price_sync_platforms"]
                 page.screenshot(path=str(artifacts / "settings-selection.png"), full_page=True)
+                sites.fake.provider_overrides[13] = {"group_models": [{"model": "model-a"}]}  # lacks the required model
                 page.click('[data-page="overview"]')
                 with page.expect_response(lambda response: response.url.endswith('/api/jobs/sync') and response.request.method == 'POST') as sync_response:
                     page.click('#sync-now')
@@ -159,6 +162,7 @@ def main():
                 expect(card).to_contain_text('跌出前 2 名时更换')
                 card.locator('summary').click()
                 expect(card).to_contain_text('名称命中排除关键字')
+                expect(card).to_contain_text('渠道缺少必需模型：MODEL-B')
                 expect(card).to_contain_text('0.2 倍')
                 page.wait_for_timeout(4500)  # survives a poll that rebuilds the cards
                 expect(card.locator('details')).to_have_attribute('open', '')

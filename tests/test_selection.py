@@ -162,10 +162,10 @@ class LowCostTests(unittest.TestCase):
     setUp = test_sync.SyncIntegrationTests.setUp
     tearDown = test_sync.SyncIntegrationTests.tearDown
 
-    def check(self, mode="ranking", **settings):
+    def check(self, mode="ranking", require_models=(), **settings):
         engine = Synchronizer(self.config, State(self.config))
         self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
-        rule = legacy_rule("low_cost", {"low_cost_enabled": True, **settings})
+        rule = {**legacy_rule("low_cost", {"low_cost_enabled": True, **settings}), "require_models": list(require_models)}
         start = len(self.fake.requests)
         try:
             return LowCostSelector(engine, rule).reconcile(engine.load_snapshot(), mode=mode)
@@ -295,6 +295,37 @@ class LowCostTests(unittest.TestCase):
         self.assertEqual(replaced["decision"], "replaced")
         self.assertEqual(replaced["local_group_id"], first["local_group_id"])
         self.assertEqual(len(self.fake.accounts), 1)
+
+    def declare(self, group_id, *models):
+        self.fake.provider_overrides.setdefault(group_id, {})["group_models"] = [{"model": model} for model in models]
+
+    def test_required_models_skip_channels_missing_any_keyword(self):
+        self.declare(7, "model-a", "model-b")  # the cheapest channel lacks model-c
+        selected = self.check(require_models=["MODEL-A", "c"])
+        self.assertEqual(selected["upstream_id"], 8)
+        cheapest = next(row for row in selected["candidates"] if row["upstream_id"] == 7)
+        self.assertEqual((cheapest["eligible"], cheapest["reason"], cheapest["missing_models"]),
+                         (False, "required_models_missing", ["c"]))
+        self.assertNotIn("missing_models", next(row for row in selected["candidates"] if row["upstream_id"] == 8))
+        # Every keyword present: the cheapest channel qualifies again and wins the next ranking check.
+        self.assertEqual(self.check(require_models=["model-a", "B"], low_cost_rank_tolerance=0)["upstream_id"], 7)
+
+    def test_current_missing_a_required_model_switches_even_in_health_mode(self):
+        first = self.check()
+        self.assertEqual(first["upstream_id"], 7)
+        self.declare(7, "model-a")
+        replaced = self.check("health", require_models=["model-c"])
+        self.assertEqual((replaced["upstream_id"], replaced["decision"], replaced["switch_reason"]),
+                         (8, "replaced", "required_models_missing"))
+        self.assertEqual(replaced["local_group_id"], first["local_group_id"])
+        self.assertEqual(len(self.fake.accounts), 1)
+        # No channel offers the model: the existing route stays as it is.
+        self.fake.requests.clear()
+        off = self.check("health", require_models=["model-z"])
+        self.assertEqual((off["status"], off["pending"], off["reason"], off["upstream_id"]),
+                         ("active", 1, "no_healthy_candidates", 8))
+        self.assertTrue(self.fake.accounts[0]["schedulable"])
+        self.assertEqual(self.fake.mutations(), [])
 
     def test_excluding_every_candidate_preserves_group(self):
         self.check()
@@ -603,15 +634,28 @@ class BestSourceTests(unittest.TestCase):
     setUp = test_sync.SyncIntegrationTests.setUp
     tearDown = test_sync.SyncIntegrationTests.tearDown
 
-    def check(self, selector=BestSourceSelector, **settings):
+    def check(self, selector=BestSourceSelector, require_models=(), **settings):
         engine = Synchronizer(self.config, State(self.config))
         self.fake.healthy_group_ids = getattr(self, "healthy", {7, 8, 9})
         options = {"best_source_enabled": True, "low_cost_enabled": True, **settings}
+        rule = {**legacy_rule(selector.strategy, options), "require_models": list(require_models)}
         start = len(self.fake.requests)
         try:
-            return selector(engine, legacy_rule(selector.strategy, options)).reconcile(engine.load_snapshot(), mode="ranking")
+            return selector(engine, rule).reconcile(engine.load_snapshot(), mode="ranking")
         finally:
             assert_no_route_disables(self, self.fake.requests[start:])
+
+    def test_required_models_fall_through_to_the_next_rank(self):
+        first = self.check()
+        self.assertEqual(first["upstream_id"], 7)
+        self.fake.provider_overrides[7] = {"group_models": [{"model": "model-a"}]}
+        moved = self.check(require_models=["model-b"])
+        self.assertEqual((moved["upstream_id"], moved["switch_reason"]), (8, "required_models_missing"))
+        self.assertEqual(moved["local_group_id"], first["local_group_id"])
+        lacking = next(row for row in moved["candidates"] if row["upstream_id"] == 7)
+        self.assertEqual((lacking["eligible"], lacking["reason"], lacking["missing_models"]),
+                         (False, "required_models_missing", ["model-b"]))
+        self.assertEqual(self.fake.local_groups[-1]["model_allowlist"]["models"], test_sync.DECLARED)
 
     def test_selects_default_first_and_keeps_it_inside_top_k(self):
         first = self.check()

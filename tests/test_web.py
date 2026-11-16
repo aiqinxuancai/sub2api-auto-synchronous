@@ -613,17 +613,22 @@ class WebTests(unittest.TestCase):
                    [{**low, "weights": {**DEFAULT_WEIGHTS, "price": 101}}], [{**low, "weights": dict.fromkeys(DEFAULT_WEIGHTS, 0)}],
                    [{**low, "weights": {"price": 1}}], [{**low, "require_detection": 1}], [{**low, "exclude_keywords": "测试"}],
                    [{**low, "exclude_keywords": ["x" * 51]}], [{**low, "exclude_keywords": [f"k{index}" for index in range(51)]}],
-                   [{**best, "keep_top": 0}], [{**best, "keep_top": 101}], [{**best, "check_minutes": 1441}]]
+                   [{**best, "keep_top": 0}], [{**best, "keep_top": 101}], [{**best, "check_minutes": 1441}],
+                   [{**best, "require_models": "gpt-5"}], [{**low, "require_models": [1]}],
+                   [{**best, "require_models": ["x" * 51]}], [{**low, "require_models": [f"m{index}" for index in range(51)]}]]
         for value in invalid:
             response = self.client.put("/api/config", json={"stable_groups": value}, headers=self.headers)
             self.assertEqual(response.status_code, 400, value)
         response = self.client.put("/api/config", json={"stable_groups": [
             {"strategy": "best_source", "platform": "deepseek", "name": " 源站 DS "},
-            {**low, "exclude_keywords": [" 测试 ", "", "Azure", "azure", "公益"]}]}, headers=self.headers)
+            {**low, "exclude_keywords": [" 测试 ", "", "Azure", "azure", "公益"],
+             "require_models": [" gpt-5 ", "GPT-5", "", "codex"]}]}, headers=self.headers)
         self.assertEqual(response.status_code, 200, response.text)
         saved = response.json()["stable_groups"]
         self.assertEqual(saved[0], new_rule("best_source", "deepseek", name="源站 DS"))
+        self.assertEqual(saved[0]["require_models"], [])
         self.assertEqual(saved[1]["exclude_keywords"], ["测试", "Azure", "公益"])
+        self.assertEqual(saved[1]["require_models"], ["gpt-5", "codex"])
         document = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(document["config"]["stable_groups"], saved)
         overview = self.client.get("/api/overview").json()
@@ -764,6 +769,16 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.service.store.get("low_cost:openai"), {"status": "active", "local_group_id": 5})
         self.assertEqual(self.service.store.get("low_cost:openai_schedule"), {"next_rank": 123})
         self.assertIsNone(self.service.store.get("low_cost"))
+
+    def test_rules_saved_before_required_models_get_the_default(self):
+        older = [{key: value for key, value in new_rule(strategy, "openai", enabled=True).items() if key != "require_models"}
+                 for strategy in ("low_cost", "best_source")]
+        self.service.store.put("config", {**self.service.store.get("config"), "stable_groups": older})
+        self.service.close()
+        self.service = Service(self.root / "data", start_scheduler=False)
+        saved = json.loads((self.service.directory / "config.json").read_text(encoding="utf-8"))["config"]["stable_groups"]
+        self.assertEqual(saved, [new_rule(strategy, "openai", enabled=True) for strategy in ("low_cost", "best_source")])
+        self.assertEqual([rule["require_models"] for rule in self.service._rules().values()], [[], []])
 
     def test_low_cost_job_reports_scores_for_candidates(self):
         self.rules(new_rule("low_cost", "openai", enabled=True))

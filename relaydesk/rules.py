@@ -17,9 +17,12 @@ from .scoring import DEFAULT_WEIGHTS, METRICS
 STRATEGY_LABELS = {"low_cost": "最低价", "best_source": "最优源站"}
 DEFAULTS = {
     "low_cost": {"score_minutes": 10, "health_minutes": 5, "retry_minutes": 1, "require_detection": True,
-                 "exclude_keywords": [], "top_n": 10, "rank_tolerance": 2, "weights": dict(DEFAULT_WEIGHTS)},
-    "best_source": {"check_minutes": 10, "keep_top": 10, "retry_minutes": 1},
+                 "exclude_keywords": [], "require_models": [], "top_n": 10, "rank_tolerance": 2,
+                 "weights": dict(DEFAULT_WEIGHTS)},
+    "best_source": {"check_minutes": 10, "keep_top": 10, "retry_minutes": 1, "require_models": []},
 }
+# Keyword lists: field -> label used in validation messages.
+KEYWORD_FIELDS = {"exclude_keywords": "排除关键字", "require_models": "必需模型关键字"}
 # Detection cadence: (mode, schedule entry, interval field). A "ranking" check also covers every other check.
 CADENCE = {"low_cost": (("ranking", "next_rank", "score_minutes"), ("health", "next_health", "health_minutes")),
            "best_source": (("ranking", "next_rank", "check_minutes"),)}
@@ -32,7 +35,7 @@ RANGES = {"score_minutes": (1, 1440, "评分检测间隔应为 1–1440 分钟")
           "top_n": (1, 100, "候选范围应为前 1–100 名"),
           "rank_tolerance": (0, 50, "允许的排名下降应为 0–50 名"),
           "keep_top": (1, 100, "保持范围应为前 1–100 名")}
-MAX_EXCLUDE_KEYWORDS = 50
+MAX_KEYWORDS = 50
 MAX_KEYWORD_LENGTH = 50
 # Flat settings of the two fixed OpenAI groups that rules replaced.
 LEGACY_FIELDS = {
@@ -73,9 +76,12 @@ def legacy_rule(strategy, values):
 
 
 def stable_rules(values):
-    """Rules from Web settings; settings saved before rules existed describe the two OpenAI groups."""
+    """Rules from Web settings; settings saved before rules existed describe the two OpenAI groups.
+
+    Rules saved by an older version get defaults for fields added since, such as `require_models`."""
     if "stable_groups" in values:
-        return values["stable_groups"]
+        return [{**new_rule(rule["strategy"], rule["platform"]), **rule} if rule.get("strategy") in DEFAULTS else rule
+                for rule in values["stable_groups"]]
     return [legacy_rule(strategy, values) for strategy in DEFAULTS]
 
 
@@ -107,10 +113,27 @@ def normalize_rules(rules):
         for field, (low, high, message) in RANGES.items():
             if field in rule and (type(rule[field]) is not int or not low <= rule[field] <= high):
                 raise SyncError(f"{label}：{message}")
+        for field, name in KEYWORD_FIELDS.items():
+            if field in rule:
+                rule[field] = _keywords(rule[field], f"{label}：{name}")
         if rule["strategy"] == "low_cost":
             _normalize_low_cost(rule, label)
         result.append(rule)
     return result
+
+
+def _keywords(keywords, label):
+    """Trimmed, non-empty keywords without case-insensitive duplicates, in their original order."""
+    if not isinstance(keywords, list) or any(not isinstance(item, str) for item in keywords):
+        raise SyncError(f"{label}必须为文本列表")
+    unique = {}
+    for item in keywords:
+        item = item.strip()
+        if item and item.casefold() not in unique:
+            unique[item.casefold()] = item
+    if len(unique) > MAX_KEYWORDS or any(len(item) > MAX_KEYWORD_LENGTH for item in unique.values()):
+        raise SyncError(f"{label}最多 {MAX_KEYWORDS} 个，每个不超过 {MAX_KEYWORD_LENGTH} 个字符")
+    return list(unique.values())
 
 
 def _normalize_low_cost(rule, label):
@@ -121,17 +144,6 @@ def _normalize_low_cost(rule, label):
             or any(type(value) is not int or not 0 <= value <= 100 for value in weights.values())
             or not sum(weights.values())):
         raise SyncError(f"{label}：评分权重应为 0–100 的整数，且至少有一项大于 0")
-    keywords = rule["exclude_keywords"]
-    if not isinstance(keywords, list) or any(not isinstance(item, str) for item in keywords):
-        raise SyncError(f"{label}：排除关键字必须为文本列表")
-    unique = {}
-    for item in keywords:
-        item = item.strip()
-        if item and item.casefold() not in unique:
-            unique[item.casefold()] = item
-    if len(unique) > MAX_EXCLUDE_KEYWORDS or any(len(item) > MAX_KEYWORD_LENGTH for item in unique.values()):
-        raise SyncError(f"{label}：排除关键字最多 {MAX_EXCLUDE_KEYWORDS} 个，每个不超过 {MAX_KEYWORD_LENGTH} 个字符")
-    rule["exclude_keywords"] = list(unique.values())
 
 
 def without_live_fields(rules):

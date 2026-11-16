@@ -21,6 +21,7 @@ from .scoring import score_candidates
 
 LOG = logging.getLogger("sub2api-sync")
 NAME_LIMIT = 100
+MISSING_MODELS = "required_models_missing"
 
 
 def display_name(base, source_name):
@@ -36,13 +37,24 @@ def display_name(base, source_name):
 class Context:
     now: object
     ranked: list            # provider items of the rule's platform in the hall's default order
-    usable: dict            # upstream id -> SelectedGroup passing availability checks
+    usable: dict            # upstream id -> SelectedGroup passing availability checks and offering every required model
     excluded: dict          # upstream id -> reason
     source_items: dict
     source_groups: dict
+    missing: dict = field(default_factory=dict)   # upstream id -> required model keywords it lacks
 
     def name(self, group_id, item=None):
         return self.source_groups.get(group_id, {}).get("name", (item or {}).get("code", ""))
+
+    def unavailable_reason(self, group_id):
+        """Why a routed channel no longer qualifies once it has dropped out of `usable`."""
+        return MISSING_MODELS if group_id in self.missing else "source_unavailable"
+
+
+def missing_models(required, models):
+    """Required keywords that no model name contains (case-insensitive substring match)."""
+    names = [model.casefold() for model in models]
+    return [keyword for keyword in required if not any(keyword.casefold() in name for name in names)]
 
 
 @dataclass
@@ -132,10 +144,22 @@ class StableGroupSelector:
         # Validate freshness/completeness before considering any route updates.
         candidate_config = replace(config, sync_limits={self.platform: 0})
         usable, excluded = select_usable(groups, rates, providers, candidate_config, now)
-        context = Context(now, ranked_items(providers, now, {self.platform}), {row.source["id"]: row for row in usable}, excluded,
-                          {item["group_id"]: item for item in providers["items"]}, {group["id"]: group for group in groups})
+        # A channel lacking a required model never qualifies; the next one in order takes its place.
+        missing = {row.source["id"]: lacking for row in usable
+                   if (lacking := missing_models(self.rule["require_models"], row.models))}
+        excluded.update(dict.fromkeys(missing, MISSING_MODELS))
+        context = Context(now, ranked_items(providers, now, {self.platform}),
+                          {row.source["id"]: row for row in usable if row.source["id"] not in missing}, excluded,
+                          {item["group_id"]: item for item in providers["items"]}, {group["id"]: group for group in groups},
+                          missing)
         current_id = self.mapping.get("upstream_id")
         plan = self.plan(context, mode, current_id)
+        for candidate in plan.candidates:
+            if candidate["reason"] == MISSING_MODELS:
+                candidate["missing_models"] = missing[candidate["upstream_id"]]
+        if plan.switch_reason == MISSING_MODELS:
+            LOG.info("%s：当前渠道 %s 缺少必需模型（%s），重新选择", self.label,
+                     group_label(current_id, context.name(current_id)), "、".join(missing[current_id]))
         result = {"checked_at": now.isoformat(), "mode": mode, "candidates": plan.candidates, "errors": [], "pending": 0,
                   "top_n": plan.top_n, **plan.extras}
         progress(f"{self.label}：读取本地分组与账号")
@@ -295,8 +319,8 @@ class LowCostSelector(StableGroupSelector):
         if current_id is None:
             keep, switch_reason = False, ""
         elif current is None:
-            # Availability checks switch immediately: closed, unreachable, unhealthy or newly excluded.
-            keep, switch_reason = False, "keyword_excluded" if current_id in blocked else "source_unavailable"
+            # Availability checks switch immediately: closed, unreachable, unhealthy, newly excluded or missing a model.
+            keep, switch_reason = False, "keyword_excluded" if current_id in blocked else context.unavailable_reason(current_id)
         elif mode == "health":
             keep, switch_reason = True, ""
         elif current_id not in top_ids:
@@ -334,7 +358,7 @@ class BestSourceSelector(StableGroupSelector):
         if current_id is None:
             keep, switch_reason = False, ""
         elif current is None:
-            keep, switch_reason = False, "source_unavailable"
+            keep, switch_reason = False, context.unavailable_reason(current_id)
         elif rank_of.get(current_id, keep_top + 1) > keep_top:
             keep, switch_reason = False, "outside_top_ten"
             LOG.info("%s：当前渠道 %s 跌出默认排序前 %d 名，重新选择", self.label,
