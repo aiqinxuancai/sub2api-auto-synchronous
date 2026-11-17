@@ -15,7 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, DEFAULT_PRICE_SYNC_PLATFORMS, PROGRESS, APIError, Client,
+from sync_sub2api import (DEFAULT_ACCOUNT_CONCURRENCY, DEFAULT_PRICE_SYNC_PLATFORMS, DEFAULT_PROVIDERS_MIN_GROUPS,
+                          PROGRESS, APIError, Client,
                           Config, State, SyncError, Synchronizer, account_concurrency, platform_limits, state_lock)
 from provider_ranking import PLATFORMS
 
@@ -53,6 +54,7 @@ def default_settings():
         "sync_accounts": True, "auto_create_keys": True, "account_concurrency": DEFAULT_ACCOUNT_CONCURRENCY,
         "priority": 50,
         "timeout": 30, "providers_path": "/api/v2/public/providers", "max_new_keys": 50,
+        "providers_min_groups": DEFAULT_PROVIDERS_MIN_GROUPS,
         "disable_unavailable": False, "request_interval": 1.1, "sync_enabled": False,
     }
 
@@ -156,6 +158,7 @@ class Service:
         migrated = {key: value for key, value in {**copy.deepcopy(SELECTION_DEFAULTS), **values,
                                                    "disable_unavailable": False,
                                                    "account_concurrency": account_concurrency(values),
+                                                   "providers_min_groups": values.get("providers_min_groups", DEFAULT_PROVIDERS_MIN_GROUPS),
                                                    "sync_platform_limits": platform_limits(values),
                                                    "stable_groups": stable_rules(values)}.items()
                     if key not in OBSOLETE_SETTINGS}
@@ -222,7 +225,7 @@ class Service:
             if key in SECRETS and value == "":
                 continue
             values[key] = value
-        for key in ("interval_minutes", "account_concurrency", "timeout", "max_new_keys", "priority"):
+        for key in ("interval_minutes", "account_concurrency", "timeout", "max_new_keys", "priority", "providers_min_groups"):
             if isinstance(values[key], bool) or not isinstance(values[key], int):
                 raise SyncError("周期、并发和数量必须为整数")
         if not 1 <= values["interval_minutes"] <= 1440:

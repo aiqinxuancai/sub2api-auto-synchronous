@@ -130,7 +130,7 @@ class LocalSites:
             "upstream_base": self.base + "/up", "upstream_email": "test@example.com",
             "upstream_password": "test-password", "target_base": self.base + "/down",
             "target_admin_api_key": "test-admin-key", "request_interval": 0,
-            "max_new_keys": 2, "sync_enabled": False})
+            "max_new_keys": 2, "sync_enabled": False, "providers_min_groups": 0})  # tiny isolated fixtures
 
     def close(self):
         self.server.shutdown(); self.server.server_close(); self.thread.join()
@@ -578,6 +578,50 @@ class WebTests(unittest.TestCase):
 
     def stable(self, key):
         return next(entry for entry in self.client.get("/api/overview").json()["stable_groups"] if entry["key"] == key)
+
+    def test_provider_count_threshold_validation_and_saved_configuration(self):
+        for value in (True, -1, 10001, 1.5, "10", None):
+            with self.subTest(value=value):
+                response = self.client.put("/api/config", json={"providers_min_groups": value}, headers=self.headers)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(self.service.config().providers_min_groups, 0)
+        for value in (0, 1, 10, 10000):
+            response = self.client.put("/api/config", json={"providers_min_groups": value}, headers=self.headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["providers_min_groups"], value)
+            self.assertEqual(self.service.config().providers_min_groups, value)
+
+    def test_tiny_provider_snapshot_blocks_sync_preview_and_both_selectors(self):
+        self.sites.fake.healthy_group_ids = {7, 8, 9}
+        self.rules(new_rule("low_cost", "openai", enabled=True), new_rule("best_source", "openai", enabled=True))
+        self.service.save_config({"providers_min_groups": 2, "max_new_keys": 10})
+        first = self.job("/jobs/sync")
+        self.assertEqual(first["status"], "success", first)
+        before = copy.deepcopy((self.sites.fake.local_groups, self.sites.fake.accounts, self.sites.fake.keys))
+        report = self.service.store.get("report")
+        fresh = self.sites.fake.providers()
+        # A plausible, healthy alternative must not replace the current routes on a truncated response.
+        tiny = {**fresh, "items": [next(item for item in fresh["items"] if item["group_id"] == 8)], "total": 1}
+        cases = (("/jobs/sync", {}), ("/jobs/sync", {"preview": True}),
+                 ("/jobs/low-cost", {}), ("/jobs/best-source", {}),
+                 ("/jobs/low-cost", {"upstream_id": 8}), ("/jobs/best-source", {"upstream_id": 8}))
+        for endpoint, body in cases:
+            with self.subTest(endpoint=endpoint, body=body):
+                self.sites.fake.requests.clear()
+                with patch.object(self.sites.fake, "providers", return_value=tiny) as fetch:
+                    with patch("sync_sub2api.time.sleep") as sleep:
+                        failed = self.job(endpoint, body)
+                self.assertEqual((failed["status"], fetch.call_count), ("failed", 4))
+                self.assertIn("低于全局最少数量 2", failed["error"])
+                self.assertTrue(all(delay in sleep.call_args_list for delay in (call(5), call(10), call(20))))
+                self.assertEqual(self.sites.fake.mutations(), [])
+                self.assertEqual((self.sites.fake.local_groups, self.sites.fake.accounts, self.sites.fake.keys), before)
+                self.assertEqual(self.service.store.get("report"), report)
+                for strategy in ("low_cost", "best_source"):
+                    current = self.stable(f"{strategy}:openai")["status"]
+                    self.assertEqual((current["upstream_id"], current["status"]), (7, "active"))
+                logs = self.service.store.logs(job_id=failed["id"])
+                self.assertEqual(sum(row["message"].startswith("供应商大厅监测渠道数量：1（") for row in logs), 4)
 
     def test_each_platform_has_its_own_top_n(self):
         config = self.client.get("/api/config").json()

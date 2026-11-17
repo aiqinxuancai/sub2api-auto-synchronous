@@ -230,7 +230,7 @@ class SyncIntegrationTests(unittest.TestCase):
             upstream_base=root + "/up", target_base=root + "/down",
             upstream_email="test@example.com", upstream_password="test-password",
             target_admin_api_key="test-admin-key", dry_run=False,
-            request_interval=0, rate_limit_retries=0,
+            request_interval=0, rate_limit_retries=0, providers_min_groups=0,  # tiny isolated fixtures
             state_file=Path(self.temp.name) / "state.json",
             report_file=Path(self.temp.name) / "report.json")
 
@@ -328,6 +328,74 @@ class SyncIntegrationTests(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         sleep.assert_not_called()
         self.assertEqual(self.fake.mutations(), [])
+
+    def test_tiny_provider_snapshots_retry_then_preserve_all_installed_resources(self):
+        self.config.providers_min_groups = 2
+        self.cycle()
+        before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        fresh = self.fake.providers()
+        for count in (0, 1):
+            for total in (count, fresh["total"]):
+                with self.subTest(count=count, total=total):
+                    tiny = {**fresh, "items": fresh["items"][:count], "total": total}
+                    self.fake.requests.clear()
+                    with patch.object(self.fake, "providers", return_value=tiny) as fetch:
+                        with patch("sync_sub2api.time.sleep") as sleep, self.assertLogs("sub2api-sync", "INFO") as logs:
+                            with self.assertRaisesRegex(SyncError, "低于全局最少数量 2"):
+                                self.cycle()
+                    self.assertEqual(fetch.call_count, 4)
+                    self.assertEqual(sleep.call_args_list, [call(5), call(10), call(20)])
+                    counts = [record.getMessage() for record in logs.records
+                              if record.getMessage().startswith("供应商大厅监测渠道数量：")]
+                    self.assertEqual(len(counts), 4)
+                    self.assertTrue(all(f"数量：{count}（" in message for message in counts))
+                    self.assertEqual(self.fake.mutations(), [])
+                    self.assertFalse(any(path.startswith("/down/") for _, path, _ in self.fake.requests))
+                    self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+
+    def test_provider_count_retry_recovers_and_logs_every_response(self):
+        self.config.providers_min_groups = 2
+        fresh = self.fake.providers()
+        empty = {**fresh, "items": [], "total": 0}
+        tiny = {**fresh, "items": fresh["items"][:1], "total": 1}
+        with patch.object(self.fake, "providers", side_effect=[empty, tiny, fresh]) as fetch:
+            with patch("sync_sub2api.time.sleep") as sleep, self.assertLogs("sub2api-sync", "INFO") as logs:
+                report = self.cycle()
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(5), call(10)])
+        counts = [record.args[0] for record in logs.records if record.msg.startswith("供应商大厅监测渠道数量：")]
+        self.assertEqual(counts, [0, 1, 3])
+        self.assertEqual((report["usable_groups"], report["errors"]), (1, []))
+        self.assertEqual(len(self.fake.accounts), 1)
+
+    def test_provider_count_is_global_and_accepts_the_exact_threshold(self):
+        self.config.providers_min_groups = 3
+        self.config.sync_limits = {"openai": 1}
+        self.fake.groups[1]["platform"] = "deepseek"
+        self.fake.groups[2]["platform"] = "gemini"
+        with patch("sync_sub2api.time.sleep") as sleep:
+            report = self.cycle()
+        sleep.assert_not_called()
+        self.assertEqual(report["usable_groups"], 1)
+        self.assertEqual(report["sync_limits"], {"openai": 1})
+
+    def test_provider_count_guard_also_applies_to_supplied_snapshots(self):
+        self.config.providers_min_groups = 2
+        fresh = self.fake.providers()
+        tiny = {**fresh, "items": fresh["items"][:1], "total": 1}
+        with self.assertRaisesRegex(SyncError, "监测渠道数量异常"):
+            Synchronizer(self.config, State(self.config)).cycle(snapshot=(self.fake.groups, self.fake.rates, tiny))
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_provider_count_guard_can_be_disabled_for_small_sites(self):
+        self.config.providers_min_groups = 0
+        empty = {**self.fake.providers(), "items": [], "total": 0}
+        with patch.object(self.fake, "providers", return_value=empty) as fetch:
+            with patch("sync_sub2api.time.sleep") as sleep:
+                snapshot = Synchronizer(self.config, State(self.config)).load_snapshot()
+        self.assertEqual(fetch.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(snapshot[2]["items"], [])
 
     def test_probe_refresh_retries_even_when_outer_snapshot_is_fresh(self):
         fresh = self.fake.providers()

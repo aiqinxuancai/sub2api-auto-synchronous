@@ -239,6 +239,7 @@
                 <label class="field">请求超时<span class="input-with-unit"><input name="timeout" type="number" min="1" max="120"><span>秒</span></span></label>
                 <label class="field">请求最小间隔<span class="input-with-unit"><input name="request_interval" type="number" min="0" max="60" step="0.1"><span>秒</span></span></label>
                 <label class="field">上游监测接口路径<input name="providers_path"></label>
+                <label class="field">监测渠道最少数量<input name="providers_min_groups" type="number" min="0" max="10000" step="1"><small>默认 10；整个响应的渠道数低于此值时重试并保留原配置，0 表示关闭数量校验</small></label>
               </div>
             </details>
           </div>

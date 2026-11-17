@@ -64,6 +64,27 @@ class ConfigurationTests(unittest.TestCase):
         finally:
             restarted.close()
 
+    def test_provider_count_default_migrates_and_custom_threshold_survives_restart(self):
+        values = default_settings()
+        self.assertEqual(values["providers_min_groups"], 10)
+        del values["providers_min_groups"]  # a configuration saved before the guard existed
+        Store(self.root).put("config", values)
+        self.assertEqual(Config.from_web(values, self.root).providers_min_groups, 10)
+        service = Service(self.root, start_scheduler=False)
+        try:
+            self.assertEqual(service.public_config()["providers_min_groups"], 10)
+            self.assertEqual(service.config().providers_min_groups, 10)
+            saved = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["config"]["providers_min_groups"], 10)
+            service.save_config({"providers_min_groups": 2})
+        finally:
+            service.close()
+        restarted = Service(self.root, start_scheduler=False)
+        try:
+            self.assertEqual(restarted.config().providers_min_groups, 2)
+        finally:
+            restarted.close()
+
     def test_sqlite_configuration_migrates_once_and_file_wins_on_restart(self):
         store = Store(self.root)
         original = default_settings()

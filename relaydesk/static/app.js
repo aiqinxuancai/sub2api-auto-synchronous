@@ -453,7 +453,7 @@ function renderModels() {
 }
 $('#model-search').oninput = renderModels;
 
-const numericSettings = new Set(['interval_minutes', 'rate_factor', 'account_concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval']);
+const numericSettings = new Set(['interval_minutes', 'rate_factor', 'account_concurrency', 'priority', 'timeout', 'max_new_keys', 'request_interval', 'providers_min_groups']);
 // Comma-separated keyword lists of a preferred-group rule; both may be left empty.
 const keywordFields = new Set(['exclude_keywords', 'require_models']);
 const splitKeywords = text => text.split(/[,，、;；\n]+/).map(item => item.trim()).filter(Boolean);

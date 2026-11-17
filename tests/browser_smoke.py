@@ -95,6 +95,8 @@ def main():
                 page.locator('[data-platform="gemini"]').uncheck()
                 expect(page.locator('[data-platform-limit="gemini"]')).to_be_disabled()
                 page.fill('[data-platform-limit="openai"]', "2")
+                page.locator('details.advanced summary').click()
+                page.locator('[name="providers_min_groups"]').fill("2")
                 expect(page.locator('[data-price-platform="deepseek"]')).to_be_checked()
                 expect(page.locator('[data-price-platform="openai"]')).not_to_be_checked()
                 page.locator('[data-price-platform="kimi"]').uncheck()
@@ -141,6 +143,7 @@ def main():
                 page.locator('button[form="settings-form"]').click()
                 expect(page.locator('#settings-dirty')).to_have_text("已保存")
                 saved = service.public_config()
+                assert saved["providers_min_groups"] == 2, saved["providers_min_groups"]
                 low = saved["stable_groups"][0]
                 assert (low["enabled"], low["top_n"], low["score_minutes"], low["rank_tolerance"], low["retry_minutes"],
                         low["weights"]["price"], low["weights"]["latency"]) == (True, 8, 20, 1, 2, 40, 0), low
@@ -378,6 +381,7 @@ def main():
                 page.click('[data-page="settings"]')
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Settings overflow"
                 expect(page.locator('[data-platform-limit="openai"]')).to_have_value('2')
+                expect(page.locator('[name="providers_min_groups"]')).to_have_value('2')
                 page.screenshot(path=str(artifacts / "mobile-settings.png"), full_page=True)
                 page.set_viewport_size({"width": 1512, "height": 1000})
                 page.click("#logout")

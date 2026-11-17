@@ -41,6 +41,7 @@ MAX_BODY_BYTES = 32 * 1024 * 1024
 ROLE_LABELS = {"upstream": "上游", "target": "本地"}
 PROVIDERS_RETRY_DELAYS = (5, 10, 20)
 PROBE_REFRESH_REASONS = {"availability_unknown", "probe_expired"}
+DEFAULT_PROVIDERS_MIN_GROUPS = 10
 
 
 def progress(step: str, done: int | None = None, total: int | None = None) -> None:
@@ -56,6 +57,10 @@ def progress_request(role: str = "", method: str = "", path: str = "") -> None:
 
 class SyncError(Exception):
     """A diagnostic that is safe to display without exposing credentials."""
+
+
+class ProviderCountError(SyncError):
+    """A suspiciously small hall response, including a self-consistent total=0/1."""
 
 
 class APIError(SyncError):
@@ -175,6 +180,7 @@ class Config:
     state_file: Path = Path("data/sync-state.json")
     report_file: Path = Path("data/last-report.json")
     providers_path: str = "/api/v2/public/providers"
+    providers_min_groups: int = DEFAULT_PROVIDERS_MIN_GROUPS
     max_new_keys: int = 50
     disable_unavailable: bool = False  # Legacy setting, ignored: synchronization never disables routes.
     request_interval: float = 1.1
@@ -204,6 +210,8 @@ class Config:
             raise SyncError("REQUEST_MIN_INTERVAL_SECONDS 必须在 0–60 之间")
         if not self.providers_path.startswith("/") or self.providers_path.startswith("//"):
             raise SyncError("PROVIDERS_API_PATH 必须是上游站点内的绝对路径")
+        if type(self.providers_min_groups) is not int or not 0 <= self.providers_min_groups <= 10000:
+            raise SyncError("监测渠道最少数量应为 0–10000 的整数，0 表示关闭数量校验")
 
     @classmethod
     def from_web(cls, values: dict[str, Any], directory: Path) -> Config:
@@ -228,6 +236,7 @@ class Config:
             dry_run=False, state_file=directory / "profiles" / profile / "state.json",
             report_file=directory / "profiles" / profile / "report.json",
             providers_path=values["providers_path"], max_new_keys=values["max_new_keys"],
+            providers_min_groups=values.get("providers_min_groups", DEFAULT_PROVIDERS_MIN_GROUPS),
             disable_unavailable=values["disable_unavailable"], request_interval=values["request_interval"],
         )
 
@@ -625,6 +634,11 @@ def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
     if providers.get("stale") is True:
         raise SyncError("供应商大厅返回过期快照，本轮保留现有配置")
     items = providers["items"]
+    # Check the full response, before platform/top-N/health filtering or route changes.
+    # Do not trust `total`: truncated snapshots can report total=0/1 as well.
+    if len(items) < config.providers_min_groups:
+        raise ProviderCountError(f"供应商大厅监测渠道数量异常：返回 {len(items)} 个，低于全局最少数量 "
+                                 f"{config.providers_min_groups} 个，本轮保留现有配置")
     if providers.get("total", len(items)) != len(items):
         raise SyncError("供应商大厅快照不完整，本轮保留现有配置")
     generated = parse_time(providers.get("generated_at"))
@@ -1087,19 +1101,32 @@ class Synchronizer:
             progress("读取供应商大厅数据" if not attempt else
                      f"重新读取供应商大厅数据（重试 {attempt}/{len(PROVIDERS_RETRY_DELAYS)}）")
             providers = self.upstream.request("GET", providers_path, site_path=True)
+            items = providers.get("items") if isinstance(providers, dict) else None
+            if isinstance(items, list):
+                counts = Counter(PLATFORM_LABELS.get(str(item.get("platform")), "其他")
+                                 for item in items if isinstance(item, dict))
+                platforms_text = "、".join(f"{name} {count}" for name, count in sorted(counts.items())) or "无渠道"
+                LOG.info("供应商大厅监测渠道数量：%d（全局最少 %d；%s）", len(items),
+                         self.config.providers_min_groups, platforms_text)
+            else:
+                LOG.info("供应商大厅响应结构无效，无法统计监测渠道数量")
             stale = isinstance(providers, dict) and providers.get("stale") is True
             if stale:
                 reason = "供应商大厅快照过期"
             else:
                 # Every re-read still needs a complete, current, structurally valid snapshot.
-                select_usable(groups, rates or {}, providers, self.config, self.upstream.server_time)
-                pending = pending_probe_platforms(providers, self.upstream.server_time, platforms)
-                if not pending:
-                    if attempt:
-                        LOG.info("供应商大厅数据已恢复，重试 %d 次后继续本轮任务", attempt)
-                    return groups, rates or {}, providers
-                names = "、".join(PLATFORM_LABELS.get(platform, platform) for platform in pending)
-                reason = f"供应商大厅 {names} 探测数据待刷新"
+                try:
+                    select_usable(groups, rates or {}, providers, self.config, self.upstream.server_time)
+                except ProviderCountError as error:
+                    reason = str(error)
+                else:
+                    pending = pending_probe_platforms(providers, self.upstream.server_time, platforms)
+                    if not pending:
+                        if attempt:
+                            LOG.info("供应商大厅数据已恢复，重试 %d 次后继续本轮任务", attempt)
+                        return groups, rates or {}, providers
+                    names = "、".join(PLATFORM_LABELS.get(platform, platform) for platform in pending)
+                    reason = f"供应商大厅 {names} 探测数据待刷新"
             if attempt == len(PROVIDERS_RETRY_DELAYS):
                 break
             delay = PROVIDERS_RETRY_DELAYS[attempt]
