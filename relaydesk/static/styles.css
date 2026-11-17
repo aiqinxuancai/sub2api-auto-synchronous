@@ -279,12 +279,13 @@ textarea { resize: vertical; line-height: 1.6; }
 .stable-empty > .icon { flex: none; width: 20px; height: 20px; color: var(--accent); }
 .stable-empty > div { flex: 1; min-width: 0; }
 .stable-empty p { margin-top: 2px; font-size: 13px; color: var(--muted); }
-.candidate-row { display: grid; grid-template-columns: 40px 1fr minmax(80px, auto); align-items: center; gap: 12px; padding: 9px 8px; border-radius: var(--radius-sm); font-size: 13px; }
+.candidate-row { display: grid; grid-template-columns: 40px minmax(0, 1fr) minmax(80px, auto) auto; align-items: center; gap: 12px; padding: 9px 8px; border-radius: var(--radius-sm); font-size: 13px; }
 .candidate-row:hover { background: var(--surface-2); }
 .candidate-row.current { background: var(--accent-soft); color: var(--accent-soft-ink); font-weight: 500; }
 .candidate-row > span:nth-child(2) { overflow-wrap: anywhere; }
 .candidate-row strong { text-align: right; font-weight: 500; font-variant-numeric: tabular-nums; }
 .candidate-rank { color: var(--subtle); font-variant-numeric: tabular-nums; }
+.candidate-switch { justify-self: end; white-space: nowrap; }
 
 .overview-body { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; align-items: start; }
 .groups-panel .panel-heading { padding-bottom: 12px; }
@@ -752,6 +753,7 @@ tbody tr:hover { background: var(--surface-2); }
   .stable-rule-body { padding: 16px 14px 4px; }
   .candidate-details summary { padding: 12px 16px; }
   .candidate-row { grid-template-columns: 30px 1fr auto; gap: 8px; }
+  .candidate-switch { grid-column: 2 / -1; }
   .filter-row { padding: 0 16px 10px; }
   th, td { padding: 11px 8px; }
   th:first-child, td:first-child { padding-left: 16px; }

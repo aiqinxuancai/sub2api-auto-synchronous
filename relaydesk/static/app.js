@@ -39,6 +39,7 @@ const reasons = { no_healthy_models: '当前没有通过健康检测的模型', 
   source_unavailable: '当前渠道已不可用', updating: '正在切换渠道',
   outside_top_ten: '当前渠道已离开设定的候选排名范围', keyword_excluded: '名称命中排除关键字',
   required_models_missing: '渠道缺少必需模型',
+  manual_switch: '手动选择上游渠道',
   group_inactive: '上游分组已停用', probe_disabled: '上游未启用有效检测', unsupported_platform: '暂不支持此平台',
   no_provider: '没有匹配的监测数据', no_provider_data: '没有匹配的监测数据',
   no_enabled_probe: '当前没有启用中的有效探测', probe_expired: '上游探测结果已过期' };
@@ -270,7 +271,7 @@ function stableCard({ key, rule, status: data = {}, schedule = {} }) {
       summaryCell('下一次检测', enabled ? `评分 ${date(schedule.next_rank)} · 可用性 ${date(schedule.next_health)}` : enableHint, undefined, true));
     note = reasons[data.reason] || lowCostDecision(data) || `对前 ${topN} 名综合评分，选用得分最高的渠道。`;
     label = `查看前 ${topN} 名候选评分`;
-    renderScoredCandidates(list, data);
+    renderScoredCandidates(list, data, rule);
   } else {
     const keepTop = rule.keep_top;
     summary.append(
@@ -281,8 +282,9 @@ function stableCard({ key, rule, status: data = {}, schedule = {} }) {
     note = reasons[data.reason] || (data.switch_reason && reasons[data.switch_reason] ? `${reasons[data.switch_reason]}，已更换为默认排序第一个可用渠道。`
       : data.decision === 'retained' ? `当前渠道仍在默认排序前 ${keepTop} 名内，继续保留。` : `跟随 providers 默认排序第 1 名，不跌出前 ${keepTop} 名就保持。`);
     label = `查看默认排序前 ${keepTop} 名`;
-    renderRankedCandidates(list, data);
+    renderRankedCandidates(list, data, rule);
   }
+  if (data.decision === 'manual') note = '已手动切换到此渠道，后续仍按自动规则检测和切换。';
   if (!enabled) note = enableHint;
   copy.append(title, el('p', '', note)); heading.append(copy, check);
   const toggle = el('summary'); toggle.append(el('span', '', label), icon('chevron')); details.append(toggle, list);
@@ -293,7 +295,21 @@ function candidateReason(candidate) {
   const text = reasons[candidate.reason] || '不可用';
   return candidate.missing_models?.length ? `${text}：${candidate.missing_models.join('、')}` : text;
 }
-function renderScoredCandidates(root, data) {
+function candidateSwitch(candidate, data, rule) {
+  const current = candidate.upstream_id === data.upstream_id;
+  const button = el('button', 'button small candidate-switch', current ? '当前渠道' : '切换到此渠道');
+  button.type = 'button'; button.dataset.switchUpstream = candidate.upstream_id;
+  const enabled = rule.enabled && state.overview.config.sync_accounts;
+  const busy = state.jobs.some(job => ['queued', 'running'].includes(job.status) && [rule.strategy, 'sync'].includes(job.kind));
+  button.disabled = current || !candidate.eligible || !enabled || busy;
+  button.title = current ? '当前正在使用此渠道' : !candidate.eligible ? candidateReason(candidate)
+    : !enabled ? '请先启用此优选分组并开启同步转发账号' : busy ? '请等待当前任务完成'
+    : '切换前会重新检测；切换后仍按自动规则运行';
+  button.onclick = () => action(() => runJob(stableJobs[rule.strategy],
+    { mode: 'ranking', platform: rule.platform, upstream_id: candidate.upstream_id }, job => openJob(job)), button);
+  return button;
+}
+function renderScoredCandidates(root, data, rule) {
   if ((data.candidates || []).some(row => row.parts)) {
     const legend = el('div', 'score-legend');
     for (const [key, label] of Object.entries(scoreMetrics)) {
@@ -309,17 +325,19 @@ function renderScoredCandidates(root, data) {
     const value = el('strong', 'candidate-score');
     if (candidate.eligible && candidate.score != null) value.append(document.createTextNode(`${number(candidate.score, 1)} 分`), el('small', '', `${number(candidate.source_rate)} 倍`));
     else value.textContent = candidate.eligible ? `${number(candidate.source_rate)} 倍` : candidateReason(candidate);
-    row.append(el('span', 'candidate-rank', candidate.score_rank ? `#${candidate.score_rank}` : '—'), name, value);
+    row.append(el('span', 'candidate-rank', candidate.score_rank ? `#${candidate.score_rank}` : '—'), name, value,
+      candidateSwitch(candidate, data, rule));
     if (candidate.upstream_id === data.upstream_id) row.classList.add('current');
     root.append(row);
   }
   if (!root.childNodes.length) root.append(el('p', 'field-help', '完成检测后显示候选渠道与综合评分。'));
 }
-function renderRankedCandidates(root, data) {
+function renderRankedCandidates(root, data, rule) {
   for (const candidate of data.candidates || []) {
     const row = el('div', 'candidate-row' + (candidate.eligible ? '' : ' ineligible'));
     row.append(el('span', 'candidate-rank', `#${candidate.provider_rank}`), el('span', '', candidate.name || `分组 #${candidate.upstream_id}`),
-      el('strong', 'candidate-score', candidate.eligible ? `${number(candidate.source_rate)} 倍` : candidateReason(candidate)));
+      el('strong', 'candidate-score', candidate.eligible ? `${number(candidate.source_rate)} 倍` : candidateReason(candidate)),
+      candidateSwitch(candidate, data, rule));
     if (candidate.upstream_id === data.upstream_id) row.classList.add('current');
     root.append(row);
   }
@@ -915,6 +933,9 @@ function summary(job) {
   if (!result) return job.error || statuses[job.status] || job.status;
   if (['low_cost', 'best_source'].includes(job.kind) && (result.pending || result.decision === 'paused')) {
     return reasons[result.reason] || '保留现有分组，等待后续检测';
+  }
+  if (['low_cost', 'best_source'].includes(job.kind) && result.decision === 'manual') {
+    return `${result.source_name} · ${number(result.source_rate)} 倍 · 已手动切换，后续按自动规则检测`;
   }
   if (job.kind === 'connect') return result.message;
   if (job.kind === 'best_source') return result.pending ? '候选渠道等待上游 Key' : result.status === 'active' ? `${result.source_name} · 默认排序 #${result.provider_rank} · ${number(result.source_rate)} 倍 · ${result.decision === 'retained' ? '保持当前渠道' : '已更新渠道'}` : reasons[result.reason] || '检测完成';

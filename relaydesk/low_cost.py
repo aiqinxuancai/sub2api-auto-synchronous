@@ -136,8 +136,13 @@ class StableGroupSelector:
             self.mapping["model_pricing_synced"] = bool(refresh.model_pricing)
         LOG.info("%s：保留路由 %s，计费已按上游更新（倍率 %g）", self.label, label, refresh.local_rate)
 
-    def reconcile(self, snapshot, *, mode="ranking"):
+    def reconcile(self, snapshot, *, mode="ranking", upstream_id=None):
         engine, config = self.engine, self.engine.config
+        manual = upstream_id is not None
+        if manual and (type(upstream_id) is not int or upstream_id < 1):
+            raise SyncError("请选择有效的上游渠道 ID")
+        if manual and (not self.rule["enabled"] or not config.sync_accounts):
+            raise SyncError("请先启用此优选分组并开启同步转发账号，再手动切换")
         groups, rates, providers = snapshot
         now = engine.upstream.server_time
         progress(f"{self.label}：评估候选渠道")
@@ -162,6 +167,10 @@ class StableGroupSelector:
                      group_label(current_id, context.name(current_id)), "、".join(missing[current_id]))
         result = {"checked_at": now.isoformat(), "mode": mode, "candidates": plan.candidates, "errors": [], "pending": 0,
                   "top_n": plan.top_n, **plan.extras}
+        if manual:
+            result["requested_upstream_id"] = upstream_id
+            if not any(row.source["id"] == upstream_id for row in plan.pool):
+                raise SyncError(f"{self.label}：所选渠道已不符合候选条件，请刷新检测结果后重试")
         progress(f"{self.label}：读取本地分组与账号")
         local_groups = engine.target.list_all("/admin/groups")
         accounts = engine.target.list_all("/admin/accounts")
@@ -171,7 +180,10 @@ class StableGroupSelector:
         if not active:
             return self._preserve(group, result, "selector_disabled", "paused")
         keep, switch_reason, pool = plan.keep, plan.switch_reason, plan.pool
-        if keep:
+        if manual:
+            selected = next(row for row in pool if row.source["id"] == upstream_id)
+            keep, decision, switch_reason = False, "manual", "manual_switch"
+        elif keep:
             selected, decision = plan.current, "retained"
         else:
             selected = pool[0] if pool else None
@@ -190,7 +202,7 @@ class StableGroupSelector:
         result["switch_reason"] = switch_reason or None
         # Prepare a usable Key before changing the existing route.
         group_id = selected.source["id"]
-        progress(f"{self.label}：{'保持' if keep else '选用' if current_id is None else '切换到'} "
+        progress(f"{self.label}：{'手动切换到' if manual else '保持' if keep else '选用' if current_id is None else '切换到'} "
                  f"{group_label(group_id, selected.source.get('name'))}")
         try:
             key = engine._get_key(group_id)
@@ -199,7 +211,7 @@ class StableGroupSelector:
                 raise
             engine.key_creation_blocked = True
             key = None
-        if key is None:
+        if key is None and not manual:
             # Creation limits must not prevent failover to a candidate with a retained Key.
             for alternative in (row for row in pool if row.source["id"] != group_id):  # preferred first
                 # Do not create another Key as a side effect of a per-cycle cap.
@@ -272,7 +284,7 @@ class StableGroupSelector:
                             key_digest=digest, status="active", reason="healthy_models", provider_rank=selected.provider_rank,
                             model_pricing_synced=bool(desired.get("model_pricing")), **plan.details.get(group_id, {}))
         self.state.save()
-        LOG.info("%s：%s %s，大厅排名 %d%s，适用倍率 %g，模型 %d", self.label, "保持" if keep else "选用",
+        LOG.info("%s：%s %s，大厅排名 %d%s，适用倍率 %g，模型 %d", self.label, "手动选用" if manual else "保持" if keep else "选用",
                  group_label(group_id, selected.source.get("name")), selected.provider_rank,
                  plan.notes.get(group_id, ""), selected.source_rate, len(selected.models))
         return self._result(result, decision)

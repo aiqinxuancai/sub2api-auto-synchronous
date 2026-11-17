@@ -164,6 +164,24 @@ def main():
                 expect(card).to_contain_text('名称命中排除关键字')
                 expect(card).to_contain_text('渠道缺少必需模型：MODEL-B')
                 expect(card).to_contain_text('0.2 倍')
+                expect(card.locator('.candidate-row.current .candidate-switch')).to_have_text('当前渠道')
+                expect(card.locator('.candidate-row.current .candidate-switch')).to_be_disabled()
+                expect(card.locator('.candidate-row.ineligible .candidate-switch').first).to_be_disabled()
+                manual = card.locator('.candidate-row:not(.current) .candidate-switch:enabled').first
+                chosen = int(manual.get_attribute('data-switch-upstream'))
+                with page.expect_response(lambda response: response.url.endswith('/api/jobs/low-cost') and response.request.method == 'POST') as switched:
+                    manual.click()
+                result = await_job(service, switched.value.json()['job_id'])
+                assert (result['status'], result['result']['upstream_id'], result['result']['decision']) == ('success', chosen, 'manual'), result
+                expect(page.locator('#job-detail-content')).to_contain_text('已手动切换', timeout=15000)
+                page.locator('#job-dialog [data-close]').click()
+                expect(card).to_contain_text('后续仍按自动规则检测和切换')
+                expect(card.locator(f'[data-switch-upstream="{chosen}"]')).to_be_disabled()
+                card.screenshot(path=str(artifacts / 'manual-low-cost.png'))
+                page.set_viewport_size({'width': 390, 'height': 844})
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Manual switch mobile overflow'
+                card.screenshot(path=str(artifacts / 'manual-low-cost-mobile.png'))
+                page.set_viewport_size({'width': 1512, 'height': 1000})
                 page.wait_for_timeout(4500)  # survives a poll that rebuilds the cards
                 expect(card.locator('details')).to_have_attribute('open', '')
                 card.get_by_role("button", name="立即检测").click()
@@ -315,6 +333,17 @@ def main():
                 page.locator('#job-dialog [data-close]').click()
                 expect(card).to_contain_text('跌出前 5 名时更换')
                 expect(card).to_contain_text('GPT · 团队标准')  # fixture names do not follow platforms; group 11 is Gemini
+                card.locator('summary').click()
+                manual = card.locator('.candidate-row:not(.current) .candidate-switch:enabled').first
+                chosen = int(manual.get_attribute('data-switch-upstream'))
+                with page.expect_response(lambda response: response.url.endswith('/api/jobs/best-source') and response.request.method == 'POST') as switched:
+                    manual.click()
+                result = await_job(service, switched.value.json()['job_id'])
+                assert (result['status'], result['result']['upstream_id'], result['result']['decision']) == ('success', chosen, 'manual'), result
+                expect(page.locator('#job-detail-content')).to_contain_text('已手动切换', timeout=15000)
+                page.locator('#job-dialog [data-close]').click()
+                expect(card.locator(f'[data-switch-upstream="{chosen}"]')).to_have_text('当前渠道')
+                card.screenshot(path=str(artifacts / 'manual-best-source.png'))
                 # No candidates keeps the route active and reports the deferred check clearly.
                 existing_health = set(sites.fake.healthy_group_ids)
                 sites.fake.healthy_group_ids = set()
@@ -362,7 +391,7 @@ def main():
         assert not errors, errors
         print(json.dumps({"browser": "Chrome", "result": "passed", "screenshots": str(artifacts),
                           "flows": ["setup/login/logout", "connection tests", "preview/sync", "key retention/recovery",
-                                    "model search", "batch create/download", "monthly rule", "selected balance reset", "logs", "mobile"]}, ensure_ascii=False))
+                                    "manual candidate switching", "model search", "batch create/download", "monthly rule", "selected balance reset", "logs", "mobile"]}, ensure_ascii=False))
 
 
 if __name__ == "__main__": main()

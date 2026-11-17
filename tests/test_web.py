@@ -656,6 +656,128 @@ class WebTests(unittest.TestCase):
             submit.assert_called_once_with("best_source", {"mode": "ranking", "platform": "openai"})
         self.assertEqual(self.service.store.get("best_source:openai_schedule")["next_rank"], when.timestamp() + 60)
 
+    def test_manual_candidate_switch_updates_both_strategies_in_place(self):
+        for strategy, endpoint in (("low_cost", "/jobs/low-cost"), ("best_source", "/jobs/best-source")):
+            with self.subTest(strategy=strategy):
+                self.sites.fake.healthy_group_ids = {7, 8, 9}
+                self.rules(new_rule(strategy, "openai", enabled=True))
+                first = self.job(endpoint)["result"]
+                self.assertEqual(first["upstream_id"], 7)
+                self.sites.fake.users[1]["allowed_groups"] = [first["local_group_id"]]
+                switched = self.job(endpoint, {"upstream_id": 8})
+                self.assertEqual(switched["status"], "success", switched)
+                result = switched["result"]
+                self.assertEqual((result["upstream_id"], result["decision"], result["switch_reason"]),
+                                 (8, "manual", "manual_switch"))
+                self.assertEqual(result["requested_upstream_id"], 8)
+                self.assertEqual(result["local_group_id"], first["local_group_id"])
+                self.assertEqual(result["local_account_id"], first["local_account_id"])
+                group = next(row for row in self.sites.fake.local_groups if row["id"] == result["local_group_id"])
+                account = next(row for row in self.sites.fake.accounts if row["id"] == result["local_account_id"])
+                self.assertEqual((group["status"], group["rate_multiplier"]), ("active", 1.0))
+                self.assertEqual((account["status"], account["schedulable"]), ("active", True))
+                self.assertEqual(account["group_ids"], [group["id"]])
+                self.assertEqual(self.sites.fake.users[1]["allowed_groups"], [group["id"]])
+                self.assertEqual(self.stable(f"{strategy}:openai")["status"]["upstream_id"], 8)
+                keys = len(self.sites.fake.keys)
+                repeated = self.job(endpoint, {"upstream_id": 8})
+                self.assertEqual(repeated["result"]["local_group_id"], group["id"])
+                self.assertEqual(len(self.sites.fake.keys), keys)
+                # A manual choice does not pin the route or bypass later health checks.
+                self.sites.fake.healthy_group_ids = {7, 9}
+                automatic = self.job(endpoint)["result"]
+                self.assertEqual((automatic["upstream_id"], automatic["decision"]), (7, "replaced"))
+                self.assertEqual(automatic["local_group_id"], group["id"])
+
+    def test_manual_candidate_switch_rejects_invalid_ids_and_paused_rules(self):
+        for strategy, endpoint in (("low_cost", "/jobs/low-cost"), ("best_source", "/jobs/best-source")):
+            with self.subTest(strategy=strategy):
+                rule = new_rule(strategy, "openai", enabled=True)
+                self.rules(rule)
+                for value in (None, True, 0, -1, "8", 1.5):
+                    response = self.post(endpoint, {"upstream_id": value})
+                    self.assertEqual(response.status_code, 400, value)
+                self.rules({**rule, "enabled": False})
+                self.assertEqual(self.post(endpoint, {"upstream_id": 8}).status_code, 400)
+                self.rules(rule)
+                self.service.save_config({"sync_accounts": False})
+                self.assertEqual(self.post(endpoint, {"upstream_id": 8}).status_code, 400)
+                self.service.save_config({"sync_accounts": True})
+        self.assertEqual(self.sites.fake.mutations(), [])
+
+    def test_manual_candidate_switch_revalidates_health_before_any_writes(self):
+        for strategy, endpoint in (("low_cost", "/jobs/low-cost"), ("best_source", "/jobs/best-source")):
+            with self.subTest(strategy=strategy):
+                self.sites.fake.healthy_group_ids = {7, 8, 9}
+                self.rules(new_rule(strategy, "openai", enabled=True))
+                first = self.job(endpoint)["result"]
+                self.assertTrue(next(row for row in first["candidates"] if row["upstream_id"] == 8)["eligible"])
+                before = copy.deepcopy((self.sites.fake.local_groups, self.sites.fake.accounts, self.sites.fake.keys))
+                self.sites.fake.healthy_group_ids = {7, 9}
+                self.sites.fake.requests.clear()
+                refused = self.job(endpoint, {"upstream_id": 8})
+                self.assertEqual(refused["status"], "failed")
+                self.assertIn("所选渠道已不符合候选条件", refused["error"])
+                self.assertEqual(self.sites.fake.mutations(), [])
+                self.assertEqual((self.sites.fake.local_groups, self.sites.fake.accounts, self.sites.fake.keys), before)
+                self.assertEqual(self.stable(f"{strategy}:openai")["status"]["upstream_id"], 7)
+
+    def test_manual_candidate_switch_respects_range_and_model_filters(self):
+        self.sites.fake.healthy_group_ids = {7, 8, 9}
+        for strategy, endpoint in (("low_cost", "/jobs/low-cost"), ("best_source", "/jobs/best-source")):
+            rule = new_rule(strategy, "openai", enabled=True)
+            self.rules(rule)
+            first = self.job(endpoint)["result"]
+            limits = {"top_n": 1} if strategy == "low_cost" else {"keep_top": 1}
+            variants = [{**rule, **limits}, {**rule, "require_models": ["missing-model"]}]
+            if strategy == "low_cost":
+                variants.append({**rule, "exclude_keywords": ["bad"]})
+            for restricted in variants:
+                with self.subTest(strategy=strategy, restricted=restricted):
+                    self.rules(restricted)
+                    self.sites.fake.requests.clear()
+                    job = self.job(endpoint, {"upstream_id": 8})
+                    self.assertEqual(job["status"], "failed")
+                    self.assertEqual(self.sites.fake.mutations(), [])
+                    self.assertEqual(self.stable(f"{strategy}:openai")["status"]["upstream_id"], first["upstream_id"])
+            self.rules(rule)
+            unknown = self.job(endpoint, {"upstream_id": 9999})
+            self.assertEqual(unknown["status"], "failed")
+
+    def test_manual_candidate_without_key_preserves_route_without_fallback(self):
+        self.sites.fake.healthy_group_ids = {7, 8, 9}
+        for strategy, endpoint in (("low_cost", "/jobs/low-cost"), ("best_source", "/jobs/best-source")):
+            with self.subTest(strategy=strategy):
+                self.sites.fake.key_count_limit = False
+                self.rules(new_rule(strategy, "openai", enabled=True))
+                first = self.job(endpoint)["result"]
+                before = copy.deepcopy((self.sites.fake.local_groups, self.sites.fake.accounts, self.sites.fake.keys))
+                self.sites.fake.key_count_limit = True
+                self.sites.fake.requests.clear()
+                pending = self.job(endpoint, {"upstream_id": 8})["result"]
+                self.assertEqual((pending["pending"], pending["reason"]), (1, "pending_upstream_key"))
+                self.assertEqual(pending["requested_upstream_id"], 8)
+                self.assertEqual(pending["upstream_id"], first["upstream_id"])
+                self.assertEqual((self.sites.fake.local_groups, self.sites.fake.accounts, self.sites.fake.keys), before)
+                self.assertFalse(any(path.startswith("/down/") for _, path, _ in self.sites.fake.mutations()))
+
+    def test_manual_candidate_switch_uses_the_rules_own_platform(self):
+        self.sites.fake.groups[1]["platform"] = "deepseek"
+        self.sites.fake.groups.append({"id": 10, "name": "DeepSeek alternate", "platform": "deepseek",
+                                       "status": "active", "rate_multiplier": 1})
+        self.sites.fake.healthy_group_ids = {7, 8, 10}
+        self.rules(new_rule("best_source", "openai", enabled=True), new_rule("best_source", "deepseek", enabled=True))
+        openai = self.job("/jobs/best-source")["result"]
+        deepseek = self.job("/jobs/best-source", {"platform": "deepseek"})["result"]
+        switched = self.job("/jobs/best-source", {"platform": "deepseek", "upstream_id": 10})
+        self.assertEqual(switched["result"]["upstream_id"], 10)
+        self.assertEqual(switched["result"]["local_group_id"], deepseek["local_group_id"])
+        self.assertEqual(self.stable("best_source:openai")["status"]["upstream_id"], openai["upstream_id"])
+        self.sites.fake.requests.clear()
+        refused = self.job("/jobs/best-source", {"platform": "openai", "upstream_id": 10})
+        self.assertEqual(refused["status"], "failed")
+        self.assertEqual(self.sites.fake.mutations(), [])
+
     def test_rules_on_several_platforms_get_their_own_checks(self):
         self.sites.fake.groups[1]["platform"] = "deepseek"
         self.sites.fake.healthy_group_ids = {7, 8}

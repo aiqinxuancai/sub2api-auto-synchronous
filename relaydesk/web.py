@@ -230,9 +230,18 @@ def create_app(directory=None, *, service=None, start_scheduler=True):
         mode, platform = body.get("mode", "ranking"), body.get("platform", "openai")
         if mode not in {entry[0] for entry in CADENCE[strategy]}:
             raise SyncError("检测模式无效")
-        if f"{strategy}:{platform}" not in manager._rules():
+        rule = manager._rules().get(f"{strategy}:{platform}")
+        if rule is None:
             raise SyncError("请先在连接配置中添加并保存这个优选分组")
-        return {"job_id": manager.submit(strategy, {"mode": mode, "platform": platform})}
+        job = {"mode": mode, "platform": platform}
+        if "upstream_id" in body:
+            upstream_id = body["upstream_id"]
+            if type(upstream_id) is not int or upstream_id < 1:
+                raise SyncError("请选择有效的上游渠道 ID")
+            if not rule["enabled"] or not manager.store.get("config")["sync_accounts"]:
+                raise SyncError("请先启用此优选分组并开启同步转发账号，再手动切换")
+            job.update(mode="ranking", upstream_id=upstream_id)
+        return {"job_id": manager.submit(strategy, job)}
 
     @app.post("/api/jobs/low-cost")
     async def low_cost(request: Request, manager=Depends(current)):

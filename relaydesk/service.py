@@ -398,7 +398,8 @@ class Service:
             elif kind in {"sync", "preview"}:
                 result = self._sync(kind == "preview")
             elif kind in SELECTORS:
-                result = self._check_stable(f"{kind}:{payload.get('platform', 'openai')}", payload.get("mode", "ranking"))
+                result = self._check_stable(f"{kind}:{payload.get('platform', 'openai')}", payload.get("mode", "ranking"),
+                                            upstream_id=payload.get("upstream_id"))
             elif kind == "refresh_users":
                 result = self._refresh_users()
             elif kind == "batch_users":
@@ -503,23 +504,25 @@ class Service:
         cadence = CADENCE[key.split(":", 1)[0]]
         return next((mode for mode, entry, _ in cadence if schedule.get(entry, 0) <= now), None)
 
-    def _check_stable(self, key, mode):
+    def _check_stable(self, key, mode, *, upstream_id=None):
         if mode not in {entry[0] for entry in CADENCE[key.split(":", 1)[0]]}:
             raise SyncError("检测模式无效")
+        if upstream_id is not None:
+            mode = "ranking"  # a manual choice always gets a complete candidate evaluation
         values = getattr(self.context, "settings", None) or self.store.get("config")
         config = self.config(values)
         with state_lock(config.state_file):
             engine = Synchronizer(config, State(config))
             snapshot = engine.load_snapshot(retry_platforms={key.split(":", 1)[1]})
-            return self._reconcile_stable(key, engine, values, snapshot, mode)
+            return self._reconcile_stable(key, engine, values, snapshot, mode, upstream_id=upstream_id)
 
-    def _reconcile_stable(self, key, engine, values, snapshot, mode):
+    def _reconcile_stable(self, key, engine, values, snapshot, mode, *, upstream_id=None):
         rule = self._rules(values).get(key)
         if rule is None:
             raise SyncError("该优选分组已删除")
         selector = SELECTORS[rule["strategy"]](engine, rule)
         try:
-            result = selector.reconcile(snapshot, mode=mode)
+            result = selector.reconcile(snapshot, mode=mode, upstream_id=upstream_id)
         except SyncError:
             # Keep the last route report and any IDs recovered during the failed check.
             previous = self.store.get(key) or {}
