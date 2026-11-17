@@ -1,10 +1,11 @@
 """Ranking, top-N policy and the stable lowest-price group's lifecycle."""
 
 import copy
+import logging
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from provider_ranking import default_score, detector_passed, ranked_items
 from relaydesk.low_cost import BestSourceSelector, LowCostSelector
@@ -399,8 +400,8 @@ class LowCostTests(unittest.TestCase):
             with self.assertRaises(SyncError):
                 self.check("health")
         requests = [path for _, path, _ in self.fake.requests if path == "/up/api/v2/public/providers"]
-        self.assertEqual(len(requests), 2)
-        sleep.assert_called_once_with(2)
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(sleep.call_args_list, [call(5), call(10), call(20)])
         self.assertEqual(self.fake.mutations(), [])
 
     def test_stale_snapshot_retry_recovers_low_cost_check(self):
@@ -411,7 +412,7 @@ class LowCostTests(unittest.TestCase):
             with patch("sync_sub2api.time.sleep") as sleep:
                 result = self.check("health")
         self.assertEqual(fetch.call_count, 2)
-        sleep.assert_called_once_with(2)
+        sleep.assert_called_once_with(5)
         self.assertEqual(result["status"], "active")
         self.assertEqual(result["upstream_id"], current["upstream_id"])
         self.assertEqual(result["local_group_id"], current["local_group_id"])
@@ -644,6 +645,43 @@ class BestSourceTests(unittest.TestCase):
             return selector(engine, rule).reconcile(engine.load_snapshot(), mode="ranking")
         finally:
             assert_no_route_disables(self, self.fake.requests[start:])
+
+    def test_pending_probe_refresh_is_quiet_and_keeps_both_strategies_routes(self):
+        for selector in (LowCostSelector, BestSourceSelector):
+            with self.subTest(strategy=selector.strategy):
+                self.fake.provider_overrides.clear()
+                first = self.check(selector)
+                for group in self.fake.groups:
+                    self.fake.provider_overrides[group["id"]] = {"availability_unknown": True,
+                                                                 "probe_expires_at": iso_after(-30)}
+                self.fake.provider_overrides[9] = {"detections_enabled": False, "probe_state": "disabled"}
+                before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+                self.fake.requests.clear()
+                with patch("sync_sub2api.time.sleep") as sleep, self.assertLogs("sub2api-sync", "INFO") as logs:
+                    waiting = self.check(selector)
+                self.assertEqual(sleep.call_args_list, [call(5), call(10), call(20)])
+                self.assertEqual((waiting["reason"], waiting["pending"]), ("probe_refresh_pending", 1))
+                self.assertEqual((waiting["upstream_id"], waiting["status"]), (first["upstream_id"], "active"))
+                self.assertEqual(waiting["local_group_id"], first["local_group_id"])
+                self.assertTrue(all(record.levelno == logging.INFO for record in logs.records))
+                self.assertEqual(self.fake.mutations(), [])
+                self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+                self.fake.provider_overrides.clear()
+                with patch("sync_sub2api.time.sleep") as sleep:
+                    recovered = self.check(selector)
+                sleep.assert_not_called()
+                self.assertEqual((recovered["decision"], recovered["reason"]), ("retained", "healthy_models"))
+                self.assertEqual(recovered["local_group_id"], first["local_group_id"])
+
+    def test_unhealthy_models_still_warn_without_probe_refresh_retries(self):
+        self.healthy = set()
+        for selector in (LowCostSelector, BestSourceSelector):
+            with self.subTest(strategy=selector.strategy):
+                with patch("sync_sub2api.time.sleep") as sleep, self.assertLogs("sub2api-sync", "WARNING") as logs:
+                    result = self.check(selector)
+                sleep.assert_not_called()
+                self.assertEqual(result["reason"], "no_healthy_candidates")
+                self.assertTrue(any("暂无符合检测条件" in record.getMessage() for record in logs.records))
 
     def test_required_models_fall_through_to_the_next_rank(self):
         first = self.check()

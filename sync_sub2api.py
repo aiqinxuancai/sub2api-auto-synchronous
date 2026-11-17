@@ -29,7 +29,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from provider_ranking import PLATFORMS, finite, rank_metadata, ranked_items, visible
+from provider_ranking import PLATFORM_LABELS, PLATFORMS, finite, rank_metadata, ranked_items, visible
 
 LOG = logging.getLogger("sub2api-sync")
 # What the running job is doing right now. Never printed or stored as log lines;
@@ -39,6 +39,8 @@ PROGRESS.propagate = False
 USER_AGENT = "sub2api-sync/0.1"
 MAX_BODY_BYTES = 32 * 1024 * 1024
 ROLE_LABELS = {"upstream": "上游", "target": "本地"}
+PROVIDERS_RETRY_DELAYS = (5, 10, 20)
+PROBE_REFRESH_REASONS = {"availability_unknown", "probe_expired"}
 
 
 def progress(step: str, done: int | None = None, total: int | None = None) -> None:
@@ -591,6 +593,28 @@ def healthy_card(card: Any, declared: set[str], item: dict[str, Any], now: datet
             and expires is not None and expires > now)
 
 
+def pending_probe_platforms(providers: dict[str, Any], now: datetime, platforms: set[str]) -> list[str]:
+    """Platforms whose monitored hall channels are all waiting for fresh probe data.
+
+    Model cards can keep updating while the shared probe snapshot expires, even
+    when the hall's outer snapshot has stale=false. Disabled monitoring is not a
+    transient refresh, and one expired channel must not delay healthy alternatives.
+    """
+    monitored: dict[str, list[dict[str, Any]]] = {}
+    allowed = platforms & set(providers.get("platform_tabs") or PLATFORMS)
+    for item in providers["items"]:
+        platform = item.get("platform")
+        if (platform in allowed and visible(item) and item.get("detections_enabled") is not False
+                and item.get("probe_state") == "enabled"):
+            monitored.setdefault(platform, []).append(item)
+
+    def waiting(item):
+        expires = parse_time(item.get("probe_expires_at"))
+        return item.get("availability_unknown") is True or expires is None or expires <= now
+
+    return sorted(platform for platform, items in monitored.items() if all(waiting(item) for item in items))
+
+
 def select_usable(groups: list[dict[str, Any]], rates: dict[str, Any],
                   providers: dict[str, Any], config: Config,
                   now: datetime) -> tuple[list[SelectedGroup], dict[int, str]]:
@@ -1050,7 +1074,7 @@ class Synchronizer:
         self.state.save()
         return account["id"], action
 
-    def load_snapshot(self):
+    def load_snapshot(self, *, retry_platforms=None):
         progress("读取上游分组与专属倍率")
         groups = self.upstream.request("GET", "/groups/available")
         rates = self.upstream.request("GET", "/groups/rates")
@@ -1058,15 +1082,31 @@ class Synchronizer:
             raise SyncError("上游分组或专属倍率接口结构无效，本轮停止")
         separator = "&" if "?" in self.config.providers_path else "?"
         providers_path = self.config.providers_path + separator + "range=1h&include_media=false"
-        progress("读取供应商大厅数据")
-        providers = self.upstream.request("GET", providers_path, site_path=True)
-        if isinstance(providers, dict) and providers.get("stale") is True:
-            LOG.warning("供应商大厅返回过期快照，2 秒后重试读取一次")
-            progress("供应商大厅快照过期，等待 2 秒后重试")
-            time.sleep(2)
-            progress("重新读取供应商大厅数据（重试 1/1）")
+        platforms = self.config.sync_platforms if retry_platforms is None else set(retry_platforms)
+        for attempt in range(len(PROVIDERS_RETRY_DELAYS) + 1):
+            progress("读取供应商大厅数据" if not attempt else
+                     f"重新读取供应商大厅数据（重试 {attempt}/{len(PROVIDERS_RETRY_DELAYS)}）")
             providers = self.upstream.request("GET", providers_path, site_path=True)
-        # Validate the entire snapshot before any caller can change routing.
+            stale = isinstance(providers, dict) and providers.get("stale") is True
+            if stale:
+                reason = "供应商大厅快照过期"
+            else:
+                # Every re-read still needs a complete, current, structurally valid snapshot.
+                select_usable(groups, rates or {}, providers, self.config, self.upstream.server_time)
+                pending = pending_probe_platforms(providers, self.upstream.server_time, platforms)
+                if not pending:
+                    if attempt:
+                        LOG.info("供应商大厅数据已恢复，重试 %d 次后继续本轮任务", attempt)
+                    return groups, rates or {}, providers
+                names = "、".join(PLATFORM_LABELS.get(platform, platform) for platform in pending)
+                reason = f"供应商大厅 {names} 探测数据待刷新"
+            if attempt == len(PROVIDERS_RETRY_DELAYS):
+                break
+            delay = PROVIDERS_RETRY_DELAYS[attempt]
+            LOG.info("%s，%d 秒后自动重试（%d/%d）", reason, delay, attempt + 1, len(PROVIDERS_RETRY_DELAYS))
+            progress(f"{reason}，等待 {delay} 秒后重试（{attempt + 1}/{len(PROVIDERS_RETRY_DELAYS)}）")
+            time.sleep(delay)
+        # Exhausted probe refreshes remain excluded; stale/invalid snapshots still fail closed.
         select_usable(groups, rates or {}, providers, self.config, self.upstream.server_time)
         return groups, rates or {}, providers
 

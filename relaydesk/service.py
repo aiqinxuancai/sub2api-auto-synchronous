@@ -471,9 +471,12 @@ class Service:
         with state_lock(config.state_file):
             state = State(config)
             engine = Synchronizer(config, state)
-            snapshot = engine.load_snapshot()
+            rules = self._rules(values)
+            retry_platforms = config.sync_platforms | {rule["platform"] for rule in rules.values()
+                                                      if not preview and rule["enabled"] and config.sync_accounts}
+            snapshot = engine.load_snapshot(retry_platforms=retry_platforms)
             stable = {}
-            for key, rule in self._rules(values).items():
+            for key, rule in rules.items():
                 if not preview and rule["enabled"] and config.sync_accounts:
                     self.progress(f"检测优选分组「{rule_label(rule)}」")
                     fallback = CADENCE[rule["strategy"]][-1][0]  # the lightest check when nothing is due
@@ -507,7 +510,8 @@ class Service:
         config = self.config(values)
         with state_lock(config.state_file):
             engine = Synchronizer(config, State(config))
-            return self._reconcile_stable(key, engine, values, engine.load_snapshot(), mode)
+            snapshot = engine.load_snapshot(retry_platforms={key.split(":", 1)[1]})
+            return self._reconcile_stable(key, engine, values, snapshot, mode)
 
     def _reconcile_stable(self, key, engine, values, snapshot, mode):
         rule = self._rules(values).get(key)

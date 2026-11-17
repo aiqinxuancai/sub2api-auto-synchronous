@@ -11,7 +11,7 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from sync_sub2api import (PROGRESS, APIError, Client, Config, State, SyncError, Synchronizer, changed_fields, ensure_account_binding,
                           hall_model_pricing, hall_stats, select_usable, stats_text)
@@ -329,13 +329,76 @@ class SyncIntegrationTests(unittest.TestCase):
         sleep.assert_not_called()
         self.assertEqual(self.fake.mutations(), [])
 
+    def test_probe_refresh_retries_even_when_outer_snapshot_is_fresh(self):
+        fresh = self.fake.providers()
+        for field, value in (("availability_unknown", True), ("probe_expires_at", iso_after(-30))):
+            with self.subTest(field=field):
+                pending = copy.deepcopy(fresh)
+                for item in pending["items"]:
+                    item[field] = value
+                with patch.object(self.fake, "providers", side_effect=[pending, fresh]) as fetch:
+                    with patch("sync_sub2api.time.sleep") as sleep, self.assertLogs("sub2api-sync", "INFO") as logs:
+                        engine = Synchronizer(self.config, State(self.config))
+                        groups, rates, providers = engine.load_snapshot()
+                self.assertEqual(fetch.call_count, 2)
+                sleep.assert_called_once_with(5)
+                selected, _ = select_usable(groups, rates, providers, self.config, engine.upstream.server_time)
+                self.assertEqual([row.source["id"] for row in selected], [7])
+                self.assertTrue(all(record.levelno == logging.INFO for record in logs.records))
+                self.assertEqual(self.fake.mutations(), [])
+
+    def test_probe_refresh_retries_are_bounded_and_preserve_routes(self):
+        self.cycle()
+        before = copy.deepcopy((self.fake.local_groups, self.fake.accounts, self.fake.keys))
+        self.fake.requests.clear()
+        for group in self.fake.groups:
+            self.fake.provider_overrides[group["id"]] = {"availability_unknown": True,
+                                                         "probe_expires_at": iso_after(-30)}
+        with patch("sync_sub2api.time.sleep") as sleep:
+            report = self.cycle()
+        requests = [path for _, path, _ in self.fake.requests if path == "/up/api/v2/public/providers"]
+        self.assertEqual(len(requests), 4)
+        self.assertEqual(sleep.call_args_list, [call(5), call(10), call(20)])
+        self.assertEqual(report["excluded_reasons"], {"availability_unknown": 3})
+        self.assertEqual(report["usable_groups"], 0)
+        self.assertEqual(self.fake.mutations(), [])
+        self.assertEqual((self.fake.local_groups, self.fake.accounts, self.fake.keys), before)
+
+    def test_probe_refresh_retry_still_rejects_incomplete_snapshots(self):
+        fresh = self.fake.providers()
+        pending = copy.deepcopy(fresh)
+        for item in pending["items"]:
+            item["availability_unknown"] = True
+        with patch.object(self.fake, "providers", side_effect=[
+                pending, {**fresh, "total": fresh["total"] + 1}]) as fetch:
+            with patch("sync_sub2api.time.sleep") as sleep:
+                with self.assertRaisesRegex(SyncError, "快照不完整"):
+                    self.cycle()
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(5)
+        self.assertEqual(self.fake.mutations(), [])
+
+    def test_one_expired_channel_does_not_delay_healthy_alternatives(self):
+        self.fake.provider_overrides[8] = {"availability_unknown": True}
+        with patch("sync_sub2api.time.sleep") as sleep:
+            self.cycle()
+        sleep.assert_not_called()
+        self.assertEqual(len(self.fake.accounts), 1)
+
+    def test_unselected_platform_probe_expiry_does_not_trigger_retry(self):
+        self.fake.groups[1]["platform"] = "deepseek"
+        self.fake.provider_overrides[8] = {"availability_unknown": True}
+        with patch("sync_sub2api.time.sleep") as sleep:
+            Synchronizer(self.config, State(self.config)).load_snapshot()
+        sleep.assert_not_called()
+
     def test_stale_provider_snapshot_retries_once_and_recovers(self):
         fresh = self.fake.providers()
         with patch.object(self.fake, "providers", side_effect=[{**fresh, "stale": True}, fresh]) as fetch:
             with patch("sync_sub2api.time.sleep") as sleep:
                 report = self.cycle()
         self.assertEqual(fetch.call_count, 2)
-        sleep.assert_called_once_with(2)
+        sleep.assert_called_once_with(5)
         self.assertEqual(report["errors"], [])
         self.assertEqual(report["usable_groups"], 1)
         self.assertEqual(len(self.fake.keys), 1)
@@ -350,7 +413,7 @@ class SyncIntegrationTests(unittest.TestCase):
                 with self.assertRaisesRegex(SyncError, "快照不完整"):
                     self.cycle()
         self.assertEqual(fetch.call_count, 2)
-        sleep.assert_called_once_with(2)
+        sleep.assert_called_once_with(5)
         self.assertEqual(self.fake.mutations(), [])
 
     def test_stale_or_partial_provider_snapshot_never_disables_existing_resources(self):
@@ -362,9 +425,9 @@ class SyncIntegrationTests(unittest.TestCase):
                 with self.assertRaises(SyncError):
                     self.cycle()
             requests = [path for _, path, _ in self.fake.requests if path == "/up/api/v2/public/providers"]
-            self.assertEqual(len(requests), 2 if field == "stale" else 1)
+            self.assertEqual(len(requests), 4 if field == "stale" else 1)
             if field == "stale":
-                sleep.assert_called_once_with(2)
+                self.assertEqual(sleep.call_args_list, [call(5), call(10), call(20)])
             else:
                 sleep.assert_not_called()
             self.assertEqual(self.fake.mutations(), [])

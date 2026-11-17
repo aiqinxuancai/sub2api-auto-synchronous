@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field, replace
 
 from provider_ranking import detector_passed, ranked_items
-from sync_sub2api import (APIError, SyncError, changed_fields, ensure_account_binding, group_label,
+from sync_sub2api import (PROBE_REFRESH_REASONS, APIError, SyncError, changed_fields, ensure_account_binding, group_label,
                           progress, select_usable, with_stats)
 
 from .rules import rule_key, rule_label
@@ -178,9 +178,15 @@ class StableGroupSelector:
             decision = "selected" if current_id is None else "replaced"
         if selected is None:
             result["pending"] = 1
-            LOG.warning("%s：前 %d 名暂无符合检测条件的可用渠道，保留现有路由，后续自动重试", self.label, plan.top_n)
+            reasons = {candidate["reason"] for candidate in plan.candidates}
+            waiting = bool(reasons & PROBE_REFRESH_REASONS) and reasons <= (
+                PROBE_REFRESH_REASONS | {"monitoring_disabled_or_unknown"})
+            if waiting:
+                LOG.info("%s：上游探测数据待刷新，保留现有路由，%d 分钟后自动重试", self.label, self.rule["retry_minutes"])
+            else:
+                LOG.warning("%s：前 %d 名暂无符合检测条件的可用渠道，保留现有路由，后续自动重试", self.label, plan.top_n)
             self._refresh_billing(context, rates, group, account, result)
-            return self._preserve(group, result, "no_healthy_candidates", "no_candidates")
+            return self._preserve(group, result, "probe_refresh_pending" if waiting else "no_healthy_candidates", "no_candidates")
         result["switch_reason"] = switch_reason or None
         # Prepare a usable Key before changing the existing route.
         group_id = selected.source["id"]

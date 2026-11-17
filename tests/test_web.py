@@ -9,7 +9,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 from urllib.parse import urlsplit, parse_qs
 from zoneinfo import ZoneInfo
 
@@ -667,6 +667,47 @@ class WebTests(unittest.TestCase):
         self.assertIn("开始检测最优源站 DeepSeek 分组", [row["message"] for row in self.service.store.logs()])
         sync = self.job("/jobs/sync")
         self.assertEqual(set(sync["result"]["stable"]), {"best_source:openai", "best_source:deepseek"})
+
+    def test_preferred_probe_retries_include_platforms_outside_normal_sync(self):
+        self.sites.fake.groups[1]["platform"] = "deepseek"
+        self.sites.fake.healthy_group_ids = {7, 8}
+        self.rules(new_rule("best_source", "deepseek", enabled=True), new_rule("low_cost", "deepseek", enabled=True))
+        fresh = self.sites.fake.providers()
+        pending = copy.deepcopy(fresh)
+        next(item for item in pending["items"] if item["group_id"] == 8)["availability_unknown"] = True
+        self.assertEqual(self.service.config().sync_platforms, {"openai"})
+        for endpoint, body in (("/jobs/best-source", {"platform": "deepseek"}),
+                               ("/jobs/low-cost", {"platform": "deepseek"}), ("/jobs/sync", {})):
+            with self.subTest(endpoint=endpoint):
+                with patch.object(self.sites.fake, "providers", side_effect=[pending, fresh]) as fetch:
+                    with patch("sync_sub2api.time.sleep") as sleep:
+                        job = self.job(endpoint, body)
+                self.assertEqual(job["status"], "success", job)
+                self.assertEqual(fetch.call_count, 2)
+                self.assertIn(call(5), sleep.call_args_list)
+                result = job["result"]["stable"]["best_source:deepseek"] if endpoint == "/jobs/sync" else job["result"]
+                self.assertEqual(result["upstream_id"], 8)
+                self.assertEqual(result["pending"], 0)
+
+    def test_pending_probe_refresh_uses_retry_schedule_without_warning_logs(self):
+        self.rules(new_rule("low_cost", "openai", enabled=True, retry_minutes=2))
+        first = self.job("/jobs/low-cost")
+        for group in self.sites.fake.groups:
+            self.sites.fake.provider_overrides[group["id"]] = {"availability_unknown": True}
+        self.sites.fake.requests.clear()
+        with patch("sync_sub2api.time.sleep") as sleep:
+            deferred = self.job("/jobs/low-cost")
+        self.assertEqual(deferred["status"], "success")
+        self.assertEqual(deferred["result"]["reason"], "probe_refresh_pending")
+        self.assertEqual(deferred["result"]["pending"], 1)
+        self.assertEqual(deferred["result"]["local_group_id"], first["result"]["local_group_id"])
+        self.assertEqual(self.sites.fake.mutations(), [])
+        logs = self.service.store.logs(job_id=deferred["id"])
+        self.assertTrue(all(row["level"] == "INFO" for row in logs))
+        self.assertTrue(any("探测数据待刷新" in row["message"] for row in logs))
+        self.assertTrue(all(delay in sleep.call_args_list for delay in (call(5), call(10), call(20))))
+        schedule = self.service.store.get("low_cost:openai_schedule")
+        self.assertAlmostEqual(schedule["next_rank"] - time.time(), 120, delta=3)
 
     def test_removed_rule_keeps_its_group_and_stops_scheduling(self):
         self.rules(new_rule("best_source", "openai", enabled=True))
